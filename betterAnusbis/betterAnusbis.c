@@ -1951,20 +1951,2262 @@ static int geoip_asn(const char *ip, uint32_t *out) {
     return 1;
 }
 
+/* the store backend is selected before the codec is defined, so these live here */
+static char store_path[512];
+static volatile int store_dirty;
+
+/*
+ * bbolt_io.h -- self-contained generic reader/writer for bbolt (BoltDB) files.
+ *
+ * Format: bbolt meta page version 2, page size taken from the file (default
+ * 4096 for new files). Only libc is used. Little-endian on-disk integers are
+ * encoded/decoded explicitly, so the host byte order does not matter.
+ *
+ * Data model:
+ *   bb_db.root        root bucket (the tree of top-level buckets)
+ *   bb_bucket.items   items in bytewise-ascending key order
+ *   bb_item.is_bucket bucket entries carry child != NULL and no value
+ *
+ * Keys are byte strings and must be non-empty. Values are binary-safe.
+ * Buckets may be nested arbitrarily; the reader understands both inline
+ * buckets (InBucket.root == 0, leaf page stored inside the item value) and
+ * regular on-page buckets. The writer always emits regular (non-inline)
+ * bucket pages, which is valid upstream bbolt.
+ */
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct bb_item {
+    unsigned char *key;
+    size_t keylen;
+    unsigned char *value;
+    size_t vallen;
+    int is_bucket;
+    struct bb_bucket *child;
+} bb_item;
+
+typedef struct bb_bucket {
+    char *name;
+    size_t namelen;
+    bb_item *items;
+    size_t nitems;
+    size_t cap;
+    unsigned long long sequence;
+} bb_bucket;
+
+typedef struct bb_db {
+    bb_bucket root;
+    unsigned int page_size;
+    unsigned long long txid;
+} bb_db;
+
+/*
+ * Read a bbolt file into *db.
+ * Returns 0 on success, -1 on error (err receives a human-readable message).
+ * On failure *db is left empty and all partially allocated memory is freed.
+ * The caller must bb_db_free() a successfully initialized db.
+ */
+int bb_read_file(const char *path, bb_db *db, char *err, size_t errcap);
+
+/*
+ * Atomically write *db as a valid bbolt file.
+ * The new file is created as a temporary file in the same directory, fully
+ * written, fsynced, then renamed over path (mode 0600). page_size == 0 means
+ * 4096. Returns 0 on success, -1 on error.
+ */
+int bb_write_file(const char *path, const bb_db *db, char *err, size_t errcap);
+
+/* Free all memory owned by *db and zero it. Safe on a zeroed struct. */
+void bb_db_free(bb_db *db);
+
+/* Find a top-level bucket by NUL-terminated name; NULL if absent. */
+bb_bucket *bb_find_bucket(bb_db *db, const char *name);
+
+/*
+ * Create (or return the existing) top-level bucket named name.
+ * Returns NULL if the name is empty/too long, memory is exhausted, or the
+ * name already exists as a plain value.
+ */
+bb_bucket *bb_add_bucket(bb_db *db, const char *name);
+
+/*
+ * Insert or replace key in b. Replaces the value if the key exists as a plain
+ * value; fails (-1) if the key exists as a bucket entry.
+ */
+int bb_set(bb_bucket *b, const void *key, size_t keylen,
+           const void *val, size_t vallen);
+
+/*
+ * Look up key. Returns a malloc'd copy of the value (non-NULL even for a
+ * zero-length value) and stores its length in *vallen. Returns NULL if the
+ * key is absent or names a bucket.
+ */
+void *bb_get(bb_bucket *b, const void *key, size_t keylen, size_t *vallen);
+
+/*
+ * Delete key. Returns 0 if the key was deleted or was already absent, -1 for
+ * invalid arguments or if key names a bucket entry (bbolt behaviour).
+ */
+int bb_del(bb_bucket *b, const void *key, size_t keylen);
+
+/*
+ * Delete a bucket entry and free its whole subtree. Returns 0 if the bucket
+ * was deleted or was already absent, -1 for invalid arguments or if the key
+ * names a plain value. Works at any level (top-level or nested).
+ */
+int bb_del_bucket(bb_bucket *b, const void *key, size_t keylen);
+
+
+/*
+ * bbolt_io.c -- self-contained bbolt (BoltDB) file reader/writer.
+ *
+ * On-disk format (bbolt v1.4.x / v1.5.x, meta version 2):
+ *
+ *   page header (16 bytes): id u64, flags u16, count u16, overflow u32
+ *   meta page body at +16:  magic u32 (0xED0CDAED), version u32 (2),
+ *                           pageSize u32, flags u32, root.root u64,
+ *                           root.sequence u64, freelist u64, pgid u64,
+ *                           txid u64, checksum u64 (FNV-1a 64 over first 56
+ *                           bytes of the meta, i.e. through txid)
+ *   leaf element (16 bytes): flags u32, pos u32, ksize u32, vsize u32
+ *   branch element (16):     pos u32, ksize u32, pgid u64
+ *   pos is relative to the element address; data starts at 16 + 16*count and
+ *   holds key (+ value for leaves) contiguously.
+ *
+ * Only libc is used. Multi-byte integers are encoded/decoded byte by byte so
+ * the code is independent of host endianness.
+ */
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define BB_PAGE_HEADER   16u
+#define BB_ELEM_SIZE     16u
+#define BB_BUCKET_HEADER 16u
+
+#define BB_FLAG_BRANCH   0x01u
+#define BB_FLAG_LEAF     0x02u
+#define BB_FLAG_META     0x04u
+#define BB_FLAG_FREELIST 0x10u
+
+#define BB_BUCKET_LEAF_FLAG 0x01u
+
+#define BB_MAGIC   0xED0CDAEDu
+#define BB_VERSION 2u
+
+#define BB_MIN_PAGE_SIZE 1024u
+#define BB_MAX_PAGE_SIZE (16u * 1024u * 1024u)
+#define BB_MAX_DEPTH     64
+#define BB_MAX_KEY_SIZE  32768u
+#define BB_MAX_VALUE_SIZE 0x7FFFFFFEu
+#define BB_NO_FREELIST   UINT64_MAX
+
+/* ------------------------------------------------------------------ */
+/* Little-endian load/store                                            */
+/* ------------------------------------------------------------------ */
+
+static uint16_t bb_rd16(const unsigned char *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t bb_rd32(const unsigned char *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t bb_rd64(const unsigned char *p)
+{
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
+static void bb_wr16(unsigned char *p, uint16_t v)
+{
+    p[0] = (unsigned char)(v & 0xFFu);
+    p[1] = (unsigned char)((v >> 8) & 0xFFu);
+}
+
+static void bb_wr32(unsigned char *p, uint32_t v)
+{
+    p[0] = (unsigned char)(v & 0xFFu);
+    p[1] = (unsigned char)((v >> 8) & 0xFFu);
+    p[2] = (unsigned char)((v >> 16) & 0xFFu);
+    p[3] = (unsigned char)((v >> 24) & 0xFFu);
+}
+
+static void bb_wr64(unsigned char *p, uint64_t v)
+{
+    p[0] = (unsigned char)(v & 0xFFu);
+    p[1] = (unsigned char)((v >> 8) & 0xFFu);
+    p[2] = (unsigned char)((v >> 16) & 0xFFu);
+    p[3] = (unsigned char)((v >> 24) & 0xFFu);
+    p[4] = (unsigned char)((v >> 32) & 0xFFu);
+    p[5] = (unsigned char)((v >> 40) & 0xFFu);
+    p[6] = (unsigned char)((v >> 48) & 0xFFu);
+    p[7] = (unsigned char)((v >> 56) & 0xFFu);
+}
+
+static uint64_t bb_fnv1a64(const unsigned char *p, size_t n)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+/* ------------------------------------------------------------------ */
+/* Small helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+static int bb_err(char *err, size_t errcap, const char *fmt, ...)
+{
+    if (err != NULL && errcap > 0) {
+        va_list ap;
+        va_start(ap, fmt);
+        (void)vsnprintf(err, errcap, fmt, ap);
+        va_end(ap);
+    }
+    return -1;
+}
+
+static int bb_keycmp(const unsigned char *a, size_t alen,
+                     const unsigned char *b, size_t blen)
+{
+    size_t n = (alen < blen) ? alen : blen;
+    int c = 0;
+    if (n > 0) {
+        c = memcmp(a, b, n);
+    }
+    if (c != 0) {
+        return (c < 0) ? -1 : 1;
+    }
+    if (alen < blen) {
+        return -1;
+    }
+    if (alen > blen) {
+        return 1;
+    }
+    return 0;
+}
+
+static unsigned char *bb_dup(const void *p, size_t n)
+{
+    unsigned char *q;
+    if (n == 0) {
+        n = 1; /* keep zero-length values distinguishable from NULL */
+    }
+    q = (unsigned char *)malloc(n);
+    if (q == NULL) {
+        return NULL;
+    }
+    if (p != NULL) {
+        memcpy(q, p, n);
+    }
+    return q;
+}
+
+/* ------------------------------------------------------------------ */
+/* Bucket memory management (used by reader and public helpers)        */
+/* ------------------------------------------------------------------ */
+
+static void bb_bucket_clear(bb_bucket *b)
+{
+    size_t i;
+    if (b == NULL) {
+        return;
+    }
+    for (i = 0; i < b->nitems; i++) {
+        bb_item *it = &b->items[i];
+        free(it->key);
+        it->key = NULL;
+        if (it->is_bucket) {
+            if (it->child != NULL) {
+                bb_bucket_clear(it->child);
+                free(it->child);
+            }
+        } else {
+            free(it->value);
+        }
+        it->value = NULL;
+        it->child = NULL;
+    }
+    free(b->items);
+    free(b->name);
+    memset(b, 0, sizeof(*b));
+}
+
+void bb_db_free(bb_db *db)
+{
+    if (db == NULL) {
+        return;
+    }
+    bb_bucket_clear(&db->root);
+    memset(db, 0, sizeof(*db));
+}
+
+/* Append an item; takes ownership of key/val/child only on success. */
+static int bb_bucket_append(bb_bucket *b, unsigned char *key, size_t keylen,
+                            unsigned char *val, size_t vallen, int is_bucket,
+                            bb_bucket *child)
+{
+    bb_item *it;
+    if (b->nitems == b->cap) {
+        size_t ncap = (b->cap == 0) ? 8 : b->cap * 2;
+        bb_item *ni;
+        if (ncap < b->cap || ncap > (SIZE_MAX / sizeof(bb_item))) {
+            return -1;
+        }
+        ni = (bb_item *)realloc(b->items, ncap * sizeof(bb_item));
+        if (ni == NULL) {
+            return -1;
+        }
+        b->items = ni;
+        b->cap = ncap;
+    }
+    it = &b->items[b->nitems];
+    memset(it, 0, sizeof(*it));
+    it->key = key;
+    it->keylen = keylen;
+    it->value = val;
+    it->vallen = vallen;
+    it->is_bucket = is_bucket;
+    it->child = child;
+    b->nitems++;
+    return 0;
+}
+
+/* Binary search; returns index of key or the insertion point (as -(i+1)). */
+static long bb_bucket_search(const bb_bucket *b, const unsigned char *key,
+                             size_t keylen)
+{
+    size_t lo = 0;
+    size_t hi = b->nitems;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int c = bb_keycmp(b->items[mid].key, b->items[mid].keylen, key, keylen);
+        if (c == 0) {
+            return (long)mid;
+        }
+        if (c < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return -(long)lo - 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Public helpers                                                      */
+/* ------------------------------------------------------------------ */
+
+bb_bucket *bb_find_bucket(bb_db *db, const char *name)
+{
+    size_t nlen;
+    long idx;
+
+    if (db == NULL || name == NULL) {
+        return NULL;
+    }
+    nlen = strlen(name);
+    if (nlen == 0 || nlen > BB_MAX_KEY_SIZE) {
+        return NULL;
+    }
+    idx = bb_bucket_search(&db->root, (const unsigned char *)name, nlen);
+    if (idx < 0) {
+        return NULL;
+    }
+    if (!db->root.items[idx].is_bucket) {
+        return NULL;
+    }
+    return db->root.items[idx].child;
+}
+
+bb_bucket *bb_add_bucket(bb_db *db, const char *name)
+{
+    size_t nlen;
+    long idx;
+    bb_bucket *child;
+    unsigned char *key;
+    unsigned char *nm;
+
+    if (db == NULL || name == NULL) {
+        return NULL;
+    }
+    nlen = strlen(name);
+    if (nlen == 0 || nlen > BB_MAX_KEY_SIZE) {
+        return NULL;
+    }
+    idx = bb_bucket_search(&db->root, (const unsigned char *)name, nlen);
+    if (idx >= 0) {
+        if (db->root.items[idx].is_bucket) {
+            return db->root.items[idx].child;
+        }
+        return NULL;
+    }
+    idx = -(idx + 1);
+    child = (bb_bucket *)calloc(1, sizeof(*child));
+    nm = bb_dup(name, nlen);
+    key = bb_dup(name, nlen);
+    if (child == NULL || nm == NULL || key == NULL) {
+        free(child);
+        free(nm);
+        free(key);
+        return NULL;
+    }
+    child->name = (char *)nm;
+    child->namelen = nlen;
+    child->sequence = 0;
+    if (bb_bucket_append(&db->root, key, nlen, NULL, 0, 1, child) != 0) {
+        free(child);
+        free(nm);
+        free(key);
+        return NULL;
+    }
+    /* Keep items strictly sorted. */
+    if ((size_t)idx + 1 < db->root.nitems) {
+        bb_item tmp = db->root.items[db->root.nitems - 1];
+        memmove(&db->root.items[(size_t)idx + 1], &db->root.items[idx],
+                (db->root.nitems - 1 - (size_t)idx) * sizeof(bb_item));
+        db->root.items[idx] = tmp;
+    }
+    return child;
+}
+
+int bb_set(bb_bucket *b, const void *key, size_t keylen,
+           const void *val, size_t vallen)
+{
+    long idx;
+    unsigned char *copy;
+
+    if (b == NULL || key == NULL || keylen == 0 || keylen > BB_MAX_KEY_SIZE) {
+        return -1;
+    }
+    if (vallen > 0 && val == NULL) {
+        return -1;
+    }
+    if (vallen > BB_MAX_VALUE_SIZE) {
+        return -1;
+    }
+    idx = bb_bucket_search(b, (const unsigned char *)key, keylen);
+    if (idx >= 0) {
+        bb_item *it = &b->items[idx];
+        if (it->is_bucket) {
+            return -1;
+        }
+        copy = bb_dup(val, vallen);
+        if (copy == NULL) {
+            return -1;
+        }
+        free(it->value);
+        it->value = copy;
+        it->vallen = vallen;
+        return 0;
+    }
+    idx = -(idx + 1);
+    copy = bb_dup(val, vallen);
+    if (copy == NULL) {
+        return -1;
+    }
+    if (bb_bucket_append(b, NULL, 0, NULL, 0, 0, NULL) != 0) {
+        free(copy);
+        return -1;
+    }
+    b->items[b->nitems - 1].key = bb_dup(key, keylen);
+    if (b->items[b->nitems - 1].key == NULL) {
+        b->nitems--;
+        free(copy);
+        return -1;
+    }
+    b->items[b->nitems - 1].keylen = keylen;
+    b->items[b->nitems - 1].value = copy;
+    b->items[b->nitems - 1].vallen = vallen;
+    b->items[b->nitems - 1].is_bucket = 0;
+    b->items[b->nitems - 1].child = NULL;
+    /* Move into sorted position (append put it last). */
+    if ((size_t)idx + 1 < b->nitems) {
+        bb_item tmp = b->items[b->nitems - 1];
+        memmove(&b->items[(size_t)idx + 1], &b->items[idx],
+                (b->nitems - 1 - (size_t)idx) * sizeof(bb_item));
+        b->items[idx] = tmp;
+    }
+    return 0;
+}
+
+void *bb_get(bb_bucket *b, const void *key, size_t keylen, size_t *vallen)
+{
+    long idx;
+    unsigned char *copy;
+    bb_item *it;
+
+    if (vallen != NULL) {
+        *vallen = 0;
+    }
+    if (b == NULL || key == NULL || keylen == 0) {
+        return NULL;
+    }
+    idx = bb_bucket_search(b, (const unsigned char *)key, keylen);
+    if (idx < 0) {
+        return NULL;
+    }
+    it = &b->items[idx];
+    if (it->is_bucket) {
+        return NULL;
+    }
+    copy = bb_dup(it->value, it->vallen);
+    if (copy == NULL) {
+        return NULL;
+    }
+    if (vallen != NULL) {
+        *vallen = it->vallen;
+    }
+    return copy;
+}
+
+int bb_del(bb_bucket *b, const void *key, size_t keylen)
+{
+    long idx;
+
+    if (b == NULL || key == NULL || keylen == 0) {
+        return -1;
+    }
+    idx = bb_bucket_search(b, (const unsigned char *)key, keylen);
+    if (idx < 0) {
+        return 0; /* bbolt: deleting an absent key is a no-op success */
+    }
+    if (b->items[idx].is_bucket) {
+        return -1;
+    }
+    free(b->items[idx].key);
+    free(b->items[idx].value);
+    if ((size_t)idx + 1 < b->nitems) {
+        memmove(&b->items[idx], &b->items[idx + 1],
+                (b->nitems - (size_t)idx - 1) * sizeof(bb_item));
+    }
+    b->nitems--;
+    return 0;
+}
+
+int bb_del_bucket(bb_bucket *b, const void *key, size_t keylen)
+{
+    long idx;
+
+    if (b == NULL || key == NULL || keylen == 0) {
+        return -1;
+    }
+    idx = bb_bucket_search(b, (const unsigned char *)key, keylen);
+    if (idx < 0) {
+        return 0; /* deleting an absent bucket is a no-op success */
+    }
+    if (!b->items[idx].is_bucket) {
+        return -1;
+    }
+    free(b->items[idx].key);
+    if (b->items[idx].child != NULL) {
+        bb_bucket_clear(b->items[idx].child);
+        free(b->items[idx].child);
+    }
+    if ((size_t)idx + 1 < b->nitems) {
+        memmove(&b->items[idx], &b->items[idx + 1],
+                (b->nitems - (size_t)idx - 1) * sizeof(bb_item));
+    }
+    b->nitems--;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Reader                                                              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    uint32_t page_size;
+    uint64_t root_root;
+    uint64_t root_seq;
+    uint64_t freelist;
+    uint64_t pgid;
+    uint64_t txid;
+    uint64_t checksum;
+} bb_meta;
+
+typedef struct {
+    const unsigned char *data;
+    size_t size;
+    unsigned int page_size;
+    uint64_t pgid;
+    uint64_t txid;
+    unsigned char *visited;
+} bb_reader;
+
+typedef struct {
+    const unsigned char *base;
+    size_t phys;      /* bytes available from base (1+overflow pages) */
+    uint16_t flags;
+    uint16_t count;
+    uint32_t overflow;
+    uint64_t id;
+} bb_page;
+
+static int bb_meta_parse(const unsigned char *page, size_t avail,
+                         int expect_page, bb_meta *m)
+{
+    const unsigned char *q;
+    if (avail < BB_PAGE_HEADER + 64) {
+        return 0;
+    }
+    /* bbolt's Tx.page() asserts meta pages carry exactly this header. */
+    if (bb_rd16(page + 8) != BB_FLAG_META || bb_rd16(page + 10) != 0 ||
+        bb_rd32(page + 12) != 0) {
+        return 0;
+    }
+    if (expect_page >= 0 && bb_rd64(page) != (uint64_t)expect_page) {
+        return 0;
+    }
+    q = page + BB_PAGE_HEADER;
+    m->page_size = bb_rd32(q + 8);
+    m->root_root = bb_rd64(q + 16);
+    m->root_seq = bb_rd64(q + 24);
+    m->freelist = bb_rd64(q + 32);
+    m->pgid = bb_rd64(q + 40);
+    m->txid = bb_rd64(q + 48);
+    m->checksum = bb_rd64(q + 56);
+    if (bb_rd32(q) != BB_MAGIC || bb_rd32(q + 4) != BB_VERSION) {
+        return 0;
+    }
+    if (m->page_size < BB_MIN_PAGE_SIZE || m->page_size > BB_MAX_PAGE_SIZE ||
+        (m->page_size % 1024u) != 0) {
+        return 0;
+    }
+    if (bb_fnv1a64(q, 56) != m->checksum) {
+        return 0;
+    }
+    return 1;
+}
+
+static int bb_load_file(const char *path, unsigned char **out, size_t *outlen,
+                        char *err, size_t errcap)
+{
+    int fd;
+    struct stat st;
+    unsigned char *buf;
+    size_t got = 0;
+    size_t want;
+    ssize_t n;
+
+    *out = NULL;
+    *outlen = 0;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return bb_err(err, errcap, "cannot open '%s': %s", path, strerror(errno));
+    }
+    if (fstat(fd, &st) != 0) {
+        int e = errno;
+        (void)close(fd);
+        return bb_err(err, errcap, "cannot stat '%s': %s", path, strerror(e));
+    }
+    if (st.st_size <= 0) {
+        (void)close(fd);
+        return bb_err(err, errcap, "'%s': empty file", path);
+    }
+    if ((uintmax_t)st.st_size > (uintmax_t)SIZE_MAX) {
+        (void)close(fd);
+        return bb_err(err, errcap, "'%s': file too large", path);
+    }
+    want = (size_t)st.st_size;
+    buf = (unsigned char *)malloc(want);
+    if (buf == NULL) {
+        (void)close(fd);
+        return bb_err(err, errcap, "'%s': out of memory", path);
+    }
+    while (got < want) {
+        n = read(fd, buf + got, want - got);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            {
+                int e = errno;
+                free(buf);
+                (void)close(fd);
+                return bb_err(err, errcap, "'%s': read failed: %s", path,
+                              strerror(e));
+            }
+        }
+        if (n == 0) {
+            free(buf);
+            (void)close(fd);
+            return bb_err(err, errcap, "'%s': unexpected EOF", path);
+        }
+        got += (size_t)n;
+    }
+    (void)close(fd);
+    *out = buf;
+    *outlen = want;
+    return 0;
+}
+
+static int bb_page_mark(bb_reader *r, uint64_t pgid, uint32_t overflow,
+                        char *err, size_t errcap)
+{
+    uint64_t i;
+    for (i = 0; i <= (uint64_t)overflow; i++) {
+        uint64_t id = pgid + i;
+        size_t bit;
+        if (id >= r->pgid) {
+            return bb_err(err, errcap,
+                          "page %llu overflow exceeds high water mark %llu",
+                          (unsigned long long)pgid,
+                          (unsigned long long)r->pgid);
+        }
+        if (r->visited == NULL) {
+            continue;
+        }
+        bit = (size_t)id;
+        if ((r->visited[bit >> 3] & (unsigned char)(1u << (bit & 7u))) != 0) {
+            return bb_err(err, errcap,
+                          "page %llu referenced more than once (cycle?)",
+                          (unsigned long long)id);
+        }
+        r->visited[bit >> 3] |= (unsigned char)(1u << (bit & 7u));
+    }
+    return 0;
+}
+
+static int bb_page_load(bb_reader *r, uint64_t pgid, bb_page *p,
+                        char *err, size_t errcap)
+{
+    uint64_t off;
+    uint64_t phys;
+    uint32_t overflow;
+    uint16_t flags;
+    uint16_t count;
+
+    if (pgid < 2) {
+        return bb_err(err, errcap, "invalid page id %llu",
+                      (unsigned long long)pgid);
+    }
+    if (pgid >= r->pgid) {
+        return bb_err(err, errcap,
+                      "page id %llu out of range (high water mark %llu)",
+                      (unsigned long long)pgid,
+                      (unsigned long long)r->pgid);
+    }
+    off = pgid * (uint64_t)r->page_size;
+    if (off > (uint64_t)r->size || (uint64_t)r->size - off < BB_PAGE_HEADER) {
+        return bb_err(err, errcap, "page %llu: truncated header",
+                      (unsigned long long)pgid);
+    }
+    p->base = r->data + (size_t)off;
+    p->id = bb_rd64(p->base);
+    flags = bb_rd16(p->base + 8);
+    count = bb_rd16(p->base + 10);
+    overflow = bb_rd32(p->base + 12);
+    if (p->id != pgid) {
+        return bb_err(err, errcap,
+                      "page at offset %llu claims id %llu (expected %llu)",
+                      (unsigned long long)off,
+                      (unsigned long long)p->id,
+                      (unsigned long long)pgid);
+    }
+    if (flags != BB_FLAG_BRANCH && flags != BB_FLAG_LEAF) {
+        return bb_err(err, errcap,
+                      "page %llu: unexpected flags 0x%x in bucket tree",
+                      (unsigned long long)pgid, (unsigned int)flags);
+    }
+    if ((uint64_t)overflow + 1u > (uint64_t)SIZE_MAX / r->page_size) {
+        return bb_err(err, errcap, "page %llu: overflow too large",
+                      (unsigned long long)pgid);
+    }
+    phys = ((uint64_t)overflow + 1u) * (uint64_t)r->page_size;
+    if (phys > (uint64_t)r->size - off) {
+        return bb_err(err, errcap,
+                      "page %llu: overflow pages run past end of file",
+                      (unsigned long long)pgid);
+    }
+    if (BB_PAGE_HEADER + (size_t)count * BB_ELEM_SIZE > (size_t)phys) {
+        return bb_err(err, errcap, "page %llu: element table overflows page",
+                      (unsigned long long)pgid);
+    }
+    if (bb_page_mark(r, pgid, overflow, err, errcap) != 0) {
+        return -1;
+    }
+    p->phys = (size_t)phys;
+    p->flags = flags;
+    p->count = count;
+    p->overflow = overflow;
+    return 0;
+}
+
+static int bb_tree_parse(bb_reader *r, uint64_t pgid, bb_bucket *b, int depth,
+                         char *err, size_t errcap);
+
+static int bb_leaf_parse(bb_reader *r, const unsigned char *base, size_t phys,
+                         uint16_t count, bb_bucket *b, int depth,
+                         char *err, size_t errcap)
+{
+    size_t i;
+    size_t data_start = BB_PAGE_HEADER + (size_t)count * BB_ELEM_SIZE;
+
+    for (i = 0; i < count; i++) {
+        size_t elem_off = BB_PAGE_HEADER + i * BB_ELEM_SIZE;
+        uint32_t flags = bb_rd32(base + elem_off);
+        uint32_t pos = bb_rd32(base + elem_off + 4);
+        uint32_t ksize = bb_rd32(base + elem_off + 8);
+        uint32_t vsize = bb_rd32(base + elem_off + 12);
+        uint64_t data_off = (uint64_t)elem_off + (uint64_t)pos;
+        const unsigned char *key;
+        const unsigned char *val;
+        unsigned char *key_copy;
+
+        if (ksize == 0) {
+            return bb_err(err, errcap, "leaf page: empty key");
+        }
+        if (data_off < (uint64_t)data_start) {
+            return bb_err(err, errcap,
+                          "leaf page: element %zu data offset before data area",
+                          i);
+        }
+        if (data_off > (uint64_t)phys ||
+            (uint64_t)ksize > (uint64_t)phys - data_off ||
+            (uint64_t)vsize > (uint64_t)phys - data_off - (uint64_t)ksize) {
+            return bb_err(err, errcap,
+                          "leaf page: element %zu data out of bounds "
+                          "(pos=%u ksize=%u vsize=%u)",
+                          i, (unsigned int)pos, (unsigned int)ksize,
+                          (unsigned int)vsize);
+        }
+        key = base + (size_t)data_off;
+        val = key + ksize;
+        if (flags != 0 && flags != BB_BUCKET_LEAF_FLAG) {
+            return bb_err(err, errcap,
+                          "leaf page: element %zu has unknown flags 0x%x",
+                          i, (unsigned int)flags);
+        }
+        if (b->nitems > 0) {
+            const bb_item *prev = &b->items[b->nitems - 1];
+            if (bb_keycmp(prev->key, prev->keylen, key, ksize) >= 0) {
+                return bb_err(err, errcap,
+                              "leaf page: keys are not strictly ascending");
+            }
+        }
+        key_copy = bb_dup(key, ksize);
+        if (key_copy == NULL) {
+            return bb_err(err, errcap, "out of memory");
+        }
+        if (flags == BB_BUCKET_LEAF_FLAG) {
+            uint64_t root;
+            uint64_t seq;
+            bb_bucket *child;
+
+            if (vsize < BB_BUCKET_HEADER) {
+                free(key_copy);
+                return bb_err(err, errcap,
+                              "bucket item: truncated bucket header");
+            }
+            root = bb_rd64(val);
+            seq = bb_rd64(val + 8);
+            child = (bb_bucket *)calloc(1, sizeof(*child));
+            if (child == NULL) {
+                free(key_copy);
+                return bb_err(err, errcap, "out of memory");
+            }
+            child->name = (char *)bb_dup(key, ksize);
+            child->namelen = ksize;
+            child->sequence = (unsigned long long)seq;
+            if (child->name == NULL) {
+                free(child);
+                free(key_copy);
+                return bb_err(err, errcap, "out of memory");
+            }
+            if (root == 0) {
+                size_t inline_len;
+                uint16_t inline_flags;
+                uint16_t inline_count;
+                uint32_t inline_overflow;
+
+                if (depth + 1 > BB_MAX_DEPTH) {
+                    bb_bucket_clear(child);
+                    free(child);
+                    free(key_copy);
+                    return bb_err(err, errcap, "bucket nesting too deep");
+                }
+                inline_len = (size_t)vsize - BB_BUCKET_HEADER;
+                if (inline_len < BB_PAGE_HEADER) {
+                    bb_bucket_clear(child);
+                    free(child);
+                    free(key_copy);
+                    return bb_err(err, errcap, "inline bucket page truncated");
+                }
+                inline_flags = bb_rd16(val + BB_BUCKET_HEADER + 8);
+                inline_count = bb_rd16(val + BB_BUCKET_HEADER + 10);
+                inline_overflow = bb_rd32(val + BB_BUCKET_HEADER + 12);
+                if (inline_flags != BB_FLAG_LEAF || inline_overflow != 0) {
+                    bb_bucket_clear(child);
+                    free(child);
+                    free(key_copy);
+                    return bb_err(err, errcap,
+                                  "inline bucket page has invalid header");
+                }
+                if (BB_PAGE_HEADER + (size_t)inline_count * BB_ELEM_SIZE >
+                    inline_len) {
+                    bb_bucket_clear(child);
+                    free(child);
+                    free(key_copy);
+                    return bb_err(err, errcap,
+                                  "inline bucket element table overflows");
+                }
+                if (bb_leaf_parse(r, val + BB_BUCKET_HEADER, inline_len,
+                                  inline_count, child, depth + 1,
+                                  err, errcap) != 0) {
+                    bb_bucket_clear(child);
+                    free(child);
+                    free(key_copy);
+                    return -1;
+                }
+            } else {
+                if (bb_tree_parse(r, root, child, depth + 1, err, errcap) != 0) {
+                    bb_bucket_clear(child);
+                    free(child);
+                    free(key_copy);
+                    return -1;
+                }
+            }
+            if (bb_bucket_append(b, key_copy, ksize, NULL, 0, 1, child) != 0) {
+                bb_bucket_clear(child);
+                free(child);
+                free(key_copy);
+                return bb_err(err, errcap, "out of memory");
+            }
+        } else {
+            unsigned char *val_copy = bb_dup(val, vsize);
+            if (val_copy == NULL) {
+                free(key_copy);
+                return bb_err(err, errcap, "out of memory");
+            }
+            if (bb_bucket_append(b, key_copy, ksize, val_copy, vsize, 0,
+                                 NULL) != 0) {
+                free(key_copy);
+                free(val_copy);
+                return bb_err(err, errcap, "out of memory");
+            }
+        }
+    }
+    return 0;
+}
+
+static int bb_tree_parse(bb_reader *r, uint64_t pgid, bb_bucket *b, int depth,
+                         char *err, size_t errcap)
+{
+    bb_page p;
+    size_t i;
+
+    if (depth > BB_MAX_DEPTH) {
+        return bb_err(err, errcap, "bucket nesting too deep");
+    }
+    if (bb_page_load(r, pgid, &p, err, errcap) != 0) {
+        return -1;
+    }
+    if (p.flags == BB_FLAG_LEAF) {
+        return bb_leaf_parse(r, p.base, p.phys, p.count, b, depth,
+                             err, errcap);
+    }
+    /* branch page */
+    {
+        size_t data_start = BB_PAGE_HEADER + (size_t)p.count * BB_ELEM_SIZE;
+        const unsigned char *prev_key = NULL;
+        size_t prev_klen = 0;
+
+        for (i = 0; i < p.count; i++) {
+            size_t elem_off = BB_PAGE_HEADER + i * BB_ELEM_SIZE;
+            uint32_t pos = bb_rd32(p.base + elem_off);
+            uint32_t ksize = bb_rd32(p.base + elem_off + 4);
+            uint64_t child = bb_rd64(p.base + elem_off + 8);
+            uint64_t data_off = (uint64_t)elem_off + (uint64_t)pos;
+            const unsigned char *key;
+
+            if (ksize == 0) {
+                return bb_err(err, errcap, "branch page: empty key");
+            }
+            if (data_off < (uint64_t)data_start) {
+                return bb_err(err, errcap,
+                              "branch page: element %zu data offset invalid", i);
+            }
+            if (data_off > (uint64_t)p.phys ||
+                (uint64_t)ksize > (uint64_t)p.phys - data_off) {
+                return bb_err(err, errcap,
+                              "branch page: element %zu key out of bounds", i);
+            }
+            key = p.base + (size_t)data_off;
+            if (prev_key != NULL &&
+                bb_keycmp(prev_key, prev_klen, key, ksize) >= 0) {
+                return bb_err(err, errcap,
+                              "branch page: keys are not strictly ascending");
+            }
+            prev_key = key;
+            prev_klen = ksize;
+            if (child < 2 || child >= r->pgid) {
+                return bb_err(err, errcap,
+                              "branch page: child page id %llu out of range",
+                              (unsigned long long)child);
+            }
+            if (bb_tree_parse(r, child, b, depth + 1, err, errcap) != 0) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+int bb_read_file(const char *path, bb_db *db, char *err, size_t errcap)
+{
+    bb_reader r;
+    bb_meta m0;
+    bb_meta m1;
+    bb_meta *use = NULL;
+    int v0 = 0;
+    int v1 = 0;
+    unsigned char *buf = NULL;
+    size_t size = 0;
+    unsigned int ps;
+    uint64_t total_bytes;
+
+    if (db == NULL) {
+        return bb_err(err, errcap, "bb_read_file: db is NULL");
+    }
+    memset(db, 0, sizeof(*db));
+    if (path == NULL) {
+        return bb_err(err, errcap, "bb_read_file: path is NULL");
+    }
+    if (bb_load_file(path, &buf, &size, err, errcap) != 0) {
+        return -1;
+    }
+    if (size >= BB_PAGE_HEADER + 64) {
+        v0 = bb_meta_parse(buf, size, 0, &m0);
+    }
+    ps = v0 ? m0.page_size : 0;
+    if (ps == 0) {
+        /* Meta page 0 is unreadable: find meta page 1 the way bbolt does. */
+        unsigned int k;
+        for (k = 0; k <= 14; k++) {
+            uint64_t off = (uint64_t)1024u << k;
+            bb_meta cand;
+            if (off + BB_PAGE_HEADER + 64 > (uint64_t)size) {
+                break;
+            }
+            if (bb_meta_parse(buf + (size_t)off, size - (size_t)off, -1,
+                              &cand)) {
+                ps = cand.page_size;
+                break;
+            }
+        }
+    }
+    if (ps == 0) {
+        free(buf);
+        return bb_err(err, errcap, "not a bbolt file: no valid meta page");
+    }
+    if ((uint64_t)ps * 2u > (uint64_t)size) {
+        free(buf);
+        return bb_err(err, errcap,
+                      "corrupt bbolt file: file smaller than two meta pages");
+    }
+    v0 = bb_meta_parse(buf, size, 0, &m0);
+    v1 = bb_meta_parse(buf + ps, size - ps, 1, &m1);
+    if (!v0 && !v1) {
+        free(buf);
+        return bb_err(err, errcap,
+                      "corrupt bbolt file: both meta pages are invalid");
+    }
+    if (v0 && v1 && m0.page_size != m1.page_size) {
+        free(buf);
+        return bb_err(err, errcap,
+                      "corrupt bbolt file: meta pages disagree on page size");
+    }
+    if (v0 && v1) {
+        use = (m1.txid > m0.txid) ? &m1 : &m0;
+    } else {
+        use = v0 ? &m0 : &m1;
+    }
+    if (use->page_size != ps) {
+        free(buf);
+        return bb_err(err, errcap,
+                      "corrupt bbolt file: inconsistent page size");
+    }
+    if (use->pgid < 3 || use->root_root < 2 || use->root_root >= use->pgid) {
+        free(buf);
+        return bb_err(err, errcap,
+                      "corrupt bbolt file: invalid root page or high water mark");
+    }
+    if (use->pgid > (uint64_t)size / (uint64_t)ps) {
+        free(buf);
+        return bb_err(err, errcap,
+                      "truncated bbolt file: high water mark %llu exceeds "
+                      "file capacity (%zu bytes, page size %u)",
+                      (unsigned long long)use->pgid, size, ps);
+    }
+    total_bytes = use->pgid * (uint64_t)ps;
+    (void)total_bytes;
+    memset(&r, 0, sizeof(r));
+    r.data = buf;
+    r.size = size;
+    r.page_size = ps;
+    r.pgid = use->pgid;
+    r.txid = use->txid;
+    r.visited = (unsigned char *)calloc((size_t)((use->pgid + 7) / 8), 1);
+    if (r.visited == NULL) {
+        free(buf);
+        return bb_err(err, errcap, "out of memory");
+    }
+    /* Meta pages are not part of the bucket tree. */
+    r.visited[0] |= 0x03u;
+
+    db->page_size = ps;
+    db->txid = use->txid;
+    db->root.sequence = use->root_seq;
+    db->root.name = NULL;
+    db->root.namelen = 0;
+
+    if (bb_tree_parse(&r, use->root_root, &db->root, 0, err, errcap) != 0) {
+        free(r.visited);
+        free(buf);
+        bb_db_free(db);
+        return -1;
+    }
+    free(r.visited);
+    free(buf);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Writer                                                              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    unsigned char *data;
+    size_t phys;
+    uint64_t id;
+} bb_out_page;
+
+typedef struct {
+    bb_out_page *pages;
+    size_t npages;
+    size_t cap;
+    uint64_t next_pgid;
+    unsigned int ps;
+} bb_writer;
+
+typedef struct {
+    const unsigned char *key;
+    size_t klen;
+    const unsigned char *val;
+    size_t vlen;
+    uint64_t flags;
+} bb_ent;
+
+typedef struct {
+    uint64_t id;
+    const unsigned char *first;
+    size_t firstlen;
+} bb_child;
+
+static void bb_writer_clear(bb_writer *w)
+{
+    size_t i;
+    for (i = 0; i < w->npages; i++) {
+        free(w->pages[i].data);
+    }
+    free(w->pages);
+    memset(w, 0, sizeof(*w));
+}
+
+static unsigned char *bb_writer_new_page(bb_writer *w, uint32_t overflow,
+                                         uint16_t flags, uint16_t count,
+                                         uint64_t *id_out,
+                                         char *err, size_t errcap)
+{
+    uint64_t nphys = (uint64_t)overflow + 1u;
+    size_t phys;
+    unsigned char *data;
+    bb_out_page *np;
+
+    if (nphys > (uint64_t)SIZE_MAX / (uint64_t)w->ps) {
+        (void)bb_err(err, errcap, "page too large");
+        return NULL;
+    }
+    phys = (size_t)nphys * w->ps;
+    data = (unsigned char *)calloc(1, phys);
+    if (data == NULL) {
+        (void)bb_err(err, errcap, "out of memory");
+        return NULL;
+    }
+    if (w->npages == w->cap) {
+        size_t ncap = (w->cap == 0) ? 16 : w->cap * 2;
+        np = (bb_out_page *)realloc(w->pages, ncap * sizeof(bb_out_page));
+        if (np == NULL) {
+            free(data);
+            (void)bb_err(err, errcap, "out of memory");
+            return NULL;
+        }
+        w->pages = np;
+        w->cap = ncap;
+    }
+    w->pages[w->npages].data = data;
+    w->pages[w->npages].phys = phys;
+    w->pages[w->npages].id = w->next_pgid;
+    w->npages++;
+    if (id_out != NULL) {
+        *id_out = w->next_pgid;
+    }
+    w->next_pgid += nphys;
+    bb_wr64(data, w->next_pgid - nphys);
+    bb_wr16(data + 8, flags);
+    bb_wr16(data + 10, count);
+    bb_wr32(data + 12, overflow);
+    return data;
+}
+
+static int bb_overflow_for(size_t len, unsigned int ps, uint32_t *out)
+{
+    uint64_t pages;
+    if (len == 0) {
+        *out = 0;
+        return 0;
+    }
+    pages = ((uint64_t)len + ps - 1u) / ps;
+    if (pages == 0) {
+        pages = 1;
+    }
+    if (pages - 1u > UINT32_MAX) {
+        return -1;
+    }
+    *out = (uint32_t)(pages - 1u);
+    return 0;
+}
+
+static int bb_pack(const bb_ent *ents, size_t n, size_t ps,
+                   size_t **bounds_out, size_t *ngroups_out)
+{
+    size_t *bounds;
+    size_t ng = 0;
+    size_t start = 0;
+    size_t len = BB_PAGE_HEADER;
+    size_t i;
+
+    bounds = (size_t *)malloc((n + 2) * sizeof(size_t));
+    if (bounds == NULL) {
+        return -1;
+    }
+    if (n == 0) {
+        bounds[0] = 0;
+        bounds[1] = 0;
+        *bounds_out = bounds;
+        *ngroups_out = 1;
+        return 0;
+    }
+    bounds[0] = 0;
+    for (i = 0; i < n; i++) {
+        size_t esz = BB_ELEM_SIZE + ents[i].klen + ents[i].vlen;
+        if (i > start && len + esz > ps) {
+            ng++;
+            bounds[ng] = i;
+            start = i;
+            len = BB_PAGE_HEADER;
+        }
+        len += esz;
+    }
+    ng++;
+    bounds[ng] = n;
+    /* Don't leave a lonely single element on the last page if we can move one
+     * over without overflowing that page. */
+    if (ng >= 2 && bounds[ng] - bounds[ng - 1] == 1 &&
+        bounds[ng - 1] - bounds[ng - 2] >= 3) {
+        size_t j = bounds[ng - 1] - 1;
+        size_t szj = BB_ELEM_SIZE + ents[j].klen + ents[j].vlen;
+        size_t szlast = BB_ELEM_SIZE + ents[bounds[ng - 1]].klen +
+                        ents[bounds[ng - 1]].vlen;
+        if (BB_PAGE_HEADER + 2 * BB_ELEM_SIZE + szj + szlast <= ps) {
+            bounds[ng - 1] -= 1;
+        }
+    }
+    *bounds_out = bounds;
+    *ngroups_out = ng;
+    return 0;
+}
+
+/*
+ * Pack branch-level entries. Unlike leaves, a branch page may overflow, so a
+ * page can always hold at least two child pointers. Requiring >=2 entries per
+ * branch page guarantees that each level strictly reduces the page count
+ * (otherwise, with huge keys, every page would hold one entry and the tree
+ * build would never terminate). A lonely final entry is merged into the
+ * previous page.
+ */
+static int bb_pack_children(const bb_ent *ents, size_t n, size_t ps,
+                            size_t **bounds_out, size_t *ngroups_out)
+{
+    size_t *bounds;
+    size_t ng = 0;
+    size_t start = 0;
+    size_t len = BB_PAGE_HEADER;
+    size_t cnt = 0;
+    size_t i;
+
+    bounds = (size_t *)malloc((n + 2) * sizeof(size_t));
+    if (bounds == NULL) {
+        return -1;
+    }
+    if (n == 0) {
+        bounds[0] = 0;
+        bounds[1] = 0;
+        *bounds_out = bounds;
+        *ngroups_out = 1;
+        return 0;
+    }
+    bounds[0] = 0;
+    for (i = 0; i < n; i++) {
+        size_t esz = BB_ELEM_SIZE + ents[i].klen + ents[i].vlen;
+        if (cnt >= 2 && len + esz > ps) {
+            ng++;
+            bounds[ng] = i;
+            start = i;
+            len = BB_PAGE_HEADER;
+            cnt = 0;
+        }
+        len += esz;
+        cnt++;
+    }
+    ng++;
+    bounds[ng] = n;
+    if (ng >= 2 && bounds[ng] - bounds[ng - 1] == 1) {
+        bounds[ng - 1] = bounds[ng];
+        ng--;
+    }
+    /* Defensive: if the packing somehow made no progress, emit one (possibly
+     * overflow) branch page holding every child. */
+    if (n > 1 && ng >= n) {
+        ng = 1;
+        bounds[1] = n;
+    }
+    (void)start;
+    *bounds_out = bounds;
+    *ngroups_out = ng;
+    return 0;
+}
+
+static int bb_emit_leaf(bb_writer *w, const bb_ent *ents, size_t a, size_t n,
+                        uint64_t *id_out, char *err, size_t errcap)
+{
+    size_t len = BB_PAGE_HEADER + n * BB_ELEM_SIZE;
+    size_t i;
+    size_t data_off = len;
+    unsigned char *page;
+    uint32_t overflow;
+
+    if (n > 0xFFFFu) {
+        return bb_err(err, errcap, "too many leaf elements for one page");
+    }
+    for (i = 0; i < n; i++) {
+        len += ents[a + i].klen + ents[a + i].vlen;
+    }
+    if (bb_overflow_for(len, w->ps, &overflow) != 0) {
+        return bb_err(err, errcap, "bucket page too large");
+    }
+    page = bb_writer_new_page(w, overflow, BB_FLAG_LEAF, (uint16_t)n,
+                              id_out, err, errcap);
+    if (page == NULL) {
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        size_t elem_off = BB_PAGE_HEADER + i * BB_ELEM_SIZE;
+        size_t klen = ents[a + i].klen;
+        size_t vlen = ents[a + i].vlen;
+        size_t rel = data_off - elem_off;
+        if (rel > UINT32_MAX) {
+            return bb_err(err, errcap, "leaf element offset overflow");
+        }
+        bb_wr32(page + elem_off, (uint32_t)ents[a + i].flags);
+        bb_wr32(page + elem_off + 4, (uint32_t)rel);
+        bb_wr32(page + elem_off + 8, (uint32_t)klen);
+        bb_wr32(page + elem_off + 12, (uint32_t)vlen);
+        if (klen > 0) {
+            memcpy(page + data_off, ents[a + i].key, klen);
+        }
+        data_off += klen;
+        if (vlen > 0) {
+            memcpy(page + data_off, ents[a + i].val, vlen);
+        }
+        data_off += vlen;
+    }
+    return 0;
+}
+
+static int bb_emit_branch(bb_writer *w, const bb_ent *ents,
+                          const bb_child *kids, size_t a, size_t n,
+                          uint64_t *id_out, char *err, size_t errcap)
+{
+    size_t len = BB_PAGE_HEADER + n * BB_ELEM_SIZE;
+    size_t i;
+    size_t data_off = len;
+    unsigned char *page;
+    uint32_t overflow;
+
+    if (n > 0xFFFFu) {
+        return bb_err(err, errcap, "too many branch elements for one page");
+    }
+    for (i = 0; i < n; i++) {
+        len += ents[a + i].klen;
+    }
+    if (bb_overflow_for(len, w->ps, &overflow) != 0) {
+        return bb_err(err, errcap, "branch page too large");
+    }
+    page = bb_writer_new_page(w, overflow, BB_FLAG_BRANCH, (uint16_t)n,
+                              id_out, err, errcap);
+    if (page == NULL) {
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        size_t elem_off = BB_PAGE_HEADER + i * BB_ELEM_SIZE;
+        size_t klen = ents[a + i].klen;
+        size_t rel = data_off - elem_off;
+        if (rel > UINT32_MAX) {
+            return bb_err(err, errcap, "branch element offset overflow");
+        }
+        bb_wr32(page + elem_off, (uint32_t)rel);
+        bb_wr32(page + elem_off + 4, (uint32_t)klen);
+        bb_wr64(page + elem_off + 8, kids[a + i].id);
+        if (klen > 0) {
+            memcpy(page + data_off, ents[a + i].key, klen);
+        }
+        data_off += klen;
+    }
+    return 0;
+}
+
+static int bb_item_ptr_cmp(const void *pa, const void *pb)
+{
+    const bb_item *a = *(const bb_item *const *)pa;
+    const bb_item *b = *(const bb_item *const *)pb;
+    return bb_keycmp(a->key, a->keylen, b->key, b->keylen);
+}
+
+static int bb_build_bucket(bb_writer *w, const bb_bucket *b,
+                           const bb_bucket **stack, int depth,
+                           uint64_t *root_out, char *err, size_t errcap)
+{
+    const bb_item **sorted = NULL;
+    uint64_t *child_roots = NULL;
+    bb_ent *ents = NULL;
+    unsigned char *bucket_hdrs = NULL;
+    size_t *bounds = NULL;
+    size_t ngroups = 0;
+    bb_child *level = NULL;
+    size_t nlevel = 0;
+    size_t n;
+    size_t i;
+    int rc = -1;
+
+    if (depth > BB_MAX_DEPTH) {
+        return bb_err(err, errcap, "bucket nesting too deep");
+    }
+    for (i = 0; i < (size_t)depth; i++) {
+        if (stack[i] == b) {
+            return bb_err(err, errcap, "bucket tree contains a cycle");
+        }
+    }
+    n = b->nitems;
+    sorted = (const bb_item **)calloc(n ? n : 1, sizeof(*sorted));
+    child_roots = (uint64_t *)calloc(n ? n : 1, sizeof(*child_roots));
+    ents = (bb_ent *)calloc(n ? n : 1, sizeof(*ents));
+    bucket_hdrs = (unsigned char *)calloc(n ? n : 1, BB_BUCKET_HEADER);
+    if (sorted == NULL || child_roots == NULL ||
+        ents == NULL || bucket_hdrs == NULL) {
+        (void)bb_err(err, errcap, "out of memory");
+        goto done;
+    }
+    for (i = 0; i < n; i++) {
+        sorted[i] = &b->items[i];
+    }
+    if (n > 1) {
+        qsort((void *)sorted, n, sizeof(*sorted), bb_item_ptr_cmp);
+    }
+    for (i = 0; i < n; i++) {
+        const bb_item *it = sorted[i];
+        if (i > 0 && bb_keycmp(sorted[i - 1]->key, sorted[i - 1]->keylen,
+                               it->key, it->keylen) >= 0) {
+            (void)bb_err(err, errcap,
+                         "duplicate or unsorted key while writing bucket");
+            goto done;
+        }
+        if (it->key == NULL || it->keylen == 0) {
+            (void)bb_err(err, errcap, "cannot write an empty key");
+            goto done;
+        }
+        if (it->keylen > BB_MAX_KEY_SIZE) {
+            (void)bb_err(err, errcap, "key too large (%zu bytes)", it->keylen);
+            goto done;
+        }
+        if (it->is_bucket) {
+            const bb_bucket *child = it->child;
+            if (child == NULL) {
+                (void)bb_err(err, errcap, "bucket item without child bucket");
+                goto done;
+            }
+            stack[depth] = b;
+            if (bb_build_bucket(w, child, stack, depth + 1,
+                                &child_roots[i], err, errcap) != 0) {
+                goto done;
+            }
+            ents[i].key = it->key;
+            ents[i].klen = it->keylen;
+            ents[i].val = bucket_hdrs + i * BB_BUCKET_HEADER;
+            ents[i].vlen = BB_BUCKET_HEADER;
+            ents[i].flags = BB_BUCKET_LEAF_FLAG;
+            bb_wr64(bucket_hdrs + i * BB_BUCKET_HEADER, child_roots[i]);
+            bb_wr64(bucket_hdrs + i * BB_BUCKET_HEADER + 8, child->sequence);
+        } else {
+            if (it->vallen > BB_MAX_VALUE_SIZE) {
+                (void)bb_err(err, errcap, "value too large (%zu bytes)",
+                             it->vallen);
+                goto done;
+            }
+            ents[i].key = it->key;
+            ents[i].klen = it->keylen;
+            ents[i].val = it->value;
+            ents[i].vlen = it->vallen;
+            ents[i].flags = 0;
+        }
+    }
+    if (bb_pack(ents, n, w->ps, &bounds, &ngroups) != 0) {
+        (void)bb_err(err, errcap, "out of memory");
+        goto done;
+    }
+    level = (bb_child *)calloc(ngroups, sizeof(*level));
+    if (level == NULL) {
+        (void)bb_err(err, errcap, "out of memory");
+        goto done;
+    }
+    for (i = 0; i < ngroups; i++) {
+        size_t a = bounds[i];
+        size_t cnt = bounds[i + 1] - a;
+        if (bb_emit_leaf(w, ents, a, cnt, &level[i].id, err, errcap) != 0) {
+            goto done;
+        }
+        if (cnt > 0) {
+            level[i].first = ents[a].key;
+            level[i].firstlen = ents[a].klen;
+        } else {
+            level[i].first = NULL;
+            level[i].firstlen = 0;
+        }
+    }
+    nlevel = ngroups;
+    while (nlevel > 1) {
+        bb_ent *bents;
+        bb_child *next_level;
+        size_t *bbounds = NULL;
+        size_t nb = 0;
+        size_t j;
+
+        bents = (bb_ent *)calloc(nlevel, sizeof(*bents));
+        if (bents == NULL) {
+            (void)bb_err(err, errcap, "out of memory");
+            goto done;
+        }
+        for (j = 0; j < nlevel; j++) {
+            bents[j].key = level[j].first;
+            bents[j].klen = level[j].firstlen;
+            bents[j].val = NULL;
+            bents[j].vlen = 0;
+            bents[j].flags = 0;
+        }
+        if (bb_pack_children(bents, nlevel, w->ps, &bbounds, &nb) != 0) {
+            free(bents);
+            (void)bb_err(err, errcap, "out of memory");
+            goto done;
+        }
+        if (nlevel > 1 && nb >= nlevel) {
+            /* Defensive fallback: a single overflow branch page. */
+            free(bbounds);
+            bbounds = (size_t *)malloc(2 * sizeof(size_t));
+            if (bbounds == NULL) {
+                free(bents);
+                (void)bb_err(err, errcap, "out of memory");
+                goto done;
+            }
+            bbounds[0] = 0;
+            bbounds[1] = nlevel;
+            nb = 1;
+        }
+        next_level = (bb_child *)calloc(nb, sizeof(*next_level));
+        if (next_level == NULL) {
+            free(bents);
+            free(bbounds);
+            (void)bb_err(err, errcap, "out of memory");
+            goto done;
+        }
+        for (j = 0; j < nb; j++) {
+            size_t a = bbounds[j];
+            size_t cnt = bbounds[j + 1] - a;
+            if (bb_emit_branch(w, bents, level, a, cnt, &next_level[j].id,
+                               err, errcap) != 0) {
+                free(next_level);
+                free(bents);
+                free(bbounds);
+                goto done;
+            }
+            next_level[j].first = level[a].first;
+            next_level[j].firstlen = level[a].firstlen;
+        }
+        free(bents);
+        free(bbounds);
+        free(level);
+        level = next_level;
+        nlevel = nb;
+    }
+    *root_out = (nlevel > 0) ? level[0].id : 0;
+    rc = 0;
+done:
+    free(sorted);
+    free(child_roots);
+    free(bucket_hdrs);
+    free(ents);
+    free(bounds);
+    free(level);
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* Metadata + atomic file output                                       */
+/* ------------------------------------------------------------------ */
+
+static void bb_meta_write(unsigned char *page, unsigned int ps, uint64_t root,
+                          uint64_t seq, uint64_t pgid, uint64_t txid)
+{
+    unsigned char *m = page + BB_PAGE_HEADER;
+    memset(page, 0, ps);
+    bb_wr64(page, txid % 2);
+    bb_wr16(page + 8, BB_FLAG_META);
+    bb_wr16(page + 10, 0);
+    bb_wr32(page + 12, 0);
+    bb_wr32(m, BB_MAGIC);
+    bb_wr32(m + 4, BB_VERSION);
+    bb_wr32(m + 8, ps);
+    bb_wr32(m + 12, 0);
+    bb_wr64(m + 16, root);
+    bb_wr64(m + 24, seq);
+    bb_wr64(m + 32, BB_NO_FREELIST);
+    bb_wr64(m + 40, pgid);
+    bb_wr64(m + 48, txid);
+    bb_wr64(m + 56, bb_fnv1a64(m, 56));
+}
+
+static int bb_write_all(int fd, const unsigned char *data, size_t len,
+                        char *err, size_t errcap)
+{
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = write(fd, data + done, len - done);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return bb_err(err, errcap, "write failed: %s", strerror(errno));
+        }
+        if (n == 0) {
+            return bb_err(err, errcap, "write returned 0");
+        }
+        done += (size_t)n;
+    }
+    return 0;
+}
+
+static int bb_write_atomic(const char *path, const unsigned char *data,
+                           size_t len, char *err, size_t errcap)
+{
+    char *tmpl;
+    const char *slash;
+    size_t dirlen;
+    int fd = -1;
+    int rc = -1;
+
+    slash = strrchr(path, '/');
+    dirlen = (slash != NULL) ? (size_t)(slash - path) + 1 : 0;
+    tmpl = (char *)malloc(dirlen + 32);
+    if (tmpl == NULL) {
+        return bb_err(err, errcap, "out of memory");
+    }
+    if (dirlen > 0) {
+        memcpy(tmpl, path, dirlen);
+    }
+    memcpy(tmpl + dirlen, ".bbolt-tmp-XXXXXX", 18);
+    fd = mkstemp(tmpl);
+    if (fd < 0) {
+        bb_err(err, errcap, "cannot create temporary file in '%s': %s",
+               dirlen > 0 ? path : ".", strerror(errno));
+        free(tmpl);
+        return -1;
+    }
+    if (fchmod(fd, 0600) != 0) {
+        bb_err(err, errcap, "cannot chmod temporary file: %s",
+               strerror(errno));
+        goto fail;
+    }
+    if (bb_write_all(fd, data, len, err, errcap) != 0) {
+        goto fail;
+    }
+    if (fsync(fd) != 0) {
+        bb_err(err, errcap, "fsync failed: %s", strerror(errno));
+        goto fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        bb_err(err, errcap, "close failed: %s", strerror(errno));
+        goto fail;
+    }
+    fd = -1;
+    if (rename(tmpl, path) != 0) {
+        bb_err(err, errcap, "rename failed: %s", strerror(errno));
+        goto fail;
+    }
+    /* Best-effort durability of the directory entry. */
+    {
+        char *dir;
+        size_t dl = dirlen;
+        if (dl == 0) {
+            dir = strdup(".");
+        } else if (dl == 1) {
+            dir = strdup("/");
+        } else {
+            dir = (char *)malloc(dl);
+            if (dir != NULL) {
+                memcpy(dir, path, dl - 1);
+                dir[dl - 1] = '\0';
+            }
+        }
+        if (dir != NULL) {
+            int dfd = open(dir, O_RDONLY);
+            if (dfd >= 0) {
+                (void)fsync(dfd);
+                (void)close(dfd);
+            }
+            free(dir);
+        }
+    }
+    rc = 0;
+    free(tmpl);
+    return rc;
+
+fail:
+    if (fd >= 0) {
+        (void)close(fd);
+    }
+    (void)unlink(tmpl);
+    free(tmpl);
+    return -1;
+}
+
+int bb_write_file(const char *path, const bb_db *db, char *err, size_t errcap)
+{
+    bb_writer w;
+    unsigned int ps;
+    uint64_t root_pgid = 0;
+    uint64_t txid;
+    uint64_t total;
+    uint64_t total_bytes;
+    unsigned char *buf = NULL;
+    const bb_bucket *stack[BB_MAX_DEPTH + 1];
+    size_t i;
+    int rc = -1;
+
+    if (path == NULL || db == NULL) {
+        return bb_err(err, errcap, "bb_write_file: invalid arguments");
+    }
+    ps = (db->page_size != 0) ? db->page_size : 4096u;
+    if (ps < BB_MIN_PAGE_SIZE || ps > BB_MAX_PAGE_SIZE ||
+        (ps % 1024u) != 0) {
+        return bb_err(err, errcap, "invalid page size %u", ps);
+    }
+    if (db->txid > UINT64_MAX - 2) {
+        return bb_err(err, errcap, "transaction id overflow");
+    }
+    memset(&w, 0, sizeof(w));
+    w.ps = ps;
+    w.next_pgid = 2;
+    /**
+     * bbolt reserves page 0 and page 1 for the two meta pages, so the first
+     * data page is page 2 (this also matches bolt's allocation).
+     */
+    if (bb_build_bucket(&w, &db->root, stack, 0, &root_pgid, err, errcap) != 0) {
+        goto done;
+    }
+    if (root_pgid < 2) {
+        (void)bb_err(err, errcap, "internal error: no root page");
+        goto done;
+    }
+    txid = (db->txid == 0) ? 2u : db->txid + 2u;
+    total = w.next_pgid;
+    if (total > (uint64_t)SIZE_MAX / (uint64_t)ps) {
+        (void)bb_err(err, errcap, "database too large");
+        goto done;
+    }
+    total_bytes = total * (uint64_t)ps;
+    buf = (unsigned char *)calloc(1, (size_t)total_bytes);
+    if (buf == NULL) {
+        (void)bb_err(err, errcap, "out of memory");
+        goto done;
+    }
+    /* bbolt places the meta whose txid is T on physical page T%2, so page 0
+     * always carries an even txid and page 1 an odd one (bbolt's Tx.page()
+     * asserts this header id). */
+    bb_meta_write(buf + (size_t)(txid % 2u) * ps, ps, root_pgid,
+                  db->root.sequence, total, txid);
+    bb_meta_write(buf + (size_t)((txid - 1u) % 2u) * ps, ps, root_pgid,
+                  db->root.sequence, total, txid - 1u);
+    for (i = 0; i < w.npages; i++) {
+        uint64_t off = w.pages[i].id * (uint64_t)ps;
+        if (off + (uint64_t)w.pages[i].phys > total_bytes) {
+            (void)bb_err(err, errcap, "internal error: page beyond file size");
+            goto done;
+        }
+        memcpy(buf + (size_t)off, w.pages[i].data, w.pages[i].phys);
+    }
+    if (bb_write_atomic(path, buf, (size_t)total_bytes, err, errcap) != 0) {
+        goto done;
+    }
+    rc = 0;
+done:
+    free(buf);
+    bb_writer_clear(&w);
+    return rc;
+}
+
+/* ------------------------------------------------------------- bbolt store
+ *
+ * The optional --store bbolt:PATH backend, in the same on-disk format as
+ * TecharoHQ/anubis's `lib/store/bbolt`: one top-level bucket per key, and that
+ * bucket holds "data" and "expiry" (an RFC3339Nano timestamp). Anubis's own
+ * records live under `challenge:<id>`; this gate writes
+ * `betteranusbis:challenge:<id>` and `betteranusbis:honeypot:<key>` so a file
+ * that has been used by both does not mix two incompatible challenge records.
+ * Everything else in the file is preserved, and buckets whose expiry has passed
+ * are dropped, which is what upstream's hourly cleanup does.
+ *
+ * The codec is a whole-file reader/rewriter rather than bbolt's copy-on-write
+ * page engine: the gate is a single writer, a flush already costs a file
+ * rewrite in the text backend, and a rewritten file has no stale pages to
+ * reclaim. The catch is that a real bbolt process must not have the file open
+ * while this gate flushes; the bbolt backend is a single-writer backend here.
+ */
+static int store_bbolt;
+static bb_db store_db;
+static int store_db_loaded;
+static long long store_db_txid;
+
+static void json_escape_into(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)(in ? in : ""); *p && o + 7 < cap; p++) {
+        switch (*p) {
+        case '"': out[o++] = '\\'; out[o++] = '"'; break;
+        case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
+        case '\n': out[o++] = '\\'; out[o++] = 'n'; break;
+        case '\r': out[o++] = '\\'; out[o++] = 'r'; break;
+        case '\t': out[o++] = '\\'; out[o++] = 't'; break;
+        default:
+            if (*p < 0x20) {
+                static const char *hex = "0123456789abcdef";
+                out[o++] = '\\'; out[o++] = 'u'; out[o++] = '0'; out[o++] = '0';
+                out[o++] = hex[*p >> 4]; out[o++] = hex[*p & 15];
+            } else {
+                out[o++] = (char)*p;
+            }
+        }
+    }
+    out[o] = 0;
+}
+
+static const char *json_field(const char *json, const char *key) {
+    if (!json || !key) return NULL;
+    char pat[128];
+    snprintf(pat, sizeof pat, "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return NULL;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != ':') return NULL;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return p;
+}
+
+static int json_get_str(const char *json, const char *key, char *out, size_t cap) {
+    const char *p = json_field(json, key);
+    if (!p || *p != '"') return 0;
+    p++;
+    size_t o = 0;
+    while (*p && *p != '"' && o + 1 < cap) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+            case 'n': out[o++] = '\n'; break;
+            case 'r': out[o++] = '\r'; break;
+            case 't': out[o++] = '\t'; break;
+            case 'b': out[o++] = '\b'; break;
+            case 'f': out[o++] = '\f'; break;
+            case 'u': {
+                /* our own writer only emits \u00XX; accept that form */
+                unsigned hi = 0, lo = 0;
+                if (sscanf(p + 1, "%1x%1x", &hi, &lo) == 2) {
+                    out[o++] = (char)((hi << 4) | lo);
+                    p += 2;
+                }
+                break;
+            }
+            default: out[o++] = *p; break;
+            }
+            p++;
+        } else {
+            out[o++] = *p++;
+        }
+    }
+    out[o] = 0;
+    return 1;
+}
+
+static long long json_get_ll(const char *json, const char *key, long long dflt) {
+    const char *p = json_field(json, key);
+    if (!p) return dflt;
+    char *end = NULL;
+    long long v = strtoll(p, &end, 10);
+    return end == p ? dflt : v;
+}
+
+static int json_get_bool(const char *json, const char *key, int dflt) {
+    const char *p = json_field(json, key);
+    if (!p) return dflt;
+    if (!strncmp(p, "true", 4)) return 1;
+    if (!strncmp(p, "false", 5)) return 0;
+    return dflt;
+}
+
+/* A timestamp bbolt's time.RFC3339Nano parser accepts. Millisecond input is
+ * the resolution the challenge id already carries. */
+static void format_rfc3339nano(long long ms, char *out, size_t cap) {
+    time_t sec = (time_t)(ms / 1000);
+    long frac = (long)(ms % 1000);
+    if (frac < 0) { frac += 1000; sec -= 1; }
+    struct tm tm;
+    if (!gmtime_r(&sec, &tm)) { snprintf(out, cap, "1970-01-01T00:00:00Z"); return; }
+    snprintf(out, cap, "%04d-%02d-%02dT%02d:%02d:%02d.%03ld000Z",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, frac);
+}
+
+static long long parse_rfc3339(const char *s) {
+    int y, mo, d, h, mi, se;
+    if (!s || sscanf(s, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &se) != 6)
+        return -1;
+    /* Go's time.RFC3339Nano writes "Z" or a numeric offset (+01:00). Ignoring
+     * the offset would make an expiry look up to a day off, which is exactly
+     * the kind of bug that keeps a dead bucket alive forever. */
+    long offset = 0;
+    const char *p = s;
+    while (*p && *p != 'T') p++;
+    while (*p && *p != 'Z' && *p != '+' && *p != '-') p++;
+    if (*p == '+' || *p == '-') {
+        int oh = 0, om = 0;
+        if (sscanf(p + 1, "%2d:%2d", &oh, &om) >= 1)
+            offset = (long)(oh * 3600 + om * 60) * (*p == '-' ? -1 : 1);
+    }
+    struct tm tm;
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = y - 1900;
+    tm.tm_mon = mo - 1;
+    tm.tm_mday = d;
+    tm.tm_hour = h;
+    tm.tm_min = mi;
+    tm.tm_sec = se;
+    time_t t = timegm(&tm);
+    return (long long)(t - offset) * 1000;
+}
+
+static bb_item *bb_find_item(bb_bucket *b, const char *key) {
+    if (!b || !key) return NULL;
+    size_t n = strlen(key);
+    for (size_t i = 0; i < b->nitems; i++) {
+        if (b->items[i].keylen == n && !memcmp(b->items[i].key, key, n))
+            return &b->items[i];
+    }
+    return NULL;
+}
+
+static int bbolt_bucket_data(bb_item *bucket, unsigned char **data, size_t *len,
+                             long long *expires_ms) {
+    if (!bucket || !bucket->is_bucket || !bucket->child) return 0;
+    bb_item *d = bb_find_item(bucket->child, "data");
+    bb_item *e = bb_find_item(bucket->child, "expiry");
+    if (!d) return 0;
+    *data = d->value;
+    *len = d->vallen;
+    *expires_ms = -1;
+    if (e && e->vallen) {
+        char buf[64];
+        size_t n = e->vallen < sizeof buf - 1 ? e->vallen : sizeof buf - 1;
+        memcpy(buf, e->value, n);
+        buf[n] = 0;
+        *expires_ms = parse_rfc3339(buf);
+    }
+    return 1;
+}
+
+static void bbolt_load_state(void) {
+    time_t now = time(NULL);
+    long long nch = 0, nhp = 0;
+    for (size_t i = 0; i < store_db.root.nitems; i++) {
+        bb_item *it = &store_db.root.items[i];
+        if (!it->is_bucket || !it->keylen) continue;
+        const char *name = (const char *)it->key;
+        if (!strncmp(name, "betteranusbis:challenge:", 24)) {
+            unsigned char *data = NULL;
+            size_t len = 0;
+            long long expires = -1;
+            if (!bbolt_bucket_data(it, &data, &len, &expires)) continue;
+            if (expires > 0 && expires / 1000 < (long long)now) continue;
+            char json[8192];
+            size_t n = len < sizeof json - 1 ? len : sizeof json - 1;
+            memcpy(json, data, n);
+            json[n] = 0;
+            char id[80] = "", rd[65] = "", algo[24] = "sha256", ref[256] = "";
+            json_get_str(json, "id", id, sizeof id);
+            if (!id[0]) snprintf(id, sizeof id, "%s", name + 24);
+            if (!json_get_str(json, "randomData", rd, sizeof rd)) continue;
+            json_get_str(json, "algorithm", algo, sizeof algo);
+            json_get_str(json, "referer", ref, sizeof ref);
+            int difficulty = (int)json_get_ll(json, "difficulty", 0);
+            int spent = json_get_bool(json, "spent", 0);
+            int css = json_get_bool(json, "cssSeen", 0);
+            long long issued_ms = json_get_ll(json, "issuedMs", (long long)now * 1000);
+            uint32_t h = 2166136261u;
+            for (const char *q = id; *q; q++) h = (h ^ (uint8_t)*q) * 16777619u;
+            for (int probe = 0; probe < 32; probe++) {
+                ch_entry *e = &ch_table[(h + (uint32_t)probe) % CH_BUCKETS];
+                if (e->used && strcmp(e->id, id) != 0) continue;
+                snprintf(e->id, sizeof e->id, "%s", id);
+                snprintf(e->rd, sizeof e->rd, "%s", rd);
+                snprintf(e->algorithm, sizeof e->algorithm, "%s", algo);
+                snprintf(e->referer, sizeof e->referer, "%s", ref);
+                e->difficulty = difficulty;
+                e->spent = spent;
+                e->css_seen = css;
+                e->issued_ms = issued_ms;
+                e->issued = (time_t)(issued_ms / 1000);
+                e->used = 1;
+                nch++;
+                break;
+            }
+        } else if (!strncmp(name, "betteranusbis:honeypot:", 23)) {
+            unsigned char *data = NULL;
+            size_t len = 0;
+            long long expires = -1;
+            if (!bbolt_bucket_data(it, &data, &len, &expires)) continue;
+            if (expires > 0 && expires / 1000 < (long long)now) continue;
+            char json[512];
+            size_t n = len < sizeof json - 1 ? len : sizeof json - 1;
+            memcpy(json, data, n);
+            json[n] = 0;
+            unsigned long long key = strtoull(name + 23, NULL, 10);
+            int count = (int)json_get_ll(json, "count", 0);
+            long long last = json_get_ll(json, "last", (long long)now);
+            if (count <= 0) continue;
+            for (int i = 0; i < HP_BUCKETS; i++) {
+                hp_entry *e = &hp_table[i];
+                if (!e->used) {
+                    e->key = key;
+                    e->count = count;
+                    e->last = (time_t)last;
+                    e->used = 1;
+                    nhp++;
+                    break;
+                }
+                if (e->key == key) {
+                    e->count = count;
+                    e->last = (time_t)last;
+                    nhp++;
+                    break;
+                }
+            }
+        }
+    }
+    if (nch || nhp)
+        logmsg("store: loaded %lld challenge(s) and %lld network(s) from %s",
+               nch, nhp, store_path);
+}
+
+/* A path with no writable parent would only fail five seconds later, once per
+ * flush, in the log. Upstream's factory checks the directory at startup too. */
+static int bbolt_check_writable(void) {
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s", store_path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        if (slash == dir) slash[1] = 0;
+        else *slash = 0;
+    } else {
+        snprintf(dir, sizeof dir, ".");
+    }
+    if (access(dir, W_OK) != 0) {
+        fprintf(stderr, "betterAnusbis: the bbolt store directory %s is not "
+                        "writable: %s\n", dir, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int bbolt_load_or_create(void) {
+    char err[256] = "";
+    if (bbolt_check_writable() != 0) return -1;
+    memset(&store_db, 0, sizeof store_db);
+    if (access(store_path, F_OK) == 0) {
+        if (bb_read_file(store_path, &store_db, err, sizeof err) != 0) {
+            fprintf(stderr, "betterAnusbis: cannot read the bbolt store %s: %s\n",
+                    store_path, err[0] ? err : "invalid database");
+            return -1;
+        }
+        store_db_txid = (long long)store_db.txid;
+        store_db_loaded = 1;
+        bbolt_load_state();
+    } else {
+        if (errno != ENOENT) {
+            fprintf(stderr, "betterAnusbis: cannot stat %s: %s\n", store_path,
+                    strerror(errno));
+            return -1;
+        }
+        store_db.page_size = 4096;
+        store_db_loaded = 1;
+    }
+    return 0;
+}
+
+static int bbolt_store_write(void) {
+    if (!store_db_loaded) return -1;
+
+    /* Drop expired foreign buckets the way upstream's cleanup does; keep the
+     * rest byte for byte. */
+    long long now_ms = (long long)time(NULL) * 1000;
+    for (size_t i = store_db.root.nitems; i-- > 0; ) {
+        bb_item *it = &store_db.root.items[i];
+        if (!it->is_bucket || !it->keylen) continue;
+        const char *name = (const char *)it->key;
+        if (!strncmp(name, "betteranusbis:challenge:", 24) ||
+            !strncmp(name, "betteranusbis:honeypot:", 23))
+            bb_del_bucket(&store_db.root, it->key, it->keylen);
+    }
+    for (size_t i = store_db.root.nitems; i-- > 0; ) {
+        bb_item *it = &store_db.root.items[i];
+        if (!it->is_bucket || !it->keylen) continue;
+        bb_item *expiry = it->child ? bb_find_item(it->child, "expiry") : NULL;
+        if (!expiry || !expiry->vallen) continue;
+        char buf[64];
+        size_t n = expiry->vallen < sizeof buf - 1 ? expiry->vallen : sizeof buf - 1;
+        memcpy(buf, expiry->value, n);
+        buf[n] = 0;
+        long long e = parse_rfc3339(buf);
+        if (e > 0 && e < now_ms)
+            bb_del_bucket(&store_db.root, it->key, it->keylen);
+    }
+
+    long long nch = 0, nhp = 0;
+    pthread_mutex_lock(&ch_lock);
+    for (int i = 0; i < CH_BUCKETS; i++) {
+        ch_entry *e = &ch_table[i];
+        if (!e->used) continue;
+        long long expires = e->issued_ms + (long long)COOKIE_TTL * 1000;
+        if (expires < now_ms) continue;
+        char name[128], json[4096], esc_ref[1024], esc_rd[256], esc_algo[128];
+        snprintf(name, sizeof name, "betteranusbis:challenge:%s", e->id);
+        json_escape_into(e->referer, esc_ref, sizeof esc_ref);
+        json_escape_into(e->rd, esc_rd, sizeof esc_rd);
+        json_escape_into(e->algorithm, esc_algo, sizeof esc_algo);
+        snprintf(json, sizeof json,
+                 "{\"id\":\"%s\",\"randomData\":\"%s\",\"algorithm\":\"%s\","
+                 "\"difficulty\":%d,\"spent\":%s,\"issuedMs\":%lld,"
+                 "\"cssSeen\":%s,\"referer\":\"%s\"}",
+                 e->id, esc_rd, esc_algo, e->difficulty,
+                 e->spent ? "true" : "false", e->issued_ms,
+                 e->css_seen ? "true" : "false", esc_ref);
+        bb_bucket *b = bb_find_bucket(&store_db, name);
+        if (!b) b = bb_add_bucket(&store_db, name);
+        if (!b) continue;
+        char expiry[64];
+        format_rfc3339nano(expires, expiry, sizeof expiry);
+        bb_set(b, "data", 4, json, strlen(json));
+        bb_set(b, "expiry", 6, expiry, strlen(expiry));
+        nch++;
+    }
+    pthread_mutex_unlock(&ch_lock);
+
+    pthread_mutex_lock(&hp_lock);
+    for (int i = 0; i < HP_BUCKETS; i++) {
+        hp_entry *e = &hp_table[i];
+        if (!e->used) continue;
+        if ((long long)e->last + HP_WINDOW < (long long)time(NULL)) continue;
+        char name[64], json[160], expiry[64];
+        snprintf(name, sizeof name, "betteranusbis:honeypot:%llu",
+                 (unsigned long long)e->key);
+        snprintf(json, sizeof json, "{\"count\":%d,\"last\":%lld}", e->count,
+                 (long long)e->last);
+        format_rfc3339nano(((long long)e->last + HP_WINDOW) * 1000, expiry,
+                           sizeof expiry);
+        bb_bucket *b = bb_find_bucket(&store_db, name);
+        if (!b) b = bb_add_bucket(&store_db, name);
+        if (!b) continue;
+        bb_set(b, "data", 4, json, strlen(json));
+        bb_set(b, "expiry", 6, expiry, strlen(expiry));
+        nhp++;
+    }
+    pthread_mutex_unlock(&hp_lock);
+
+    store_db.txid = (unsigned long long)(store_db_txid + 2);
+    char err[256] = "";
+    if (bb_write_file(store_path, &store_db, err, sizeof err) != 0) {
+        logmsg("store: cannot write bbolt %s: %s", store_path,
+               err[0] ? err : "unknown error");
+        return -1;
+    }
+    store_db_txid += 2;
+    if (cfg.verbose)
+        logmsg("store: wrote %lld challenges and %lld networks to %s", nch, nhp,
+               store_path);
+    return 0;
+}
+
 /* ---------------------------------------------------------------- the store
  *
  * The challenge ledger and the honeypot counters live in memory, so a restart
  * forgets which challenges were issued and how much a network has been annoying.
  * --store file:PATH snapshots both to a text file every few seconds and loads
- * them back at startup.
+ * them back at startup; --store bbolt:PATH does the same in a real bbolt
+ * database with Anubis's bucket layout (data + expiry, RFC3339Nano).
  *
- * This is a snapshot, not a journal: a crash loses up to five seconds, and
- * there is no locking against another process writing the same file. That is a
- * deliberate size decision, and it is the gap between this and upstream's
- * bbolt/valkey/S3 backends, which also exist to share state between replicas.
+ * Both are snapshots, not journals: a crash loses up to five seconds. Neither
+ * is a multi-writer store, and bbolt is explicitly single-writer here because a
+ * flush rewrites the whole file atomically. Upstream's valkey and S3 backends
+ * exist to share state between replicas, which this does not do.
  */
-static char store_path[512];
-static volatile int store_dirty;
 static pthread_t store_thread_id;
 static volatile sig_atomic_t shutdown_requested;
 
@@ -1976,6 +4218,10 @@ static void on_shutdown(int sig) {
 static void store_mark_dirty(void) { store_dirty = 1; }
 
 static void store_write(void) {
+    if (store_bbolt) {
+        if (bbolt_store_write() == 0) store_dirty = 0;
+        return;
+    }
     if (!store_path[0]) return;
     char tmp[560];
     snprintf(tmp, sizeof tmp, "%s.tmp", store_path);
@@ -2019,12 +4265,13 @@ static void store_write(void) {
     if (cfg.verbose) logmsg("store: wrote %lld challenges and %lld networks", ch_written, hp_written);
 }
 
-static void store_load(void) {
+static int store_load(void) {
+    if (store_bbolt) return bbolt_load_or_create();
     FILE *f = fopen(store_path, "r");
     if (!f) {
         if (errno != ENOENT)
             logmsg("store: cannot read %s: %s", store_path, strerror(errno));
-        return;
+        return 0;
     }
     char line[1024];
     long long nch = 0, nhp = 0;
@@ -2081,6 +4328,7 @@ static void store_load(void) {
     fclose(f);
     logmsg("store: loaded %lld challenge(s) and %lld network(s) from %s", nch, nhp,
            store_path);
+    return 0;
 }
 
 static void *store_thread(void *arg) {
@@ -6053,11 +8301,17 @@ static void policy_apply_blocks(const y_node *root) {
                 cfg.store = y_dup(spec);
             }
             logmsg("policy: store backend file, %s", path);
-        } else if (!strcasecmp(backend, "bbolt") || !strcasecmp(backend, "valkey") ||
-                   !strcasecmp(backend, "s3api")) {
+        } else if (!strcasecmp(backend, "bbolt") && path && *path) {
+            if (!cfg.store) {
+                char spec[600];
+                snprintf(spec, sizeof spec, "bbolt:%s", path);
+                cfg.store = y_dup(spec);
+            }
+            logmsg("policy: store backend bbolt, %s", path);
+        } else if (!strcasecmp(backend, "valkey") || !strcasecmp(backend, "s3api")) {
             logmsg("policy: store backend %s is not implemented by betterAnusbis; the "
-                   "challenge ledger stays in memory (--store file:PATH is the one that "
-                   "survives a restart)", backend);
+                   "challenge ledger stays in memory (--store file:PATH or "
+                   "--store bbolt:PATH survives a restart)", backend);
         } else {
             logmsg("policy: store backend %s is unknown here, using memory", backend);
         }
@@ -9808,9 +12062,11 @@ static void usage(FILE *out) {
         "                         /api/check and the challenge\n"
         "  --public-url URL       where this gate is reachable, used to build the\n"
         "                         forwardAuth redirect\n"
-        "  --store file:PATH      snapshot the challenge ledger and the honeypot\n"
-        "                         counters here, every five seconds, and load them at\n"
-        "                         startup (bbolt, valkey and S3 are not implemented)\n"
+        "  --store file:PATH|bbolt:PATH\n"
+        "                         keep the challenge ledger and the honeypot counters\n"
+        "                         here: a snapshot text file, or an Anubis-style\n"
+        "                         bbolt DB (single writer; valkey and S3 are not\n"
+        "                         implemented)\n"
         "  --challenge-extension NAME\n"
         "                         css-load: the page's stylesheet must be fetched\n"
         "                         before pass-challenge is accepted\n"
@@ -10446,7 +12702,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "betterAnusbis: --store file: wants a path\n");
                 return 2;
             }
-            store_load();
+            if (store_load() != 0) return 1;
             struct sigaction sd = {0};
             sd.sa_handler = on_shutdown;
             sigemptyset(&sd.sa_mask);
@@ -10455,11 +12711,28 @@ int main(int argc, char **argv) {
             if (pthread_create(&store_thread_id, NULL, store_thread, NULL) == 0)
                 pthread_detach(store_thread_id);
             logmsg("store: %s, snapshotted every five seconds", store_path);
+        } else if (!strncmp(cfg.store, "bbolt:", 6)) {
+            snprintf(store_path, sizeof store_path, "%s", cfg.store + 6);
+            if (!store_path[0]) {
+                fprintf(stderr, "betterAnusbis: --store bbolt: wants a path\n");
+                return 2;
+            }
+            store_bbolt = 1;
+            if (store_load() != 0) return 1;
+            struct sigaction sd = {0};
+            sd.sa_handler = on_shutdown;
+            sigemptyset(&sd.sa_mask);
+            sigaction(SIGTERM, &sd, NULL);
+            sigaction(SIGINT, &sd, NULL);
+            if (pthread_create(&store_thread_id, NULL, store_thread, NULL) == 0)
+                pthread_detach(store_thread_id);
+            logmsg("store: bbolt %s, flushed every five seconds (single writer)",
+                   store_path);
         } else if (!strcmp(cfg.store, "memory") || !strcmp(cfg.store, "none")) {
             logmsg("store: memory only, as before");
         } else {
-            fprintf(stderr, "betterAnusbis: --store wants file:PATH or memory "
-                            "(bbolt, valkey and S3 are not implemented)\n");
+            fprintf(stderr, "betterAnusbis: --store wants file:PATH, bbolt:PATH "
+                            "or memory (valkey and S3 are not implemented)\n");
             return 2;
         }
     }

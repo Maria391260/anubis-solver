@@ -165,7 +165,9 @@ policy, honeypot, assets, TLS, metrics
   --og-passthrough  --og-expiry-time SECS  --og-override "og:title=..."
   --og-cache-consider-host               key the cache on host and path
   --challenge-extension css-load
-  --store file:PATH      keep the challenge ledger and honeypot counters
+  --store file:PATH|bbolt:PATH
+                         keep the challenge ledger and honeypot counters in a
+                         snapshot text file, or in an Anubis-style bbolt DB
   (upstream's --bind, --policy-fname and --target-insecure-skip-verify are
    accepted as aliases)
 ```
@@ -355,9 +357,11 @@ honoured too, through DroneBL, cached for a day.
 `impressum`, `logging`, `dns_ttl`, `status_codes`, `honeypot` and `dnsbl` are
 read from the same document as the rules, so an Anubis deployment's config
 travels rather than being retyped as flags. Flags win where both are given. What
-is still missing there is said out loud: a `bbolt`, `valkey` or `s3api` store is
-named as unimplemented (the ledger stays in memory), as are the metrics
-listener's `tls`/`basic_auth` and `pprof`, and `botstopper` is enterprise.
+is still missing there is said out loud: a `valkey` or `s3api` store is named as
+unimplemented (the ledger stays in memory), as are the metrics listener's
+`tls`/`basic_auth` and `pprof`, and `botstopper` is enterprise. `store.backend:
+bbolt` with `store.parameters.path` is honoured and configures the bbolt store,
+exactly as it does upstream.
 
 What is reported and skipped, by name, at load: `geoip` and `asns` matchers when
 no database is configured, and `verifyFCrDNS` in shapes the evaluator cannot
@@ -518,19 +522,22 @@ difference — Anubis re-checks through its wasm module via wazero, this calls
   page and refuses a pass-challenge until the browser has fetched it, which is
   what the upstream extension does. `headless` exists only in the enterprise
   build, so asking for it logs that and checks nothing.
-- **One store backend: a file.** `--store file:PATH` snapshots the challenge
-  ledger and the honeypot counters every five seconds, on `SIGTERM`, and loads
-  them at startup, so a restart no longer forgets which challenges were issued
-  or which networks were annoying. It is a snapshot, not a journal: a crash
-  loses up to five seconds, and nothing coordinates two processes writing the
-  same file. Upstream's bbolt, valkey and S3 backends exist to share state
-  between replicas, which this does not do.
-- **No bbolt, valkey or S3 backends.** `pass-challenge`,
+- **Two store backends: a file and bbolt.** `--store file:PATH` snapshots the
+  challenge ledger and the honeypot counters every five seconds, on `SIGTERM`,
+  and loads them at startup. `--store bbolt:PATH` writes the same state into a
+  real bbolt database with Anubis's layout: one top-level bucket per record,
+  holding `data` and `expiry`, expiry as RFC3339Nano. The bbolt backend is
+  read and re-verified with `go.etcd.io/bbolt` itself in the test suite.
+  Neither is a journal: a crash loses up to five seconds. bbolt here is a
+  single-writer backend — the file is rewritten atomically on each flush, so do
+  not point a live Anubis at the same file — and it does not share state
+  between replicas. valkey and S3 remain unimplemented.
+- **No valkey or S3 backends.** `pass-challenge`,
   `check`, `ping`, the state endpoint, the honeypot, `robots.txt`, the
   Prometheus `/metrics`, impressum, localization and the challenge extensions
-  are implemented or documented above. The store backends (bbolt, valkey, S3)
-  and OpenGraph passthrough are the last two things on the parity list;
-  `PARITY.md` is the full gap list with file references.
+  are implemented or documented above. valkey/S3 and OpenGraph passthrough are
+  the last two things on the parity list; `PARITY.md` is the full gap list with
+  file references.
 - **Two policy formats, neither of them a CEL engine.** Our own flat rules
   (literal or regex matchers, first match wins) and Anubis's `botPolicies.yaml`
   (rules, weights, thresholds, imports). The expression evaluator covers the
@@ -560,6 +567,11 @@ a site owner actually configures. That is the point: `--target` and you are done
 python3 test_parity.py        # the flags taken from cmd/anubis, checked on the wire
 python3 tests_http23.py -v    # HTTP/2 and HTTP/3, listener and backend hop
 ```
+
+`test_parity.py` also writes and re-reads a `--store bbolt:PATH` database with
+the real `go.etcd.io/bbolt` library when Go and the cached module are available
+(including `tx.Check`, expiry validity, foreign/nested bucket preservation and
+expired-bucket pruning); without Go those checks are skipped, not failed.
 
 `test-all-algorithms.sh` starts a backend itself if one is not running and
 kills/restarts betterAnusbis per algorithm. `test_parity.py` starts both sides

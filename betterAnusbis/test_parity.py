@@ -9,6 +9,7 @@ received. Nothing here is asserted from the log.
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import http.client
 import json
@@ -185,6 +186,187 @@ def backend_conns():
     body = r.read()
     c.close()
     return json.loads(body)["conns"]
+
+
+
+# --------------------------------------------------------------- bbolt store
+# The bbolt backend is validated by go.etcd.io/bbolt itself, from the module
+# cache, because "it opens" is not the same claim as "bbolt's own consistency
+# check passes". The tool is built once per run; without Go or the cached
+# module the checks are skipped, not failed.
+BBOLT_GO_SRC = r"""
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "os"
+    "strings"
+    "time"
+
+    bolt "go.etcd.io/bbolt"
+)
+
+func main() {
+    if len(os.Args) != 3 {
+        fmt.Fprintln(os.Stderr, "usage: mode path")
+        os.Exit(2)
+    }
+    mode, path := os.Args[1], os.Args[2]
+    db, err := bolt.Open(path, 0600, &bolt.Options{
+        FreelistType:   bolt.FreelistMapType,
+        NoFreelistSync: true,
+    })
+    if err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        os.Exit(1)
+    }
+    defer db.Close()
+
+    if mode == "seed" {
+        err = db.Update(func(tx *bolt.Tx) error {
+            put := func(name string, data []byte, exp time.Time) error {
+                b, e := tx.CreateBucketIfNotExists([]byte(name))
+                if e != nil {
+                    return e
+                }
+                if e = b.Put([]byte("data"), data); e != nil {
+                    return e
+                }
+                return b.Put([]byte("expiry"), []byte(exp.Format(time.RFC3339Nano)))
+            }
+            if e := put("challenge:foreign", []byte(`{"id":"foreign"}`), time.Now().Add(time.Hour)); e != nil {
+                return e
+            }
+            if e := put("keepme", []byte("hello"), time.Now().Add(24*time.Hour)); e != nil {
+                return e
+            }
+            kb := tx.Bucket([]byte("keepme"))
+            cb, e := kb.CreateBucketIfNotExists([]byte("child"))
+            if e != nil {
+                return e
+            }
+            if e = cb.Put([]byte("k"), []byte("v")); e != nil {
+                return e
+            }
+            return put("expiredbucket", []byte("gone"), time.Now().Add(-time.Hour))
+        })
+        if err != nil {
+            fmt.Fprintln(os.Stderr, err)
+            os.Exit(1)
+        }
+        fmt.Println(`{"seeded":true}`)
+        return
+    }
+
+    out := map[string]any{}
+    err = db.View(func(tx *bolt.Tx) error {
+        for e := range tx.Check() {
+            return e
+        }
+        names, ch, hp := 0, 0, 0
+        foreign, nested, expOK, expiredKept := false, false, true, false
+        if e := tx.ForEach(func(name []byte, b *bolt.Bucket) error {
+            names++
+            n := string(name)
+            d, ex := b.Get([]byte("data")), b.Get([]byte("expiry"))
+            if strings.HasPrefix(n, "betteranusbis:challenge:") {
+                ch++
+                if d == nil || ex == nil {
+                    expOK = false
+                } else if t, er := time.Parse(time.RFC3339Nano, string(ex)); er != nil || t.Before(time.Now()) {
+                    expOK = false
+                }
+            }
+            if strings.HasPrefix(n, "betteranusbis:honeypot:") {
+                hp++
+            }
+            if n == "challenge:foreign" {
+                foreign = d != nil && ex != nil
+            }
+            if n == "keepme" && b.Bucket([]byte("child")) != nil {
+                nested = true
+            }
+            if n == "expiredbucket" {
+                expiredKept = true
+            }
+            return nil
+        }); e != nil {
+            return e
+        }
+        out = map[string]any{
+            "txcheck": true, "buckets": names, "challenges": ch,
+            "honeypots": hp, "foreign": foreign, "nested": nested,
+            "expiries_ok": expOK, "expired_kept": expiredKept,
+        }
+        return nil
+    })
+    if err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        os.Exit(1)
+    }
+    if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
+        os.Exit(1)
+    }
+}
+"""
+
+_BBOLT_DIR = None
+
+
+def bbolt_go(dbpath, mode="check"):
+    """Run the Go bbolt checker. Returns (ok, dict-or-reason), or (None, reason)
+    when Go or the cached bbolt module is not available."""
+    global _BBOLT_DIR
+    go = shutil.which("go")
+    if not go:
+        return None, "go is not installed"
+    if _BBOLT_DIR is None:
+        try:
+            cache = subprocess.run([go, "env", "GOMODCACHE"], capture_output=True,
+                                   text=True, timeout=30).stdout.strip()
+        except Exception as e:  # noqa: BLE001
+            return None, f"cannot ask go for its module cache: {e}"
+        bolt = os.path.join(cache, "go.etcd.io", "bbolt@v1.4.3")
+        xs = [p for p in glob.glob(os.path.join(cache, "golang.org", "x", "sys@*"))
+              if os.path.isdir(p)]
+        xsync = [p for p in glob.glob(os.path.join(cache, "golang.org", "x", "sync@*"))
+                 if os.path.isdir(p)]
+        if not os.path.isdir(bolt) or not xs or not xsync:
+            return None, "the bbolt v1.4.3 module (and x/sys, x/sync) is not in the Go module cache"
+
+        # These two versions are the pair that builds with the toolchains in
+        # the module cache here; replaced module directories are used as-is, so
+        # a newer "go" line in their go.mod does not block the build. Fall back
+        # to whatever is present rather than skipping silently.
+        def _prefer(deps, version):
+            exact = [p for p in deps if p.endswith("@" + version)]
+            return exact[0] if exact else sorted(deps)[-1]
+
+        xsys = _prefer(xs, "v0.31.0")
+        xsyn = _prefer(xsync, "v0.21.0")
+        d = tempfile.mkdtemp(prefix="ba-bbolt-go-")
+        with open(os.path.join(d, "go.mod"), "w") as f:
+            f.write("module baboltcheck\n\ngo 1.22\n\n"
+                    "require go.etcd.io/bbolt v1.4.3\n\n"
+                    f"replace go.etcd.io/bbolt => {bolt}\n"
+                    f"replace golang.org/x/sys => {xsys}\n"
+                    f"replace golang.org/x/sync => {xsyn}\n")
+        with open(os.path.join(d, "main.go"), "w") as f:
+            f.write(BBOLT_GO_SRC)
+        _BBOLT_DIR = d
+    env = dict(os.environ, GOFLAGS="-mod=mod", GOPROXY="off")
+    try:
+        r = subprocess.run([go, "run", ".", mode, dbpath], cwd=_BBOLT_DIR, env=env,
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:  # noqa: BLE001
+        return None, f"go run failed: {e}"
+    if r.returncode != 0:
+        return None, (r.stderr or r.stdout).strip()[-800:]
+    try:
+        return True, json.loads(r.stdout)
+    except ValueError:
+        return None, r.stdout[-400:]
 
 
 # ------------------------------------------------------------------------ gate
@@ -1110,6 +1292,57 @@ def main():
                        "nonce": str(sol.nonce), "redir": "/"})
         st, hdrs, body = request("GET", API + "pass-challenge?" + q)
         check("a challenge issued before the restart still verifies", st == 302, st)
+
+    # ---- 23g-2. the bbolt store is a real bbolt database and survives a restart
+    storepath = os.path.join(tempfile.mkdtemp(), "state.bbolt")
+    ok, seeded = bbolt_go(storepath, "seed")
+    if ok is None:
+        print(f"  (skipped the bbolt store checks: {seeded})")
+    else:
+        check("a Go bbolt file is seeded for the store test", ok and seeded.get("seeded"), seeded)
+        with Gate("--difficulty", "6", "--store", f"bbolt:{storepath}"):
+            st, hdrs, body = request("GET", "/")
+            ch = anubis_solver.parse_challenge(body.decode(errors="replace"))
+            sol = SOLVER.solve(ch)
+        check("the bbolt store file is written on shutdown",
+              os.path.exists(storepath) and os.path.getsize(storepath) > 0,
+              os.path.getsize(storepath) if os.path.exists(storepath) else "absent")
+        ok, data = bbolt_go(storepath, "check")
+        check("the gate's bbolt file passes bbolt's own tx.Check",
+              ok and data.get("txcheck") is True, data)
+        check("the bbolt store holds the issued challenge with a valid expiry",
+              ok and data.get("challenges", 0) >= 1 and data.get("expiries_ok") is True, data)
+        check("foreign and nested buckets are preserved",
+              ok and data.get("foreign") is True and data.get("nested") is True, data)
+        check("expired buckets are pruned like upstream's cleanup",
+              ok and data.get("expired_kept") is False, data)
+        with Gate("--difficulty", "6", "--store", f"bbolt:{storepath}"):
+            q = urlencode({"id": ch.id, "response": sol.response_hex,
+                           "nonce": str(sol.nonce), "redir": "/"})
+            st, hdrs, body = request("GET", API + "pass-challenge?" + q)
+        check("a challenge in the bbolt store still verifies after a restart", st == 302, st)
+        ok, data2 = bbolt_go(storepath, "check")
+        check("the restarted gate rewrote a valid bbolt file",
+              ok and data2.get("txcheck") is True, data2)
+
+    # ---- 23g-3. a corrupt bbolt file is refused, not overwritten
+    bad = os.path.join(tempfile.mkdtemp(), "garbage.bbolt")
+    with open(bad, "wb") as f:
+        f.write(b"this is not a bolt database\n" * 200)
+    r = subprocess.run(
+        [os.path.join(HERE, "betterAnusbis"), "--listen", "127.0.0.1:0",
+         "--target", f"http://127.0.0.1:{BACKEND_PORT}", "--store", f"bbolt:{bad}"],
+        capture_output=True, timeout=20)
+    check("a corrupt bbolt store is refused at startup",
+          r.returncode != 0 and b"bbolt" in r.stderr, r.stderr.decode(errors="replace")[-300:])
+    check("the corrupt file was not replaced", open(bad, "rb").read(8) == b"this is ", "")
+
+    r = subprocess.run(
+        [os.path.join(HERE, "betterAnusbis"), "--listen", "127.0.0.1:0",
+         "--target", f"http://127.0.0.1:{BACKEND_PORT}", "--store", "bbolt:"],
+        capture_output=True, timeout=20)
+    check("--store bbolt: without a path is rejected",
+          r.returncode == 2 and b"bbolt:" in r.stderr, r.stderr.decode(errors="replace")[-300:])
 
     # ---- 23h. the policy file configures the gate, not just the rules
     cdb = os.path.join(HERE, "tools", "geoip-testdata", "GeoIP2-Country-Test.mmdb")

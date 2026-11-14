@@ -75,3 +75,18 @@ offline; the provenance and rebuild commands are in that directory's README.
 - License: MIT
 - Full text: [`betterAnusbis/third_party/nghttp3/COPYING`](betterAnusbis/third_party/nghttp3/COPYING)
 - Used by: `betterAnusbis/betterAnusbis.c` when built with `-DHAVE_NGHTTP3`
+
+## bbolt file format (`go.etcd.io/bbolt`)
+
+The optional `--store bbolt:PATH` backend reads and writes the on-disk format of
+bbolt (BoltDB), the store Anubis uses for its `bbolt` backend: meta page version
+2, B+tree pages, inline buckets, and one top-level bucket per record with `data`
+and `expiry` (RFC3339Nano).
+
+- Upstream: https://github.com/etcd-io/bbolt
+- License: MIT
+- Vendored: **no**. The C reader/writer in `betterAnusbis/betterAnusbis.c` is an
+  independent implementation of the format; no bbolt source is copied here.
+- Tests: when Go and the cached bbolt module are available, `test_parity.py`
+  opens the gate's bbolt file with the real `go.etcd.io/bbolt` and runs
+  `tx.Check`; otherwise those checks skip.
