@@ -248,6 +248,48 @@ how you ship one.
 
 ---
 
+## 12. "Xe Iaso? more like Intel Iris Xe Iaso"
+
+**The claim: implicit, in the name.** The Anubis author's handle contains "Xe", which
+is also the name of Intel's integrated GPU architecture (gen12lp / Xe-LP), which is
+also the target of 30,260 hand-written assembly instructions in this repository
+([`src/intel/xe/intelXe_hashx.xe`](src/intel/xe/intelXe_hashx.xe)), which is also the
+GPU that ran IGC's kernel at 195.2 M hashes/s and verified every digest against
+`hashlib`.
+
+**Verdict: the name chose the hardware, and the hardware chose the repo.**
+
+The coincidence is not the repo's fault. Intel named the architecture "Xe" (eXascale)
+years before anyone noticed the handle. But the repo noticed, and it did not let the
+coincidence go to waste:
+
+- the assembly files are literally `.xe` (e.g.
+  [`intelXe_sha256.xe`](src/intel/xe/intelXe_sha256.xe),
+  [`intelXe_hashx.xe`](src/intel/xe/intelXe_hashx.xe));
+- the generator is [`tools/gen_xe_sha256.py`](tools/gen_xe_sha256.py) /
+  [`tools/gen_xe_hashx.py`](tools/gen_xe_hashx.py);
+- the hand-written listing targets gen12lp (Tiger Lake, DG1, Alder Lake-P) — the same
+  family as the iGPU in the laptop that runs the WebGPU ANV miscompile probe;
+- the [`mascot/`](mascot) folder contains
+  [`Screenshot_20261114_132944.png`](mascot/Screenshot_20261114_132944.png): the
+  author's profile picture circled in MS Paint with an arrow pointing at an Intel Iris
+  Xe logo, which is either a declaration of war or a hardware inventory, and possibly
+  both.
+
+**What it does not prove:** that Xe Iaso has any connection to Intel, that Intel named
+the architecture after her, or that the `.xe` files are anything other than a GPU ISA
+extension. **What it does prove:** that the repo's author saw the overlap, found it
+funny, and built 484,160 bytes of assembly on top of it without mentioning the joke in
+any document except the filename.
+
+The one thing the repository will concede: the joke is better if you don't explain it.
+This entry exists anyway, because the HALL_OF_SHAME does not have a "too petty to
+document" threshold. See also: [entry 1](#1-the-hey-claude-vibeslop-me-a-cuda-anubis-solver-route-is-fundamentally-dead),
+where the same author's "fundamentally dead" prediction was falsified by a file in this
+repository.
+
+---
+
 ## Rules this repository took from the above
 
 1. Count attempts, not calls. The search stops when it wins, and the count is
