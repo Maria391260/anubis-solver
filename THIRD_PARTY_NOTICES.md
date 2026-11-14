@@ -104,3 +104,16 @@ compatible server.
 - Tests: `tests_valkey.py` runs an in-process RESP2 mock server, so no Valkey
   installation is required; it uses a real `valkey-server`/`redis-server` from
   PATH when one is present.
+
+## Amazon S3 API
+
+The optional `--store s3api:BUCKET` backend talks to S3 or S3-compatible object
+storage over HTTP with AWS Signature Version 4.
+
+- API: https://docs.aws.amazon.com/AmazonS3/latest/API/
+- Signature: https://docs.aws.amazon.com/general/latest/gr/sigv4_signing.html
+- Vendored: **no**. The HTTP/1.1 client and SigV4 signer in
+  `betterAnusbis/betterAnusbis.c` are independent implementations of the public
+  protocol; no AWS SDK source is copied here.
+- Tests: `tests_s3.py` runs an in-process S3 mock that independently verifies
+  SigV4, so no AWS account or MinIO is required.

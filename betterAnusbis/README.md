@@ -165,10 +165,10 @@ policy, honeypot, assets, TLS, metrics
   --og-passthrough  --og-expiry-time SECS  --og-override "og:title=..."
   --og-cache-consider-host               key the cache on host and path
   --challenge-extension css-load
-  --store file:PATH|bbolt:PATH|valkey:URL
+  --store file:PATH|bbolt:PATH|valkey:URL|s3api:BUCKET
                          keep the challenge ledger and honeypot counters in a
-                         snapshot text file, an Anubis-style bbolt DB, or a
-                         Valkey/Redis server (redis://, rediss://, unix://)
+                         snapshot text file, an Anubis-style bbolt DB, a
+                         Valkey/Redis server, or an S3 bucket
   (upstream's --bind, --policy-fname and --target-insecure-skip-verify are
    accepted as aliases)
 ```
@@ -358,12 +358,13 @@ honoured too, through DroneBL, cached for a day.
 `impressum`, `logging`, `dns_ttl`, `status_codes`, `honeypot` and `dnsbl` are
 read from the same document as the rules, so an Anubis deployment's config
 travels rather than being retyped as flags. Flags win where both are given. What
-is still missing there is said out loud: an `s3api` store is named as
-unimplemented (the ledger stays in memory), as are the metrics listener's
-`tls`/`basic_auth` and `pprof`, and `botstopper` is enterprise. `store.backend:
-bbolt` with `store.parameters.path` and `store.backend: valkey` with
-`store.parameters.url` are honoured and configure those stores, exactly as they
-do upstream.
+is still missing there is said out loud: a store backend with missing required
+parameters is named, as are the metrics listener's `tls`/`basic_auth` and
+`pprof`, and `botstopper` is enterprise. `store.backend: bbolt` with
+`store.parameters.path`, `store.backend: valkey` with
+`store.parameters.url`, and `store.backend: s3api` with
+`parameters.bucketName`/`pathStyle` are honoured and configure those stores,
+exactly as they do upstream.
 
 What is reported and skipped, by name, at load: `geoip` and `asns` matchers when
 no database is configured, and `verifyFCrDNS` in shapes the evaluator cannot
@@ -524,26 +525,29 @@ difference — Anubis re-checks through its wasm module via wazero, this calls
   page and refuses a pass-challenge until the browser has fetched it, which is
   what the upstream extension does. `headless` exists only in the enterprise
   build, so asking for it logs that and checks nothing.
-- **Three store backends: a file, bbolt and Valkey.** `--store file:PATH`
+- **Four store backends: file, bbolt, Valkey and S3.** `--store file:PATH`
   snapshots the challenge ledger and the honeypot counters every five seconds,
   on `SIGTERM`, and loads them at startup. `--store bbolt:PATH` writes the same
   state into a real bbolt database with Anubis's layout: one top-level bucket
   per record, holding `data` and `expiry`, expiry as RFC3339Nano; it is
   read and re-verified with `go.etcd.io/bbolt` itself in the test suite.
   `--store valkey:redis://HOST:PORT/DB` keeps the same records in Valkey (or
-  any RESP server), with native TTLs, and needs no local disk: records are
-  written on issue/spend, loaded at startup with `SCAN`, and looked up
-  remotely, so two gate instances can share challenges.
-  file and bbolt are single-writer: bbolt rewrites the whole file atomically,
-  and neither should be shared with a live Anubis. valkey is the multi-instance
-  backend. None is a journal in the file/bbolt case: a crash loses up to five
-  seconds. S3 remains unimplemented.
-- **No S3 backend.** `pass-challenge`,
-  `check`, `ping`, the state endpoint, the honeypot, `robots.txt`, the
-  Prometheus `/metrics`, impressum, localization and the challenge extensions
-  are implemented or documented above. S3 and OpenGraph passthrough are the
-  last two things on the parity list; `PARITY.md` is the full gap list with file
-  references.
+  any RESP server), with native TTLs. `--store s3api:BUCKET` keeps them as S3
+  objects under `betteranusbis/challenge/<id>` and
+  `betteranusbis/honeypot/<network>`, with the absolute expiry in
+  `x-amz-meta-x-anubis-expiry-ms`; credentials and region come from
+  `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional
+  `AWS_SESSION_TOKEN`, and `AWS_ENDPOINT_URL_S3`/`AWS_ENDPOINT_URL` for
+  S3-compatible services, exactly as upstream's AWS SDK reads them.
+  file and bbolt are single-writer; Valkey and S3 are the multi-instance
+  backends (records are written on issue/spend and looked up remotely, so an
+  instance can verify another instance's challenge). file/bbolt are snapshots:
+  a crash loses up to five seconds; Valkey/S3 write with the event.
+- **`pass-challenge`, `check`, `ping`, the state endpoint, the honeypot,
+  `robots.txt`, the Prometheus `/metrics`, impressum, localization and the
+  challenge extensions** are implemented or documented above. OpenGraph
+  passthrough is the last thing on the parity list; `PARITY.md` is the full gap
+  list with file references.
 - **Two policy formats, neither of them a CEL engine.** Our own flat rules
   (literal or regex matchers, first match wins) and Anubis's `botPolicies.yaml`
   (rules, weights, thresholds, imports). The expression evaluator covers the
@@ -573,6 +577,7 @@ a site owner actually configures. That is the point: `--target` and you are done
 python3 test_parity.py        # the flags taken from cmd/anubis, checked on the wire
 python3 tests_http23.py -v    # HTTP/2 and HTTP/3, listener and backend hop
 python3 tests_valkey.py       # the Valkey store against an in-process RESP mock
+python3 tests_s3.py           # the S3 store against an in-process SigV4 mock
 ```
 
 `test_parity.py` also writes and re-reads a `--store bbolt:PATH` database with

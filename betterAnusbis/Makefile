@@ -83,7 +83,12 @@ test-http23: betterAnusbis
 test-valkey: betterAnusbis
 	python3 tests_valkey.py
 
+# The S3 store against the test file's in-process S3 mock (independent SigV4
+# verification); no AWS account or network is needed.
+test-s3: betterAnusbis
+	python3 tests_s3.py
+
 clean:
 	rm -f betterAnusbis
 
-.PHONY: clean wasm-kernels slow test-parity test-http23 test-valkey
+.PHONY: clean wasm-kernels slow test-parity test-http23 test-valkey test-s3

@@ -8,9 +8,9 @@ Where a claim could not be checked it says **unverified**.
 
 Post-snapshot additions (not in the line references below): HTTP/2 and HTTP/3 on
 both the listener and the backend hop, described in `README.md` under "HTTP/2
-and HTTP/3", and the `bbolt` (`--store bbolt:PATH`) and `valkey`
-(`--store valkey:URL`) store backends. The audit below was taken before they
-existed.
+and HTTP/3", and the `bbolt` (`--store bbolt:PATH`), `valkey`
+(`--store valkey:URL`) and `s3api` (`--store s3api:BUCKET`) store backends. The
+audit below was taken before they existed.
 
 Snapshots. Upstream: working tree as of 2026-11-14 09:59, git revision not read (**unverified**).
 Ours: `betterAnusbis.c` md5 `768d0c966353ebc54afd13405bbda9e8`, 3705 lines, mtime 2026-11-14 10:09:04 +0100. This is

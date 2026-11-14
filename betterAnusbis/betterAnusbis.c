@@ -619,8 +619,12 @@ static void respond_redirect(conn *c, const char *location, const char *extra_he
 /* The Valkey client type lives further down with the store code; the ledger
  * hooks above it need the forward declaration and the shared handle. */
 typedef struct vk_client vk_client;
+typedef struct s3_client s3_client;
 static int store_valkey;
+static int store_s3;
+static int s3_path_style;
 static vk_client *vk;
+static s3_client *s3;
 
 #define CH_BUCKETS 4096
 typedef struct {
@@ -636,16 +640,22 @@ typedef struct {
     int used;
 } ch_entry;
 
-/* defined with the Valkey store below; the ledger calls them in place */
-static int vk_available(void);
-static int vk_get_challenge(const char *id, ch_entry *out);
-static void vk_put_challenge(const ch_entry *e, long long ttl);
+/* defined with the remote stores below; the ledger calls them in place */
+static int remote_available(void);
+static int remote_get_challenge(const char *id, ch_entry *out);
+static void remote_put_challenge(const ch_entry *e, long long ttl);
 static void ch_cache_put(const ch_entry *src);
-static int vk_get_honeypot(uint64_t key, int *count, time_t *last);
-static void vk_put_honeypot(uint64_t key, int count, time_t last);
+static int remote_get_honeypot(uint64_t key, int *count, time_t *last);
+static void remote_put_honeypot(uint64_t key, int count, time_t last);
 static void hp_cache_put(uint64_t key, int count, time_t last);
 static int vk_miss_seen(uint64_t key);
 static void vk_miss_mark(uint64_t key);
+static int s3_available(void);
+static int s3_get_challenge(const char *id, ch_entry *out);
+static void s3_put_challenge(const ch_entry *e, long long ttl);
+static int s3_get_honeypot(uint64_t key, int *count, time_t *last);
+static void s3_put_honeypot(uint64_t key, int count, time_t last);
+static int s3_store_start(const char *bucket);
 
 static ch_entry ch_table[CH_BUCKETS];
 static pthread_mutex_t ch_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -678,7 +688,7 @@ static void ch_issue(const char *id, const char *rd, int difficulty, const char 
             ch_issued++;
             ch_entry snap = *e;
             pthread_mutex_unlock(&ch_lock);
-            if (store_valkey) vk_put_challenge(&snap, COOKIE_TTL);
+            if (store_valkey || store_s3) remote_put_challenge(&snap, COOKIE_TTL);
             return;
         }
         if (!strcmp(e->id, id)) {          /* re-issued: refresh it */
@@ -695,7 +705,7 @@ static void ch_issue(const char *id, const char *rd, int difficulty, const char 
             e->spent = 0;
             ch_entry snap = *e;
             pthread_mutex_unlock(&ch_lock);
-            if (store_valkey) vk_put_challenge(&snap, COOKIE_TTL);
+            if (store_valkey || store_s3) remote_put_challenge(&snap, COOKIE_TTL);
             return;
         }
     }
@@ -706,15 +716,15 @@ static void ch_issue(const char *id, const char *rd, int difficulty, const char 
 static int ch_take(const char *id, char *rd_out, size_t rd_cap, int *difficulty_out,
                    char *algo_out, size_t algo_cap) {
     time_t now = time(NULL);
-    if (store_valkey) {
+    if (store_valkey || store_s3) {
         ch_entry remote;
-        int got = vk_get_challenge(id, &remote);
+        int got = remote_get_challenge(id, &remote);
         if (got == 1) {
             if (now - remote.issued > COOKIE_TTL) { ch_expired++; return -1; }
             if (remote.spent) { ch_replayed++; return -2; }
             remote.spent = 1;
             long long ttl = (long long)COOKIE_TTL - (long long)(now - remote.issued);
-            if (ttl > 0) vk_put_challenge(&remote, ttl);
+            if (ttl > 0) remote_put_challenge(&remote, ttl);
             ch_cache_put(&remote);
             snprintf(rd_out, rd_cap, "%s", remote.rd);
             if (difficulty_out) *difficulty_out = remote.difficulty;
@@ -748,9 +758,9 @@ static int ch_take(const char *id, char *rd_out, size_t rd_cap, int *difficulty_
         break;
     }
     pthread_mutex_unlock(&ch_lock);
-    if (rc == 1 && store_valkey) {
+    if (rc == 1 && (store_valkey || store_s3)) {
         long long ttl = (long long)COOKIE_TTL - (long long)(now - snap.issued);
-        if (ttl > 0) vk_put_challenge(&snap, ttl);
+        if (ttl > 0) remote_put_challenge(&snap, ttl);
     }
     return rc;
 }
@@ -772,9 +782,9 @@ static int ch_peek_algorithm(const char *id, char *out, size_t cap) {
         break;
     }
     pthread_mutex_unlock(&ch_lock);
-    if (!found && store_valkey) {
+    if (!found && (store_valkey || store_s3)) {
         ch_entry remote;
-        if (vk_get_challenge(id, &remote) == 1) {
+        if (remote_get_challenge(id, &remote) == 1) {
             ch_cache_put(&remote);
             snprintf(out, cap, "%s", remote.algorithm);
             found = 1;
@@ -788,13 +798,13 @@ static int ch_peek_algorithm(const char *id, char *out, size_t cap) {
  * only accepted if that fetch happened (lib/challenge/extension/css-load). */
 static int ch_mark_css(const char *id) {
     if (!cfg.stateful || !id) return 0;
-    if (store_valkey) {
+    if (store_valkey || store_s3) {
         ch_entry remote;
-        if (vk_get_challenge(id, &remote) == 1) {
+        if (remote_get_challenge(id, &remote) == 1) {
             remote.css_seen = 1;
             long long ttl = (long long)COOKIE_TTL -
                             ((long long)time(NULL) - (long long)remote.issued);
-            if (ttl > 0) vk_put_challenge(&remote, ttl);
+            if (ttl > 0) remote_put_challenge(&remote, ttl);
             ch_cache_put(&remote);
             return 1;
         }
@@ -832,9 +842,9 @@ static int ch_css_seen(const char *id) {
         break;
     }
     pthread_mutex_unlock(&ch_lock);
-    if (seen < 0 && store_valkey) {
+    if (seen < 0 && (store_valkey || store_s3)) {
         ch_entry remote;
-        if (vk_get_challenge(id, &remote) == 1) {
+        if (remote_get_challenge(id, &remote) == 1) {
             ch_cache_put(&remote);
             seen = remote.css_seen ? 1 : 0;
         }
@@ -859,9 +869,9 @@ static int ch_peek_issued_ms(const char *id, long long *out) {
         break;
     }
     pthread_mutex_unlock(&ch_lock);
-    if (!found && store_valkey) {
+    if (!found && (store_valkey || store_s3)) {
         ch_entry remote;
-        if (vk_get_challenge(id, &remote) == 1) {
+        if (remote_get_challenge(id, &remote) == 1) {
             ch_cache_put(&remote);
             *out = remote.issued_ms;
             found = 1;
@@ -887,9 +897,9 @@ static int ch_peek_referer(const char *id, char *out, size_t cap) {
         break;
     }
     pthread_mutex_unlock(&ch_lock);
-    if (!found && store_valkey) {
+    if (!found && (store_valkey || store_s3)) {
         ch_entry remote;
-        if (vk_get_challenge(id, &remote) == 1) {
+        if (remote_get_challenge(id, &remote) == 1) {
             ch_cache_put(&remote);
             snprintf(out, cap, "%s", remote.referer);
             found = 1;
@@ -1042,7 +1052,7 @@ static void hp_record(const char *ip) {
     return;
 
 report:
-    if (store_valkey) vk_put_honeypot(key, hcount, hlast);
+    if (store_valkey || store_s3) remote_put_honeypot(key, hcount, hlast);
     if (cfg.honeypot_log) {
         FILE *f = fopen(cfg.honeypot_log, "a");
         if (f) {
@@ -1071,10 +1081,10 @@ static int hp_count(const char *ip) {
         }
     }
     pthread_mutex_unlock(&hp_lock);
-    if (count == 0 && vk_available() && !vk_miss_seen(key)) {
+    if (count == 0 && remote_available() && !vk_miss_seen(key)) {
         int c2 = 0;
         time_t l2 = 0;
-        int got = vk_get_honeypot(key, &c2, &l2);
+        int got = remote_get_honeypot(key, &c2, &l2);
         if (got == 1 && c2 > 0 && now - l2 <= HP_WINDOW) {
             count = c2;
             hp_cache_put(key, c2, l2);
@@ -6468,6 +6478,35 @@ static void vk_put_honeypot(uint64_t key, int count, time_t last) {
         vk_warn("SET honeypot", err);
 }
 
+/* The ledger talks to one remote interface; Valkey and S3 both implement it. */
+static int remote_available(void) {
+    if (store_valkey) return vk_available();
+    if (store_s3) return s3_available();
+    return 0;
+}
+
+static int remote_get_challenge(const char *id, ch_entry *out) {
+    if (store_valkey) return vk_get_challenge(id, out);
+    if (store_s3) return s3_get_challenge(id, out);
+    return 0;
+}
+
+static void remote_put_challenge(const ch_entry *e, long long ttl) {
+    if (store_valkey) vk_put_challenge(e, ttl);
+    else if (store_s3) s3_put_challenge(e, ttl);
+}
+
+static int remote_get_honeypot(uint64_t key, int *count, time_t *last) {
+    if (store_valkey) return vk_get_honeypot(key, count, last);
+    if (store_s3) return s3_get_honeypot(key, count, last);
+    return 0;
+}
+
+static void remote_put_honeypot(uint64_t key, int count, time_t last) {
+    if (store_valkey) vk_put_honeypot(key, count, last);
+    else if (store_s3) s3_put_honeypot(key, count, last);
+}
+
 /* A negative cache: a network with no honeypot hits would otherwise cost a
  * Valkey round trip on every single request. */
 static int vk_miss_seen(uint64_t key) {
@@ -6626,6 +6665,3128 @@ static int valkey_store_start(const char *url) {
     return 0;
 }
 
+/*
+ * s3_io.h -- minimal standalone Amazon S3 client (HTTP/1.1 + TLS + SigV4).
+ *
+ * The implementation is single-file friendly: paste s3_io.h and s3_io.c into
+ * a project and link with -lssl -lcrypto -lpthread.
+ *
+ * Public API (all return 0 on success and -1 on error unless noted):
+ *   s3_client *s3_connect(bucket, path_style, err, errcap);
+ *   void       s3_close(c);
+ *   int        s3_ping(c, err, errcap);
+ *   int        s3_get(c, key, &val, &vallen, &expiry_ms, err, errcap);
+ *   int        s3_put(c, key, val, vallen, expiry_ms, err, errcap);
+ *   int        s3_delete(c, key, err, errcap);
+ *
+ * Configuration comes from the environment in s3_connect():
+ *   AWS_REGION or AWS_DEFAULT_REGION   (required)
+ *   AWS_ACCESS_KEY_ID                  (required)
+ *   AWS_SECRET_ACCESS_KEY              (required)
+ *   AWS_SESSION_TOKEN                  (optional)
+ *   AWS_ENDPOINT_URL_S3 / AWS_ENDPOINT_URL (optional; http:// or https://)
+ *
+ * path_style:  >0 forces path style, 0 forces virtual-host style, <0 selects
+ *              automatically (virtual-host for the AWS default s3_endpoint,
+ *              path style for any custom s3_endpoint).
+ *
+ * Secrets are never logged. See REPORT.md for the full contract and caveats.
+ */
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct s3_client s3_client;
+
+/* Connect (parse env config, validate addressing, build TLS context).
+ * Returns NULL and fills err on failure. Never logs secret material. */
+s3_client *s3_connect(const char *bucket, int path_style,
+                      char *err, size_t errcap);
+
+/* Release all resources owned by the client (safe with NULL). */
+void s3_close(s3_client *c);
+
+/* Probe the bucket: GET a sentinel key. 404 / NoSuchKey means the bucket and
+ * the credentials/signature work. 0 = ok, -1 = error (err has details). */
+int s3_ping(s3_client *c, char *err, size_t errcap);
+
+/* Fetch an object.
+ *   1  found: *val is a malloc'd, NUL-terminated buffer (non-NULL even for an
+ *      empty object), *vallen the byte length, *expiry_ms the upstream
+ *      x-amz-meta-x-anubis-expiry-ms value (0 when absent).
+ *   0  not found, or the stored expiry has passed (a best-effort DELETE is
+ *      attempted in that case).
+ *  -1  error (err has details; S3 XML Code/Message are surfaced). */
+int s3_get(s3_client *c, const char *key, unsigned char **val, size_t *vallen,
+           long long *expiry_ms, char *err, size_t errcap);
+
+/* Store an object. expiry_ms > 0 adds x-amz-meta-x-anubis-expiry-ms. */
+int s3_put(s3_client *c, const char *key, const unsigned char *val,
+           size_t vallen, long long expiry_ms, char *err, size_t errcap);
+
+/* Delete an object. 2xx and 404 are both treated as success. */
+int s3_delete(s3_client *c, const char *key, char *err, size_t errcap);
+
+/* ------------------------------------------------------------------------ */
+/* Test-only helpers (compiled unconditionally; unused by the S3 code paths) */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Generic SigV4 signer used by the official AWS test suite harness.
+ * It signs an arbitrary method / path / query / header set with an arbitrary
+ * service name, and can apply the botocore-style URI path normalization that
+ * the official suite expects. The production S3 path never normalizes the
+ * URI (S3 keys are canonical already) and passes path_pre_encoded = 1.
+ */
+typedef struct {
+    const char *method;        /* "GET", "POST", ...                      */
+    const char *raw_path;      /* path as it appears before encoding      */
+    int normalize_path;        /* 1: remove dot segments / extra slashes  */
+    const char *raw_query;     /* query string without '?', or NULL/""    */
+    const char *const *headers;/* "Name: value" lines, duplicates allowed */
+    size_t nheaders;
+    const unsigned char *body;
+    size_t bodylen;
+    const char *access_key;
+    const char *secret_key;
+    const char *region;
+    const char *service;
+    const char *amzdate;       /* "YYYYMMDDTHHMMSSZ"                      */
+    int path_pre_encoded;      /* 1: raw_path already RFC3986 encoded     */
+} s3_sigv4_test_req;
+
+typedef struct {
+    char *canonical_request;   /* <method>\n<uri>\n<query>\n...           */
+    char *string_to_sign;
+    char *authorization;
+} s3_sigv4_test_out;
+
+int s3_sigv4_test(const s3_sigv4_test_req *req, s3_sigv4_test_out *out,
+                  char *err, size_t errcap);
+void s3_sigv4_test_free(s3_sigv4_test_out *out);
+
+
+/*
+ * s3_io.c -- minimal standalone Amazon S3 client with SigV4 signing.
+ *
+ * Design notes:
+ *  - No global mutable state. Each s3_client owns its configuration and its
+ *    TLS_CTX, so distinct clients may be used concurrently from threads.
+ *  - Stdlib/POSIX only + OpenSSL. No GNU extensions (clean with -Wpedantic).
+ *  - Secrets live in the client struct and are never printed or logged.
+ */
+#define _POSIX_C_SOURCE 200809L
+
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+/* ------------------------------------------------------------------------- */
+/* Tunables                                                                  */
+/* ------------------------------------------------------------------------- */
+
+#define S3_MAX_HEADER_BYTES (64u * 1024u)
+#define S3_MAX_BODY_BYTES   (8u * 1024u * 1024u)
+#define S3_CONNECT_TIMEOUT_MS 5000
+#define S3_IO_TIMEOUT_SEC 10
+#define S3_READ_CHUNK 16384u
+#define S3_STREAM_CAP (S3_MAX_BODY_BYTES + S3_MAX_HEADER_BYTES + 65536u)
+
+#define S3_META_EXPIRY "x-amz-meta-x-anubis-expiry-ms"
+#define S3_PROBE_KEY ".s3_io_probe"
+
+/* ------------------------------------------------------------------------- */
+/* Small growable byte buffer                                                */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    char *p;
+    size_t len;
+    size_t cap;
+} s3_sbuf;
+
+static void sb_init(s3_sbuf *b)
+{
+    b->p = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
+static void sb_free(s3_sbuf *b)
+{
+    free(b->p);
+    b->p = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
+static int sb_reserve(s3_sbuf *b, size_t extra)
+{
+    size_t need, cap;
+    char *np;
+
+    if (extra > SIZE_MAX - b->len - 1u) {
+        return -1;
+    }
+    need = b->len + extra + 1u;
+    if (need <= b->cap) {
+        return 0;
+    }
+    cap = b->cap ? b->cap : 128u;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2u) {
+            cap = need;
+            break;
+        }
+        cap *= 2u;
+    }
+    np = (char *)realloc(b->p, cap);
+    if (np == NULL) {
+        return -1;
+    }
+    b->p = np;
+    b->cap = cap;
+    return 0;
+}
+
+static int sb_append(s3_sbuf *b, const void *data, size_t n)
+{
+    if (n == 0) {
+        return 0;
+    }
+    if (sb_reserve(b, n) != 0) {
+        return -1;
+    }
+    memcpy(b->p + b->len, data, n);
+    b->len += n;
+    b->p[b->len] = '\0';
+    return 0;
+}
+
+static int sb_puts(s3_sbuf *b, const char *s)
+{
+    return sb_append(b, s, strlen(s));
+}
+
+static int sb_putc(s3_sbuf *b, char ch)
+{
+    return sb_append(b, &ch, 1u);
+}
+
+static int sb_printf(s3_sbuf *b, const char *fmt, ...)
+{
+    va_list ap;
+    va_list ap2;
+    int n;
+
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        va_end(ap2);
+        return -1;
+    }
+    if (sb_reserve(b, (size_t)n) != 0) {
+        va_end(ap2);
+        return -1;
+    }
+    (void)vsnprintf(b->p + b->len, (size_t)n + 1u, fmt, ap2);
+    va_end(ap2);
+    b->len += (size_t)n;
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Errors, allocation helpers                                                */
+/* ------------------------------------------------------------------------- */
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 3, 4)))
+#endif
+static void s3_set_err(char *err, size_t cap, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (err == NULL || cap == 0) {
+        return;
+    }
+    va_start(ap, fmt);
+    (void)vsnprintf(err, cap, fmt, ap);
+    va_end(ap);
+}
+
+static char *xstrdup(const char *s)
+{
+    size_t n;
+    char *p;
+
+    if (s == NULL) {
+        return NULL;
+    }
+    n = strlen(s);
+    p = (char *)malloc(n + 1u);
+    if (p == NULL) {
+        return NULL;
+    }
+    memcpy(p, s, n + 1u);
+    return p;
+}
+
+static char *xstrndup(const char *s, size_t n)
+{
+    char *p;
+
+    p = (char *)malloc(n + 1u);
+    if (p == NULL) {
+        return NULL;
+    }
+    memcpy(p, s, n);
+    p[n] = '\0';
+    return p;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Crypto helpers (OpenSSL EVP/HMAC)                                         */
+/* ------------------------------------------------------------------------- */
+
+static int s3_sha256_hex(const void *data, size_t len, char out[65])
+{
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int mdlen = 0;
+    static const char hx[] = "0123456789abcdef";
+    int i;
+
+    if (len > 0 && data == NULL) {
+        return -1;
+    }
+    if (EVP_Digest(data, len, md, &mdlen, EVP_sha256(), NULL) != 1) {
+        return -1;
+    }
+    if (mdlen != 32u) {
+        return -1;
+    }
+    for (i = 0; i < 32; i++) {
+        out[i * 2] = hx[(md[i] >> 4) & 0x0f];
+        out[i * 2 + 1] = hx[md[i] & 0x0f];
+    }
+    out[64] = '\0';
+    return 0;
+}
+
+static int s3_hmac_sha256(const void *key, size_t keylen,
+                       const void *data, size_t datalen,
+                       unsigned char out[32])
+{
+    unsigned int outlen = 0;
+
+    if (keylen > (size_t)INT_MAX || datalen > (size_t)INT_MAX) {
+        return -1;
+    }
+    if (key == NULL || (datalen > 0 && data == NULL)) {
+        return -1;
+    }
+    if (HMAC(EVP_sha256(), key, (int)keylen,
+             (const unsigned char *)data, datalen, out, &outlen) == NULL) {
+        return -1;
+    }
+    if (outlen != 32u) {
+        return -1;
+    }
+    return 0;
+}
+
+static void bin_to_hex(const unsigned char *in, size_t n, char *out)
+{
+    static const char hx[] = "0123456789abcdef";
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        out[i * 2] = hx[(in[i] >> 4) & 0x0f];
+        out[i * 2 + 1] = hx[in[i] & 0x0f];
+    }
+    out[n * 2] = '\0';
+}
+
+/* ------------------------------------------------------------------------- */
+/* RFC 3986 percent encoding / decoding                                      */
+/* ------------------------------------------------------------------------- */
+
+static int is_unreserved(unsigned char c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
+           c == '~';
+}
+
+static int pct_encode(const unsigned char *in, size_t n, int keep_slash,
+                      s3_sbuf *out)
+{
+    static const char hx[] = "0123456789ABCDEF";
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        unsigned char ch = in[i];
+
+        if (is_unreserved(ch) || (keep_slash && ch == '/')) {
+            if (sb_putc(out, (char)ch) != 0) {
+                return -1;
+            }
+        } else {
+            char enc[3];
+
+            enc[0] = '%';
+            enc[1] = hx[(ch >> 4) & 0x0f];
+            enc[2] = hx[ch & 0x0f];
+            if (sb_append(out, enc, 3u) != 0) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int hex_digit(int c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/* Decode %XX escapes; malformed escapes are kept verbatim. */
+static int s3_pct_decode(const char *in, size_t n, s3_sbuf *out)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        if (in[i] == '%' && i + 2u < n) {
+            int hi = hex_digit((unsigned char)in[i + 1]);
+            int lo = hex_digit((unsigned char)in[i + 2]);
+
+            if (hi >= 0 && lo >= 0) {
+                unsigned char byte = (unsigned char)((hi << 4) | lo);
+
+                if (sb_putc(out, (char)byte) != 0) {
+                    return -1;
+                }
+                i += 2u;
+                continue;
+            }
+        }
+        if (sb_putc(out, in[i]) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Canonical URI path (botocore-compatible normalization for the test suite)  */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * RFC 3986 section 5.2.4 dot-segment removal, matching botocore's
+ * remove_dot_segments (which also collapses empty segments). Used only by the
+ * generic test signer: the S3 data path must never normalize keys.
+ */
+static int normalize_uri_path(const char *raw, s3_sbuf *out)
+{
+    size_t n = strlen(raw);
+    size_t i = 0;
+    size_t *starts = NULL;
+    size_t *lens = NULL;
+    size_t count = 0;
+    size_t alloc = 0;
+    size_t k;
+
+    while (i <= n) {
+        size_t seg_start = i;
+        size_t seg_len;
+
+        while (i < n && raw[i] != '/') {
+            i++;
+        }
+        seg_len = i - seg_start;
+        if (seg_len == 1u && raw[seg_start] == '.') {
+            /* skip */
+        } else if (seg_len == 2u && raw[seg_start] == '.' &&
+                   raw[seg_start + 1u] == '.') {
+            if (count > 0) {
+                count--;
+            }
+        } else if (seg_len > 0) {
+            if (count == alloc) {
+                size_t nalloc = alloc ? alloc * 2u : 8u;
+                size_t *ns = (size_t *)realloc(starts, nalloc * sizeof(*ns));
+                size_t *nl;
+
+                if (ns == NULL) {
+                    free(starts);
+                    free(lens);
+                    return -1;
+                }
+                starts = ns;
+                nl = (size_t *)realloc(lens, nalloc * sizeof(*nl));
+                if (nl == NULL) {
+                    free(starts);
+                    free(lens);
+                    return -1;
+                }
+                lens = nl;
+                alloc = nalloc;
+            }
+            starts[count] = seg_start;
+            lens[count] = seg_len;
+            count++;
+        }
+        if (i == n) {
+            break;
+        }
+        i++; /* skip '/' */
+        if (i == n) {
+            break; /* trailing slash handled below */
+        }
+    }
+
+    if (n > 0 && raw[0] == '/') {
+        if (sb_putc(out, '/') != 0) {
+            goto oom;
+        }
+    }
+    for (k = 0; k < count; k++) {
+        if (k > 0 && sb_putc(out, '/') != 0) {
+            goto oom;
+        }
+        if (sb_append(out, raw + starts[k], lens[k]) != 0) {
+            goto oom;
+        }
+    }
+    if (n > 0 && raw[n - 1] == '/' && count > 0) {
+        if (sb_putc(out, '/') != 0) {
+            goto oom;
+        }
+    }
+    free(starts);
+    free(lens);
+    return 0;
+
+oom:
+    free(starts);
+    free(lens);
+    return -1;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Canonical query string                                                    */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    s3_sbuf key;
+    s3_sbuf val;
+} s3_qpair;
+
+static int qpair_cmp(const void *a, const void *b)
+{
+    const s3_qpair *x = (const s3_qpair *)a;
+    const s3_qpair *y = (const s3_qpair *)b;
+    int r = strcmp(x->key.p ? x->key.p : "", y->key.p ? y->key.p : "");
+
+    if (r != 0) {
+        return r;
+    }
+    return strcmp(x->val.p ? x->val.p : "", y->val.p ? y->val.p : "");
+}
+
+static void qpair_free(s3_qpair *v, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        sb_free(&v[i].key);
+        sb_free(&v[i].val);
+    }
+    free(v);
+}
+
+static int canonical_query(const char *raw, s3_sbuf *out)
+{
+    const char *p;
+    const char *end;
+    s3_qpair *pairs = NULL;
+    size_t count = 0;
+    size_t alloc = 0;
+    size_t i;
+
+    if (raw == NULL || raw[0] == '\0') {
+        return 0;
+    }
+    p = raw;
+    end = raw + strlen(raw);
+    while (p < end) {
+        const char *amp = p;
+        const char *eq;
+        const char *seg_end;
+        s3_sbuf dk, dv;
+
+        while (amp < end && *amp != '&') {
+            amp++;
+        }
+        seg_end = amp;
+        if (seg_end > p) {
+            eq = p;
+            while (eq < seg_end && *eq != '=') {
+                eq++;
+            }
+            sb_init(&dk);
+            sb_init(&dv);
+            if (s3_pct_decode(p, (size_t)(eq - p), &dk) != 0 ||
+                s3_pct_decode(eq < seg_end ? eq + 1 : seg_end,
+                           eq < seg_end ? (size_t)(seg_end - eq - 1) : 0u,
+                           &dv) != 0) {
+                sb_free(&dk);
+                sb_free(&dv);
+                qpair_free(pairs, count);
+                return -1;
+            }
+            if (count == alloc) {
+                size_t nalloc = alloc ? alloc * 2u : 8u;
+                s3_qpair *np = (s3_qpair *)realloc(pairs, nalloc * sizeof(*np));
+
+                if (np == NULL) {
+                    sb_free(&dk);
+                    sb_free(&dv);
+                    qpair_free(pairs, count);
+                    return -1;
+                }
+                pairs = np;
+                alloc = nalloc;
+            }
+            sb_init(&pairs[count].key);
+            sb_init(&pairs[count].val);
+            if (pct_encode((const unsigned char *)dk.p, dk.len, 0,
+                           &pairs[count].key) != 0 ||
+                pct_encode((const unsigned char *)dv.p, dv.len, 0,
+                           &pairs[count].val) != 0) {
+                sb_free(&dk);
+                sb_free(&dv);
+                qpair_free(pairs, count + 1u);
+                return -1;
+            }
+            sb_free(&dk);
+            sb_free(&dv);
+            count++;
+        }
+        p = (amp < end) ? amp + 1 : end;
+    }
+    if (count > 1) {
+        qsort(pairs, count, sizeof(*pairs), qpair_cmp);
+    }
+    for (i = 0; i < count; i++) {
+        if (i > 0 && sb_putc(out, '&') != 0) {
+            qpair_free(pairs, count);
+            return -1;
+        }
+        if (sb_append(out, pairs[i].key.p, pairs[i].key.len) != 0 ||
+            sb_putc(out, '=') != 0 ||
+            sb_append(out, pairs[i].val.p, pairs[i].val.len) != 0) {
+            qpair_free(pairs, count);
+            return -1;
+        }
+    }
+    qpair_free(pairs, count);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Header canonicalization and SigV4 signing                                 */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    char *name;   /* lowercase, trimmed */
+    char *value;  /* trimmed, internal runs of SP/HTAB collapsed */
+    size_t order; /* original position, keeps duplicate values in order */
+} s3_shdr;
+
+static void shdr_free_all(s3_shdr *v, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        free(v[i].name);
+        free(v[i].value);
+    }
+    free(v);
+}
+
+static char *trim_ows_dup(const char *s, size_t n)
+{
+    size_t b = 0;
+    size_t e = n;
+    size_t i;
+    size_t w = 0;
+    char *out;
+    int pending_space = 0;
+
+    while (b < e && (s[b] == ' ' || s[b] == '\t')) {
+        b++;
+    }
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t')) {
+        e--;
+    }
+    out = (char *)malloc(e - b + 1u);
+    if (out == NULL) {
+        return NULL;
+    }
+    for (i = b; i < e; i++) {
+        char ch = s[i];
+
+        if (ch == ' ' || ch == '\t') {
+            pending_space = 1;
+            continue;
+        }
+        if (pending_space && w > 0) {
+            out[w++] = ' ';
+        }
+        pending_space = 0;
+        out[w++] = ch;
+    }
+    out[w] = '\0';
+    return out;
+}
+
+static int shdr_cmp(const void *a, const void *b)
+{
+    const s3_shdr *x = (const s3_shdr *)a;
+    const s3_shdr *y = (const s3_shdr *)b;
+    int r = strcmp(x->name, y->name);
+
+    if (r != 0) {
+        return r;
+    }
+    if (x->order < y->order) {
+        return -1;
+    }
+    if (x->order > y->order) {
+        return 1;
+    }
+    return 0;
+}
+
+static int parse_header_line(const char *line, size_t order, s3_shdr *out,
+                             char *err, size_t errcap)
+{
+    const char *colon = strchr(line, ':');
+    size_t i;
+    size_t name_len;
+    char *name;
+
+    if (colon == NULL) {
+        s3_set_err(err, errcap, "malformed header line (missing colon)");
+        return -1;
+    }
+    name_len = (size_t)(colon - line);
+    name = (char *)malloc(name_len + 1u);
+    if (name == NULL) {
+        s3_set_err(err, errcap, "out of memory");
+        return -1;
+    }
+    for (i = 0; i < name_len; i++) {
+        unsigned char ch = (unsigned char)line[i];
+
+        if (ch <= 0x20 || ch >= 0x7f) {
+            free(name);
+            s3_set_err(err, errcap, "invalid character in header name");
+            return -1;
+        }
+        name[i] = (char)tolower(ch);
+    }
+    name[name_len] = '\0';
+    if (name_len == 0) {
+        free(name);
+        s3_set_err(err, errcap, "empty header name");
+        return -1;
+    }
+    out->name = name;
+    out->value = trim_ows_dup(colon + 1, strlen(colon + 1));
+    out->order = order;
+    if (out->value == NULL) {
+        free(name);
+        out->name = NULL;
+        s3_set_err(err, errcap, "out of memory");
+        return -1;
+    }
+    if (strpbrk(out->value, "\r\n") != NULL) {
+        free(out->name);
+        free(out->value);
+        out->name = NULL;
+        out->value = NULL;
+        s3_set_err(err, errcap, "header value contains CR/LF");
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Core SigV4 signer. Canonical URI and query are passed already encoded (the
+ * production caller encodes the key exactly once). Header values are
+ * normalized here, and the normalized values are what the caller must place
+ * on the wire (production values are already canonical by construction).
+ */
+static int sigv4_sign(const char *method, const char *canon_uri,
+                      const char *canon_query,
+                      const char *const *hdr_lines, size_t nhdrs,
+                      const char *payload_hash_hex,
+                      const char *access_key, const char *secret_key,
+                      const char *region, const char *service,
+                      const char *amzdate,
+                      s3_sbuf *out_authz, s3_sbuf *out_signed,
+                      s3_sbuf *out_creq, s3_sbuf *out_sts,
+                      char *err, size_t errcap)
+{
+    s3_shdr *hdrs = NULL;
+    s3_sbuf canon_headers, signed_headers, creq, sts, scope, keybuf;
+    unsigned char kdate[32], kregion[32], kservice[32], ksigning[32];
+    unsigned char sig[32];
+    char sig_hex[65];
+    char creq_hash[65];
+    size_t i;
+    size_t groups = 0;
+    int rc = -1;
+
+    sb_init(&canon_headers);
+    sb_init(&signed_headers);
+    sb_init(&creq);
+    sb_init(&sts);
+    sb_init(&scope);
+    sb_init(&keybuf);
+
+    if (method == NULL || canon_uri == NULL || access_key == NULL ||
+        secret_key == NULL || region == NULL || service == NULL ||
+        amzdate == NULL || payload_hash_hex == NULL) {
+        s3_set_err(err, errcap, "internal: missing signing input");
+        goto done;
+    }
+    if (strlen(amzdate) != 16u || amzdate[8] != 'T' || amzdate[15] != 'Z') {
+        s3_set_err(err, errcap, "internal: bad x-amz-date");
+        goto done;
+    }
+    if (nhdrs > 0 && hdr_lines == NULL) {
+        s3_set_err(err, errcap, "internal: missing headers");
+        goto done;
+    }
+
+    if (nhdrs > 0) {
+        hdrs = (s3_shdr *)calloc(nhdrs, sizeof(*hdrs));
+        if (hdrs == NULL) {
+            s3_set_err(err, errcap, "out of memory");
+            goto done;
+        }
+        for (i = 0; i < nhdrs; i++) {
+            if (parse_header_line(hdr_lines[i], i, &hdrs[i], err, errcap) != 0) {
+                shdr_free_all(hdrs, nhdrs);
+                hdrs = NULL;
+                goto done;
+            }
+        }
+        qsort(hdrs, nhdrs, sizeof(*hdrs), shdr_cmp);
+    }
+
+    /* Merge duplicate header names, preserving value order. */
+    for (i = 0; i < nhdrs;) {
+        size_t j = i + 1u;
+        s3_sbuf merged;
+
+        sb_init(&merged);
+        if (sb_puts(&merged, hdrs[i].value) != 0) {
+            sb_free(&merged);
+            shdr_free_all(hdrs, nhdrs);
+            hdrs = NULL;
+            goto done;
+        }
+        while (j < nhdrs && strcmp(hdrs[j].name, hdrs[i].name) == 0) {
+            if (sb_putc(&merged, ',') != 0 ||
+                sb_puts(&merged, hdrs[j].value) != 0) {
+                sb_free(&merged);
+                shdr_free_all(hdrs, nhdrs);
+                hdrs = NULL;
+                goto done;
+            }
+            j++;
+        }
+        if (groups > 0 && sb_putc(&signed_headers, ';') != 0) {
+            sb_free(&merged);
+            shdr_free_all(hdrs, nhdrs);
+            hdrs = NULL;
+            goto done;
+        }
+        if (sb_puts(&signed_headers, hdrs[i].name) != 0 ||
+            sb_puts(&canon_headers, hdrs[i].name) != 0 ||
+            sb_putc(&canon_headers, ':') != 0 ||
+            sb_append(&canon_headers, merged.p, merged.len) != 0 ||
+            sb_putc(&canon_headers, '\n') != 0) {
+            sb_free(&merged);
+            shdr_free_all(hdrs, nhdrs);
+            hdrs = NULL;
+            goto done;
+        }
+        sb_free(&merged);
+        groups++;
+        i = j;
+    }
+    shdr_free_all(hdrs, nhdrs);
+    hdrs = NULL;
+
+    if (sb_printf(&creq, "%s\n%s\n%s\n", method, canon_uri,
+                  canon_query ? canon_query : "") != 0 ||
+        sb_append(&creq, canon_headers.p, canon_headers.len) != 0 ||
+        sb_putc(&creq, '\n') != 0 ||
+        sb_append(&creq, signed_headers.p, signed_headers.len) != 0 ||
+        sb_putc(&creq, '\n') != 0 ||
+        sb_puts(&creq, payload_hash_hex) != 0) {
+        s3_set_err(err, errcap, "out of memory");
+        goto done;
+    }
+    if (s3_sha256_hex(creq.p, creq.len, creq_hash) != 0) {
+        s3_set_err(err, errcap, "SHA-256 failed");
+        goto done;
+    }
+    if (sb_printf(&scope, "%.8s/%s/%s/aws4_request", amzdate, region,
+                  service) != 0 ||
+        sb_printf(&sts, "AWS4-HMAC-SHA256\n%s\n%s\n%s", amzdate, scope.p,
+                  creq_hash) != 0) {
+        s3_set_err(err, errcap, "out of memory");
+        goto done;
+    }
+
+    if (sb_puts(&keybuf, "AWS4") != 0 || sb_puts(&keybuf, secret_key) != 0) {
+        s3_set_err(err, errcap, "out of memory");
+        goto done;
+    }
+    if (s3_hmac_sha256(keybuf.p, keybuf.len, amzdate, 8u, kdate) != 0 ||
+        s3_hmac_sha256(kdate, 32u, region, strlen(region), kregion) != 0 ||
+        s3_hmac_sha256(kregion, 32u, service, strlen(service), kservice) != 0 ||
+        s3_hmac_sha256(kservice, 32u, "aws4_request", 12u, ksigning) != 0 ||
+        s3_hmac_sha256(ksigning, 32u, sts.p, sts.len, sig) != 0) {
+        s3_set_err(err, errcap, "HMAC-SHA256 failed");
+        goto done;
+    }
+    bin_to_hex(sig, 32u, sig_hex);
+
+    if (sb_printf(out_authz,
+                  "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, "
+                  "Signature=%s",
+                  access_key, scope.p, signed_headers.p, sig_hex) != 0) {
+        s3_set_err(err, errcap, "out of memory");
+        goto done;
+    }
+    if (out_signed != NULL &&
+        sb_append(out_signed, signed_headers.p, signed_headers.len) != 0) {
+        s3_set_err(err, errcap, "out of memory");
+        goto done;
+    }
+    if (out_creq != NULL &&
+        sb_append(out_creq, creq.p, creq.len) != 0) {
+        s3_set_err(err, errcap, "out of memory");
+        goto done;
+    }
+    if (out_sts != NULL && sb_append(out_sts, sts.p, sts.len) != 0) {
+        s3_set_err(err, errcap, "out of memory");
+        goto done;
+    }
+    rc = 0;
+
+done:
+    if (hdrs != NULL) {
+        shdr_free_all(hdrs, nhdrs);
+    }
+    sb_free(&canon_headers);
+    sb_free(&signed_headers);
+    sb_free(&creq);
+    sb_free(&sts);
+    sb_free(&scope);
+    sb_free(&keybuf);
+    return rc;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Test-only public signer entry point                                       */
+/* ------------------------------------------------------------------------- */
+
+static char *sbuf_take(s3_sbuf *b)
+{
+    char *p;
+
+    if (b->p == NULL) {
+        p = xstrdup("");
+        return p;
+    }
+    p = b->p;
+    b->p = NULL;
+    b->len = 0;
+    b->cap = 0;
+    return p;
+}
+
+int s3_sigv4_test(const s3_sigv4_test_req *req, s3_sigv4_test_out *out,
+                  char *err, size_t errcap)
+{
+    s3_sbuf encpath, normpath, query, creq, sts, authz;
+    char payload[65];
+    int rc = -1;
+
+    if (out != NULL) {
+        out->canonical_request = NULL;
+        out->string_to_sign = NULL;
+        out->authorization = NULL;
+    }
+    if (req == NULL || out == NULL) {
+        s3_set_err(err, errcap, "internal: null request");
+        return -1;
+    }
+    sb_init(&encpath);
+    sb_init(&normpath);
+    sb_init(&query);
+    sb_init(&creq);
+    sb_init(&sts);
+    sb_init(&authz);
+
+    if (req->method == NULL || req->raw_path == NULL) {
+        s3_set_err(err, errcap, "internal: missing method or path");
+        goto done;
+    }
+    if (req->path_pre_encoded) {
+        if (sb_puts(&encpath, req->raw_path) != 0) {
+            s3_set_err(err, errcap, "out of memory");
+            goto done;
+        }
+    } else {
+        if (req->normalize_path) {
+            if (normalize_uri_path(req->raw_path, &normpath) != 0) {
+                s3_set_err(err, errcap, "out of memory");
+                goto done;
+            }
+            if (pct_encode((const unsigned char *)normpath.p, normpath.len, 1,
+                           &encpath) != 0) {
+                s3_set_err(err, errcap, "out of memory");
+                goto done;
+            }
+        } else {
+            if (pct_encode((const unsigned char *)req->raw_path,
+                           strlen(req->raw_path), 1, &encpath) != 0) {
+                s3_set_err(err, errcap, "out of memory");
+                goto done;
+            }
+        }
+    }
+    if (canonical_query(req->raw_query, &query) != 0) {
+        s3_set_err(err, errcap, "out of memory");
+        goto done;
+    }
+    if (s3_sha256_hex(req->body ? req->body : (const unsigned char *)"",
+                   req->bodylen, payload) != 0) {
+        s3_set_err(err, errcap, "SHA-256 failed");
+        goto done;
+    }
+    if (sigv4_sign(req->method, encpath.p ? encpath.p : "/",
+                   query.p ? query.p : "",
+                   req->headers, req->nheaders, payload,
+                   req->access_key, req->secret_key, req->region,
+                   req->service, req->amzdate,
+                   &authz, NULL, &creq, &sts, err, errcap) != 0) {
+        goto done;
+    }
+    out->canonical_request = sbuf_take(&creq);
+    out->string_to_sign = sbuf_take(&sts);
+    out->authorization = sbuf_take(&authz);
+    if (out->canonical_request == NULL || out->string_to_sign == NULL ||
+        out->authorization == NULL) {
+        s3_sigv4_test_free(out);
+        s3_set_err(err, errcap, "out of memory");
+        goto done;
+    }
+    rc = 0;
+
+done:
+    sb_free(&encpath);
+    sb_free(&normpath);
+    sb_free(&query);
+    sb_free(&creq);
+    sb_free(&sts);
+    sb_free(&authz);
+    return rc;
+}
+
+void s3_sigv4_test_free(s3_sigv4_test_out *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    free(out->canonical_request);
+    free(out->string_to_sign);
+    free(out->authorization);
+    out->canonical_request = NULL;
+    out->string_to_sign = NULL;
+    out->authorization = NULL;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Environment / s3_endpoint configuration                                      */
+/* ------------------------------------------------------------------------- */
+
+static char *env_dup_nonempty(const char *name)
+{
+    const char *v = getenv(name);
+
+    if (v == NULL) {
+        return NULL;
+    }
+    while (*v == ' ' || *v == '\t') {
+        v++;
+    }
+    if (*v == '\0') {
+        return NULL;
+    }
+    {
+        size_t n = strlen(v);
+        char *out;
+
+        while (n > 0 && (v[n - 1] == ' ' || v[n - 1] == '\t')) {
+            n--;
+        }
+        out = xstrndup(v, n);
+        if (out == NULL) {
+            return NULL;
+        }
+        if (out[0] == '\0') {
+            free(out);
+            return NULL;
+        }
+        return out;
+    }
+}
+
+static int ci_equal_n(const char *a, const char *b, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+typedef struct {
+    char *scheme;
+    char *host;
+    int port;
+    char *base_path;
+} s3_endpoint;
+
+static void endpoint_free(s3_endpoint *ep)
+{
+    if (ep == NULL) {
+        return;
+    }
+    free(ep->scheme);
+    free(ep->host);
+    free(ep->base_path);
+    ep->scheme = NULL;
+    ep->host = NULL;
+    ep->base_path = NULL;
+}
+
+static int parse_port(const char *s, size_t n, int *out)
+{
+    long v = 0;
+    size_t i;
+
+    if (n == 0 || n > 5u) {
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') {
+            return -1;
+        }
+        v = v * 10 + (s[i] - '0');
+        if (v > 65535) {
+            return -1;
+        }
+    }
+    if (v <= 0) {
+        return -1;
+    }
+    *out = (int)v;
+    return 0;
+}
+
+static int parse_endpoint(const char *url, s3_endpoint *ep,
+                          char *err, size_t errcap)
+{
+    const char *sep;
+    const char *authority;
+    const char *auth_end;
+    const char *host_start;
+    const char *host_end;
+    const char *port_start = NULL;
+    const char *slash;
+    size_t auth_len;
+
+    memset(ep, 0, sizeof(*ep));
+    sep = strstr(url, "://");
+    if (sep == NULL) {
+        s3_set_err(err, errcap, "s3_endpoint URL must start with http:// or https://");
+        return -1;
+    }
+    ep->scheme = xstrndup(url, (size_t)(sep - url));
+    if (ep->scheme == NULL) {
+        s3_set_err(err, errcap, "out of memory");
+        return -1;
+    }
+    if (strcmp(ep->scheme, "http") == 0) {
+        ep->port = 80;
+    } else if (strcmp(ep->scheme, "https") == 0) {
+        ep->port = 443;
+    } else {
+        s3_set_err(err, errcap, "unsupported s3_endpoint scheme \"%s\" "
+                "(only http and https)", ep->scheme);
+        endpoint_free(ep);
+        return -1;
+    }
+
+    authority = sep + 3;
+    slash = strchr(authority, '/');
+    auth_end = slash ? slash : authority + strlen(authority);
+    auth_len = (size_t)(auth_end - authority);
+    if (auth_len == 0) {
+        s3_set_err(err, errcap, "s3_endpoint URL has an empty host");
+        endpoint_free(ep);
+        return -1;
+    }
+    if (memchr(authority, '@', auth_len) != NULL) {
+        s3_set_err(err, errcap, "s3_endpoint URL must not contain userinfo");
+        endpoint_free(ep);
+        return -1;
+    }
+
+    host_start = authority;
+    host_end = auth_end;
+    if (*host_start == '[') {
+        const char *rb = memchr(host_start, ']', auth_len);
+
+        if (rb == NULL) {
+            s3_set_err(err, errcap, "malformed IPv6 s3_endpoint host");
+            endpoint_free(ep);
+            return -1;
+        }
+        host_start++;
+        host_end = rb;
+        if (rb + 1 < auth_end) {
+            if (rb[1] != ':') {
+                s3_set_err(err, errcap, "malformed s3_endpoint host/port");
+                endpoint_free(ep);
+                return -1;
+            }
+            port_start = rb + 2;
+        }
+    } else {
+        const char *colon = NULL;
+        const char *q;
+
+        for (q = authority; q < auth_end; q++) {
+            if (*q == ':') {
+                colon = q;
+            }
+        }
+        if (colon != NULL) {
+            host_end = colon;
+            port_start = colon + 1;
+        }
+    }
+    if (host_end <= host_start) {
+        s3_set_err(err, errcap, "s3_endpoint URL has an empty host");
+        endpoint_free(ep);
+        return -1;
+    }
+    ep->host = xstrndup(host_start, (size_t)(host_end - host_start));
+    if (ep->host == NULL) {
+        s3_set_err(err, errcap, "out of memory");
+        endpoint_free(ep);
+        return -1;
+    }
+    if (port_start != NULL) {
+        if (parse_port(port_start, (size_t)(auth_end - port_start),
+                       &ep->port) != 0) {
+            s3_set_err(err, errcap, "invalid port in s3_endpoint URL");
+            endpoint_free(ep);
+            return -1;
+        }
+    }
+
+    /* Base path: normalize away a trailing slash; keep a leading one. */
+    if (slash != NULL) {
+        size_t blen = strlen(slash);
+
+        while (blen > 0 && slash[blen - 1] == '/') {
+            blen--;
+        }
+        if (blen > 0) {
+            ep->base_path = xstrndup(slash, blen);
+            if (ep->base_path == NULL) {
+                s3_set_err(err, errcap, "out of memory");
+                endpoint_free(ep);
+                return -1;
+            }
+        }
+    }
+    if (ep->base_path != NULL && ep->base_path[0] != '/') {
+        s3_set_err(err, errcap, "internal: base path must start with '/'");
+        endpoint_free(ep);
+        return -1;
+    }
+    return 0;
+}
+
+static int bucket_common_ok(const char *bucket, char *err, size_t errcap)
+{
+    size_t n;
+    size_t i;
+
+    if (bucket == NULL || bucket[0] == '\0') {
+        s3_set_err(err, errcap, "bucket name is empty");
+        return -1;
+    }
+    n = strlen(bucket);
+    if (n > 255u) {
+        s3_set_err(err, errcap, "bucket name is too long");
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        unsigned char ch = (unsigned char)bucket[i];
+
+        if (ch <= 0x20 || ch == 0x7f) {
+            s3_set_err(err, errcap, "bucket name contains whitespace/control "
+                    "characters");
+            return -1;
+        }
+        if (ch == '/' || ch == '#' || ch == '?' || ch == '\\') {
+            s3_set_err(err, errcap, "bucket name contains an invalid character "
+                    "('%c')", (char)ch);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int bucket_dns_ok(const char *bucket, char *err, size_t errcap)
+{
+    size_t n = strlen(bucket);
+    size_t i;
+    int all_numeric_dots = 1;
+
+    if (bucket_common_ok(bucket, err, errcap) != 0) {
+        return -1;
+    }
+    if (n < 3u || n > 63u) {
+        s3_set_err(err, errcap, "bucket name \"%s\" cannot be used in a DNS host "
+                "(virtual-host style requires 3-63 characters); use path-style "
+                "addressing", bucket);
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        char ch = bucket[i];
+
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+              ch == '-' || ch == '.')) {
+            if (ch >= 'A' && ch <= 'Z') {
+                s3_set_err(err, errcap, "bucket name \"%s\" contains uppercase "
+                        "letters, which is invalid for virtual-host style; use "
+                        "path-style addressing", bucket);
+            } else {
+                s3_set_err(err, errcap, "bucket name \"%s\" contains a character "
+                        "that is not DNS-safe for virtual-host style; use "
+                        "path-style addressing", bucket);
+            }
+            return -1;
+        }
+        if (ch != '.' && ch != '-') {
+            all_numeric_dots = 0;
+        }
+    }
+    if (bucket[0] == '.' || bucket[0] == '-' || bucket[n - 1] == '.' ||
+        bucket[n - 1] == '-') {
+        s3_set_err(err, errcap, "bucket name \"%s\" must start and end with a "
+                "letter or digit for virtual-host style; use path-style "
+                "addressing", bucket);
+        return -1;
+    }
+    if (strstr(bucket, "..") != NULL) {
+        s3_set_err(err, errcap, "bucket name \"%s\" contains consecutive dots and "
+                "is not DNS-safe; use path-style addressing", bucket);
+        return -1;
+    }
+    if (all_numeric_dots) {
+        s3_set_err(err, errcap, "bucket name \"%s\" looks like an IP address; "
+                "use path-style addressing", bucket);
+        return -1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Client state                                                              */
+/* ------------------------------------------------------------------------- */
+
+struct s3_client {
+    char *bucket;
+    int path_style;
+    char *s3_connect_host; /* DNS name actually resolved (bucket-prefixed) */
+    char *host_header;  /* Host: value (may include :port)                */
+    int port;
+    int tls;
+    char *base_path;
+    char *region;
+    char *access_key;
+    char *secret_key;
+    char *session_token; /* NULL when not configured */
+    SSL_CTX *ssl_ctx;    /* NULL for plain HTTP */
+};
+
+static pthread_once_t sigpipe_once = PTHREAD_ONCE_INIT;
+
+static void ignore_sigpipe_once(void)
+{
+    (void)signal(SIGPIPE, SIG_IGN);
+}
+
+static SSL_CTX *make_ssl_ctx(char *err, size_t errcap)
+{
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+
+    if (ctx == NULL) {
+        s3_set_err(err, errcap, "cannot create TLS context");
+        return NULL;
+    }
+    if (SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) != 1) {
+        s3_set_err(err, errcap, "cannot require TLS 1.2");
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+        s3_set_err(err, errcap, "cannot load system CA certificates");
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
+    return ctx;
+}
+
+s3_client *s3_connect(const char *bucket, int path_style,
+                      char *err, size_t errcap)
+{
+    s3_client *c;
+    char *region = NULL;
+    char *ak = NULL;
+    char *sk = NULL;
+    char *token = NULL;
+    char *endpoint_url = NULL;
+    char *custom_env = NULL;
+    s3_endpoint ep;
+    int resolved_path_style;
+    int is_custom;
+    size_t need;
+    char *hh;
+
+    memset(&ep, 0, sizeof(ep));
+    if (err != NULL && errcap > 0) {
+        err[0] = '\0';
+    }
+    if (bucket_common_ok(bucket, err, errcap) != 0) {
+        return NULL;
+    }
+
+    region = env_dup_nonempty("AWS_REGION");
+    if (region == NULL) {
+        region = env_dup_nonempty("AWS_DEFAULT_REGION");
+    }
+    if (region == NULL) {
+        s3_set_err(err, errcap, "AWS_REGION (or AWS_DEFAULT_REGION) is not set");
+        goto fail;
+    }
+    ak = env_dup_nonempty("AWS_ACCESS_KEY_ID");
+    if (ak == NULL) {
+        s3_set_err(err, errcap, "AWS_ACCESS_KEY_ID is not set");
+        goto fail;
+    }
+    sk = env_dup_nonempty("AWS_SECRET_ACCESS_KEY");
+    if (sk == NULL) {
+        s3_set_err(err, errcap, "AWS_SECRET_ACCESS_KEY is not set");
+        goto fail;
+    }
+    token = env_dup_nonempty("AWS_SESSION_TOKEN");
+
+    custom_env = env_dup_nonempty("AWS_ENDPOINT_URL_S3");
+    if (custom_env == NULL) {
+        custom_env = env_dup_nonempty("AWS_ENDPOINT_URL");
+    }
+    is_custom = (custom_env != NULL);
+    if (custom_env != NULL) {
+        endpoint_url = xstrdup(custom_env);
+    } else {
+        need = strlen(region) + 64u;
+        endpoint_url = (char *)malloc(need);
+        if (endpoint_url != NULL) {
+            (void)snprintf(endpoint_url, need, "https://s3.%s.amazonaws.com",
+                           region);
+        }
+    }
+    if (endpoint_url == NULL) {
+        s3_set_err(err, errcap, "out of memory");
+        goto fail;
+    }
+    if (parse_endpoint(endpoint_url, &ep, err, errcap) != 0) {
+        goto fail;
+    }
+
+    if (path_style < 0) {
+        resolved_path_style = is_custom ? 1 : 0;
+    } else {
+        resolved_path_style = path_style ? 1 : 0;
+    }
+    if (!resolved_path_style && bucket_dns_ok(bucket, err, errcap) != 0) {
+        goto fail;
+    }
+
+    c = (s3_client *)calloc(1u, sizeof(*c));
+    if (c == NULL) {
+        s3_set_err(err, errcap, "out of memory");
+        goto fail;
+    }
+    c->port = ep.port;
+    c->tls = (strcmp(ep.scheme, "https") == 0);
+    c->path_style = resolved_path_style;
+
+    if (!c->path_style) {
+        need = strlen(bucket) + 1u + strlen(ep.host) + 1u;
+        c->s3_connect_host = (char *)malloc(need);
+        if (c->s3_connect_host != NULL) {
+            (void)snprintf(c->s3_connect_host, need, "%s.%s", bucket, ep.host);
+        }
+    } else {
+        c->s3_connect_host = xstrdup(ep.host);
+    }
+    if (c->s3_connect_host == NULL) {
+        s3_set_err(err, errcap, "out of memory");
+        free(c);
+        goto fail;
+    }
+
+    need = strlen(c->s3_connect_host) + 16u;
+    hh = (char *)malloc(need);
+    if (hh == NULL) {
+        s3_set_err(err, errcap, "out of memory");
+        free(c->s3_connect_host);
+        free(c);
+        goto fail;
+    }
+    if (c->port == (c->tls ? 443 : 80)) {
+        (void)snprintf(hh, need, "%s", c->s3_connect_host);
+    } else {
+        (void)snprintf(hh, need, "%s:%d", c->s3_connect_host, c->port);
+    }
+    c->host_header = hh;
+
+    c->bucket = xstrdup(bucket);
+    c->region = region;
+    c->access_key = ak;
+    c->secret_key = sk;
+    c->session_token = token;
+    c->base_path = ep.base_path ? xstrdup(ep.base_path) : xstrdup("");
+    region = NULL;
+    ak = NULL;
+    sk = NULL;
+    token = NULL;
+    ep.base_path = NULL;
+
+    if (c->bucket == NULL || c->base_path == NULL) {
+        s3_set_err(err, errcap, "out of memory");
+        s3_close(c);
+        goto fail;
+    }
+    if (c->tls) {
+        c->ssl_ctx = make_ssl_ctx(err, errcap);
+        if (c->ssl_ctx == NULL) {
+            s3_close(c);
+            goto fail;
+        }
+    }
+    (void)pthread_once(&sigpipe_once, ignore_sigpipe_once);
+
+    free(region);
+    free(ak);
+    free(sk);
+    free(token);
+    free(custom_env);
+    free(endpoint_url);
+    endpoint_free(&ep);
+    return c;
+
+fail:
+    free(region);
+    free(ak);
+    free(sk);
+    free(token);
+    free(custom_env);
+    free(endpoint_url);
+    endpoint_free(&ep);
+    return NULL;
+}
+
+void s3_close(s3_client *c)
+{
+    if (c == NULL) {
+        return;
+    }
+    if (c->ssl_ctx != NULL) {
+        SSL_CTX_free(c->ssl_ctx);
+    }
+    free(c->bucket);
+    free(c->s3_connect_host);
+    free(c->host_header);
+    free(c->base_path);
+    if (c->region != NULL) {
+        memset(c->region, 0, strlen(c->region));
+    }
+    free(c->region);
+    if (c->access_key != NULL) {
+        memset(c->access_key, 0, strlen(c->access_key));
+    }
+    free(c->access_key);
+    if (c->secret_key != NULL) {
+        memset(c->secret_key, 0, strlen(c->secret_key));
+    }
+    free(c->secret_key);
+    if (c->session_token != NULL) {
+        memset(c->session_token, 0, strlen(c->session_token));
+    }
+    free(c->session_token);
+    memset(c, 0, sizeof(*c));
+    free(c);
+}
+
+/* ------------------------------------------------------------------------- */
+/* TCP / TLS transport                                                       */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    int fd;
+    SSL *ssl;
+    int tls;
+} s3_conn;
+
+static int set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+
+    if (flags < 0) {
+        return -1;
+    }
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int set_blocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+
+    if (flags < 0) {
+        return -1;
+    }
+    return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+static void set_io_timeouts(int fd)
+{
+    struct timeval tv;
+
+    tv.tv_sec = S3_IO_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static int s3_connect_tcp(const char *host, int port, char *err, size_t errcap)
+{
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    struct addrinfo *ai;
+    char portstr[16];
+    int rc;
+    int fd = -1;
+    int last_errno = 0;
+
+    (void)snprintf(portstr, sizeof(portstr), "%d", port);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    rc = getaddrinfo(host, portstr, &hints, &res);
+    if (rc != 0) {
+        s3_set_err(err, errcap, "DNS lookup failed for \"%s\": %s", host,
+                gai_strerror(rc));
+        return -1;
+    }
+    for (ai = res; ai != NULL; ai = ai->ai_next) {
+        struct pollfd pfd;
+        int soerr = 0;
+        socklen_t slen = sizeof(soerr);
+        int cr;
+
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            last_errno = errno;
+            continue;
+        }
+        (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+        if (set_nonblocking(fd) != 0) {
+            last_errno = errno;
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        cr = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (cr != 0 && errno != EINPROGRESS) {
+            last_errno = errno;
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        if (cr != 0) {
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            cr = poll(&pfd, 1, S3_CONNECT_TIMEOUT_MS);
+            if (cr <= 0) {
+                last_errno = (cr == 0) ? ETIMEDOUT : errno;
+                close(fd);
+                fd = -1;
+                continue;
+            }
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) != 0 ||
+                soerr != 0) {
+                last_errno = (soerr != 0) ? soerr : errno;
+                close(fd);
+                fd = -1;
+                continue;
+            }
+        }
+        if (set_blocking(fd) != 0) {
+            last_errno = errno;
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        set_io_timeouts(fd);
+        break;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) {
+        s3_set_err(err, errcap, "cannot connect to %s:%d: %s", host, port,
+                strerror(last_errno ? last_errno : ECONNREFUSED));
+        return -1;
+    }
+    return fd;
+}
+
+static int is_ip_literal(const char *host)
+{
+    struct in_addr a4;
+    struct in6_addr a6;
+
+    return inet_pton(AF_INET, host, &a4) == 1 ||
+           inet_pton(AF_INET6, host, &a6) == 1;
+}
+
+static void s3_conn_close(s3_conn *cn)
+{
+    if (cn->ssl != NULL) {
+        (void)SSL_shutdown(cn->ssl);
+        SSL_free(cn->ssl);
+        cn->ssl = NULL;
+    }
+    if (cn->fd >= 0) {
+        close(cn->fd);
+        cn->fd = -1;
+    }
+}
+
+static int s3_conn_open(s3_client *c, s3_conn *cn, char *err, size_t errcap)
+{
+    int fd;
+    SSL *ssl;
+
+    memset(cn, 0, sizeof(*cn));
+    cn->fd = -1;
+    cn->tls = c->tls;
+    fd = s3_connect_tcp(c->s3_connect_host, c->port, err, errcap);
+    if (fd < 0) {
+        return -1;
+    }
+    cn->fd = fd;
+    if (!c->tls) {
+        return 0;
+    }
+    ssl = SSL_new(c->ssl_ctx);
+    if (ssl == NULL) {
+        s3_set_err(err, errcap, "SSL_new failed");
+        s3_conn_close(cn);
+        return -1;
+    }
+    cn->ssl = ssl;
+    if (SSL_set_fd(ssl, fd) != 1) {
+        s3_set_err(err, errcap, "SSL_set_fd failed");
+        s3_conn_close(cn);
+        return -1;
+    }
+    if (!is_ip_literal(c->s3_connect_host)) {
+        if (SSL_set_tlsext_host_name(ssl, c->s3_connect_host) != 1) {
+            s3_set_err(err, errcap, "cannot set TLS SNI host");
+            s3_conn_close(cn);
+            return -1;
+        }
+    }
+    {
+        X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
+
+        X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        if (is_ip_literal(c->s3_connect_host)) {
+            if (X509_VERIFY_PARAM_set1_ip_asc(param, c->s3_connect_host) != 1) {
+                s3_set_err(err, errcap, "cannot set TLS IP verification");
+                s3_conn_close(cn);
+                return -1;
+            }
+        } else if (X509_VERIFY_PARAM_set1_host(param, c->s3_connect_host, 0) != 1) {
+            s3_set_err(err, errcap, "cannot set TLS hostname verification");
+            s3_conn_close(cn);
+            return -1;
+        }
+    }
+    ERR_clear_error();
+    if (SSL_connect(ssl) != 1) {
+        unsigned long e = ERR_get_error();
+        char ebuf[256];
+
+        if (e != 0) {
+            ERR_error_string_n(e, ebuf, sizeof(ebuf));
+            s3_set_err(err, errcap, "TLS handshake failed: %s", ebuf);
+        } else {
+            long vr = SSL_get_verify_result(ssl);
+
+            if (vr != X509_V_OK) {
+                s3_set_err(err, errcap, "TLS certificate verification failed: %s",
+                        X509_verify_cert_error_string(vr));
+            } else {
+                s3_set_err(err, errcap, "TLS handshake failed");
+            }
+        }
+        s3_conn_close(cn);
+        return -1;
+    }
+    return 0;
+}
+
+static int s3_conn_write_all(s3_conn *cn, const void *buf, size_t len)
+{
+    const unsigned char *p = (const unsigned char *)buf;
+
+    while (len > 0) {
+        size_t chunk = (len > (1024u * 1024u)) ? (1024u * 1024u) : len;
+        int n;
+
+        if (cn->tls) {
+            n = SSL_write(cn->ssl, p, (int)chunk);
+            if (n <= 0) {
+                return -1;
+            }
+        } else {
+            ssize_t r = send(cn->fd, p, chunk, MSG_NOSIGNAL);
+
+            if (r < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -1;
+            }
+            n = (int)r;
+        }
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static ssize_t s3_conn_read(s3_conn *cn, void *buf, size_t cap)
+{
+    for (;;) {
+        if (cn->tls) {
+            int n = SSL_read(cn->ssl, buf, (int)cap);
+            int e;
+
+            if (n > 0) {
+                return n;
+            }
+            e = SSL_get_error(cn->ssl, n);
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+                continue;
+            }
+            if (e == SSL_ERROR_ZERO_RETURN) {
+                return 0;
+            }
+            return -1;
+        } else {
+            ssize_t r = recv(cn->fd, buf, cap, 0);
+
+            if (r >= 0) {
+                return r;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Response stream + HTTP exchange                                           */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    s3_conn *cn;
+    unsigned char *buf;
+    size_t len;
+    size_t cap;
+    size_t pos;
+    int eof;
+} s3_rstream;
+
+static void rs_init(s3_rstream *rs, s3_conn *cn)
+{
+    rs->cn = cn;
+    rs->buf = NULL;
+    rs->len = 0;
+    rs->cap = 0;
+    rs->pos = 0;
+    rs->eof = 0;
+}
+
+static void rs_free(s3_rstream *rs)
+{
+    free(rs->buf);
+    rs->buf = NULL;
+    rs->len = 0;
+    rs->cap = 0;
+    rs->pos = 0;
+}
+
+static int rs_fill(s3_rstream *rs)
+{
+    size_t avail = rs->len - rs->pos;
+    ssize_t n;
+
+    if (rs->eof) {
+        return 0;
+    }
+    if (rs->pos > 0 && (rs->pos > rs->cap / 2u || rs->len == rs->cap)) {
+        if (avail > 0) {
+            memmove(rs->buf, rs->buf + rs->pos, avail);
+        }
+        rs->len = avail;
+        rs->pos = 0;
+    }
+    if (rs->len + S3_READ_CHUNK > rs->cap) {
+        size_t ncap = rs->cap ? rs->cap * 2u : (S3_READ_CHUNK * 2u);
+        unsigned char *nb;
+
+        while (ncap < rs->len + S3_READ_CHUNK) {
+            ncap *= 2u;
+        }
+        if (ncap > S3_STREAM_CAP) {
+            ncap = S3_STREAM_CAP;
+        }
+        if (ncap <= rs->len) {
+            return -1;
+        }
+        nb = (unsigned char *)realloc(rs->buf, ncap);
+        if (nb == NULL) {
+            return -1;
+        }
+        rs->buf = nb;
+        rs->cap = ncap;
+    }
+    n = s3_conn_read(rs->cn, rs->buf + rs->len, rs->cap - rs->len);
+    if (n < 0) {
+        return -1;
+    }
+    if (n == 0) {
+        rs->eof = 1;
+        return 0;
+    }
+    rs->len += (size_t)n;
+    return 1;
+}
+
+static int rs_ensure(s3_rstream *rs, size_t need)
+{
+    while (rs->len - rs->pos < need) {
+        int r = rs_fill(rs);
+
+        if (r <= 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Find needle in [from, len); returns index or (size_t)-1. */
+static size_t find_bytes(const unsigned char *hay, size_t haylen,
+                         const char *needle, size_t nlen)
+{
+    size_t i;
+
+    if (nlen == 0 || haylen < nlen) {
+        return (size_t)-1;
+    }
+    for (i = 0; i + nlen <= haylen; i++) {
+        if (memcmp(hay + i, needle, nlen) == 0) {
+            return i;
+        }
+    }
+    return (size_t)-1;
+}
+
+static char *header_value_dup(const unsigned char *block, size_t blocklen,
+                              const char *name)
+{
+    size_t pos = 0;
+    size_t namelen = strlen(name);
+
+    while (pos < blocklen) {
+        size_t eol = pos;
+        size_t colon;
+        size_t vstart;
+        size_t vend;
+
+        while (eol < blocklen && block[eol] != '\r') {
+            eol++;
+        }
+        if (eol == pos) {
+            break;
+        }
+        colon = pos;
+        while (colon < eol && block[colon] != ':') {
+            colon++;
+        }
+        if (colon < eol &&
+            (colon - pos) == namelen &&
+            ci_equal_n((const char *)block + pos, name, namelen)) {
+            vstart = colon + 1u;
+            while (vstart < eol &&
+                   (block[vstart] == ' ' || block[vstart] == '\t')) {
+                vstart++;
+            }
+            vend = eol;
+            while (vend > vstart &&
+                   (block[vend - 1] == ' ' || block[vend - 1] == '\t')) {
+                vend--;
+            }
+            return xstrndup((const char *)block + vstart, vend - vstart);
+        }
+        pos = (eol + 2u <= blocklen) ? eol + 2u : blocklen;
+    }
+    return NULL;
+}
+
+static int header_contains_token(const unsigned char *block, size_t blocklen,
+                                 const char *name, const char *token)
+{
+    char *v = header_value_dup(block, blocklen, name);
+    int found = 0;
+
+    if (v != NULL) {
+        const char *p = v;
+        size_t tlen = strlen(token);
+
+        while (*p != '\0') {
+            const char *st = p;
+            size_t n;
+
+            while (*p != '\0' && *p != ',' && *p != ' ' && *p != '\t') {
+                p++;
+            }
+            n = (size_t)(p - st);
+            if (n == tlen && ci_equal_n(st, token, n)) {
+                found = 1;
+                break;
+            }
+            if (*p != '\0') {
+                p++;
+            }
+        }
+        free(v);
+    }
+    return found;
+}
+
+static int parse_status_line(const unsigned char *buf, size_t len, int *status)
+{
+    size_t i = 0;
+
+    if (len < 12u) {
+        return -1;
+    }
+    if (memcmp(buf, "HTTP/1.", 7u) != 0) {
+        return -1;
+    }
+    while (i < len && buf[i] != ' ') {
+        i++;
+    }
+    if (i + 3u >= len) {
+        return -1;
+    }
+    i++;
+    if (buf[i] < '0' || buf[i] > '9' || buf[i + 1] < '0' || buf[i + 1] > '9' ||
+        buf[i + 2] < '0' || buf[i + 2] > '9') {
+        return -1;
+    }
+    *status = (buf[i] - '0') * 100 + (buf[i + 1] - '0') * 10 +
+              (buf[i + 2] - '0');
+    if (*status < 100 || *status > 599) {
+        return -1;
+    }
+    return 0;
+}
+
+typedef struct {
+    int status;
+    unsigned char *body;
+    size_t body_len;
+    long long expiry_ms;
+    int has_expiry;
+} s3_http_response;
+
+static void http_response_free(s3_http_response *r)
+{
+    free(r->body);
+    r->body = NULL;
+    r->body_len = 0;
+}
+
+static int parse_content_length(const char *v, long long *out)
+{
+    char *end = NULL;
+    long long n;
+
+    if (v == NULL || v[0] == '\0') {
+        return -1;
+    }
+    errno = 0;
+    n = strtoll(v, &end, 10);
+    if (errno != 0 || end == v || *end != '\0' || n < 0) {
+        return -1;
+    }
+    *out = n;
+    return 0;
+}
+
+static int s3_read_chunked_body(s3_rstream *rs, unsigned char **out,
+                             size_t *outlen, char *err, size_t errcap)
+{
+    s3_sbuf body;
+
+    sb_init(&body);
+    for (;;) {
+        size_t line_end = (size_t)-1;
+        size_t size = 0;
+        size_t i;
+        int digits = 0;
+
+        /* Read the chunk-size line. */
+        for (;;) {
+            size_t start = rs->pos;
+
+            while (start < rs->len) {
+                size_t idx = find_bytes(rs->buf + start, rs->len - start,
+                                        "\r\n", 2u);
+
+                if (idx != (size_t)-1) {
+                    line_end = start + idx;
+                    break;
+                }
+                break; /* need more data */
+            }
+            if (line_end != (size_t)-1) {
+                break;
+            }
+            if (rs->len - rs->pos > 1024u) {
+                s3_set_err(err, errcap, "chunked response: chunk header too long");
+                sb_free(&body);
+                return -1;
+            }
+            if (rs_fill(rs) <= 0) {
+                s3_set_err(err, errcap, "chunked response: truncated chunk header");
+                sb_free(&body);
+                return -1;
+            }
+        }
+        i = rs->pos;
+        while (i < line_end) {
+            int hd;
+            char ch = (char)rs->buf[i];
+
+            if (ch == ';' || ch == ' ' || ch == '\t') {
+                break;
+            }
+            hd = hex_digit((unsigned char)ch);
+            if (hd < 0) {
+                s3_set_err(err, errcap, "chunked response: invalid chunk size");
+                sb_free(&body);
+                return -1;
+            }
+            if (size > (SIZE_MAX - (size_t)hd) / 16u) {
+                s3_set_err(err, errcap, "chunked response: chunk size overflow");
+                sb_free(&body);
+                return -1;
+            }
+            size = size * 16u + (size_t)hd;
+            digits++;
+            i++;
+        }
+        if (digits == 0) {
+            s3_set_err(err, errcap, "chunked response: missing chunk size");
+            sb_free(&body);
+            return -1;
+        }
+        rs->pos = line_end + 2u;
+        if (size == 0) {
+            /* Consume optional trailers up to the terminating empty line. */
+            for (;;) {
+                size_t idx;
+                size_t tstart = rs->pos;
+
+                while (tstart < rs->len) {
+                    idx = find_bytes(rs->buf + tstart, rs->len - tstart,
+                                     "\r\n", 2u);
+                    if (idx == (size_t)-1) {
+                        break;
+                    }
+                    if (idx == 0) {
+                        rs->pos = tstart + 2u;
+                        goto chunk_done;
+                    }
+                    tstart += idx + 2u;
+                }
+                if (rs->len - rs->pos > 4096u) {
+                    s3_set_err(err, errcap, "chunked response: trailers too long");
+                    sb_free(&body);
+                    return -1;
+                }
+                if (rs_fill(rs) <= 0) {
+                    s3_set_err(err, errcap, "chunked response: truncated trailers");
+                    sb_free(&body);
+                    return -1;
+                }
+            }
+        } else {
+            if (size > S3_MAX_BODY_BYTES - body.len) {
+                s3_set_err(err, errcap, "chunked response body exceeds %u bytes",
+                        (unsigned)S3_MAX_BODY_BYTES);
+                sb_free(&body);
+                return -1;
+            }
+            if (rs_ensure(rs, size + 2u) != 0) {
+                s3_set_err(err, errcap, "chunked response: truncated chunk data");
+                sb_free(&body);
+                return -1;
+            }
+            if (rs->buf[rs->pos + size] != '\r' ||
+                rs->buf[rs->pos + size + 1u] != '\n') {
+                s3_set_err(err, errcap, "chunked response: missing chunk CRLF");
+                sb_free(&body);
+                return -1;
+            }
+            if (sb_append(&body, rs->buf + rs->pos, size) != 0) {
+                s3_set_err(err, errcap, "out of memory");
+                sb_free(&body);
+                return -1;
+            }
+            rs->pos += size + 2u;
+        }
+    }
+chunk_done:
+    *out = (unsigned char *)body.p;
+    *outlen = body.len;
+    if (*out == NULL) {
+        *out = (unsigned char *)malloc(1u);
+        if (*out == NULL) {
+            s3_set_err(err, errcap, "out of memory");
+            return -1;
+        }
+        *outlen = 0;
+    }
+    return 0;
+}
+
+/*
+ * Returns 0 on success, 1 on a retryable transport error, -1 on a
+ * non-retryable/protocol error.
+ */
+static int http_exchange(s3_client *c, const char *method, const char *path,
+                         const char *const *hdr_lines, size_t nhdrs,
+                         const char *authorization,
+                         const unsigned char *body, size_t bodylen,
+                         s3_http_response *resp, char *err, size_t errcap)
+{
+    s3_conn cn;
+    s3_rstream rs;
+    s3_sbuf req;
+    size_t i;
+    size_t hdr_end = (size_t)-1;
+    size_t blocklen;
+    int chunked = 0;
+    long long content_length = 0;
+    int has_cl = 0;
+    int rc = 1;
+
+    memset(resp, 0, sizeof(*resp));
+    sb_init(&req);
+    memset(&cn, 0, sizeof(cn));
+    cn.fd = -1;
+
+    if (s3_conn_open(c, &cn, err, errcap) != 0) {
+        return 1;
+    }
+    rs_init(&rs, &cn);
+    if (sb_printf(&req, "%s %s HTTP/1.1\r\n", method, path) != 0) {
+        s3_set_err(err, errcap, "out of memory");
+        rc = -1;
+        goto out;
+    }
+    for (i = 0; i < nhdrs; i++) {
+        if (sb_puts(&req, hdr_lines[i]) != 0 || sb_puts(&req, "\r\n") != 0) {
+            s3_set_err(err, errcap, "out of memory");
+            rc = -1;
+            goto out;
+        }
+    }
+    if (sb_puts(&req, "Authorization: ") != 0 ||
+        sb_puts(&req, authorization) != 0 ||
+        sb_puts(&req, "\r\n") != 0) {
+        s3_set_err(err, errcap, "out of memory");
+        rc = -1;
+        goto out;
+    }
+    if ((body != NULL || strcmp(method, "PUT") == 0)) {
+        if (sb_printf(&req, "Content-Length: %zu\r\n", bodylen) != 0) {
+            s3_set_err(err, errcap, "out of memory");
+            rc = -1;
+            goto out;
+        }
+    }
+    if (sb_puts(&req, "Connection: close\r\n\r\n") != 0) {
+        s3_set_err(err, errcap, "out of memory");
+        rc = -1;
+        goto out;
+    }
+    if (bodylen > 0) {
+        if (sb_reserve(&req, bodylen) != 0) {
+            s3_set_err(err, errcap, "out of memory");
+            rc = -1;
+            goto out;
+        }
+        memcpy(req.p + req.len, body, bodylen);
+        req.len += bodylen;
+        req.p[req.len] = '\0';
+    }
+    if (s3_conn_write_all(&cn, req.p, req.len) != 0) {
+        s3_set_err(err, errcap, "network error: failed to send request");
+        rc = 1;
+        goto out;
+    }
+
+    /* Read the response header block. */
+    for (;;) {
+        size_t avail = rs.len - rs.pos;
+        size_t idx = find_bytes(rs.buf + rs.pos, avail, "\r\n\r\n", 4u);
+
+        if (idx != (size_t)-1) {
+            hdr_end = rs.pos + idx;
+            break;
+        }
+        if (avail > S3_MAX_HEADER_BYTES) {
+            s3_set_err(err, errcap, "response header block exceeds %u bytes",
+                    (unsigned)S3_MAX_HEADER_BYTES);
+            rc = -1;
+            goto out;
+        }
+        {
+            int f = rs_fill(&rs);
+
+            if (f < 0) {
+                s3_set_err(err, errcap, "network error: failed to read response");
+                rc = 1;
+                goto out;
+            }
+            if (f == 0) {
+                s3_set_err(err, errcap, "network error: connection closed before "
+                        "response headers");
+                rc = 1;
+                goto out;
+            }
+        }
+    }
+    blocklen = hdr_end - rs.pos;
+    if (blocklen > S3_MAX_HEADER_BYTES) {
+        s3_set_err(err, errcap, "response header block exceeds %u bytes",
+                (unsigned)S3_MAX_HEADER_BYTES);
+        rc = -1;
+        goto out;
+    }
+    if (parse_status_line(rs.buf + rs.pos, blocklen, &resp->status) != 0) {
+        s3_set_err(err, errcap, "malformed HTTP status line");
+        rc = -1;
+        goto out;
+    }
+
+    chunked = header_contains_token(rs.buf + rs.pos, blocklen,
+                                    "transfer-encoding", "chunked");
+    {
+        char *cl = header_value_dup(rs.buf + rs.pos, blocklen,
+                                    "content-length");
+
+        if (cl != NULL) {
+            has_cl = 1;
+            if (parse_content_length(cl, &content_length) != 0) {
+                free(cl);
+                s3_set_err(err, errcap, "invalid Content-Length in response");
+                rc = -1;
+                goto out;
+            }
+            free(cl);
+        }
+    }
+    {
+        char *ex = header_value_dup(rs.buf + rs.pos, blocklen,
+                                    S3_META_EXPIRY);
+
+        if (ex != NULL) {
+            char *end = NULL;
+            long long v;
+
+            errno = 0;
+            v = strtoll(ex, &end, 10);
+            if (errno == 0 && end != ex && *end == '\0' && v > 0) {
+                resp->expiry_ms = v;
+                resp->has_expiry = 1;
+            }
+            free(ex);
+        }
+    }
+    rs.pos = hdr_end + 4u;
+
+    if (resp->status == 204 || resp->status == 304 ||
+        strcmp(method, "HEAD") == 0) {
+        rc = 0;
+        goto out;
+    }
+    if (chunked) {
+        if (s3_read_chunked_body(&rs, &resp->body, &resp->body_len,
+                              err, errcap) != 0) {
+            rc = -1;
+            goto out;
+        }
+        rc = 0;
+        goto out;
+    }
+    if (has_cl) {
+        if ((unsigned long long)content_length > S3_MAX_BODY_BYTES) {
+            s3_set_err(err, errcap, "response body exceeds %u bytes",
+                    (unsigned)S3_MAX_BODY_BYTES);
+            rc = -1;
+            goto out;
+        }
+        if (rs_ensure(&rs, (size_t)content_length) != 0) {
+            s3_set_err(err, errcap, "network error: truncated response body");
+            rc = 1;
+            goto out;
+        }
+        resp->body = (unsigned char *)malloc((size_t)content_length + 1u);
+        if (resp->body == NULL) {
+            s3_set_err(err, errcap, "out of memory");
+            rc = -1;
+            goto out;
+        }
+        if (content_length > 0) {
+            memcpy(resp->body, rs.buf + rs.pos, (size_t)content_length);
+        }
+        resp->body[content_length] = '\0';
+        resp->body_len = (size_t)content_length;
+        rs.pos += (size_t)content_length;
+        rc = 0;
+        goto out;
+    }
+
+    /* No framing headers: read until EOF (Connection: close). */
+    {
+        s3_sbuf acc;
+
+        sb_init(&acc);
+        for (;;) {
+            size_t avail = rs.len - rs.pos;
+            int f;
+
+            if (avail > 0) {
+                if (acc.len + avail > S3_MAX_BODY_BYTES) {
+                    s3_set_err(err, errcap, "response body exceeds %u bytes",
+                            (unsigned)S3_MAX_BODY_BYTES);
+                    sb_free(&acc);
+                    rc = -1;
+                    goto out;
+                }
+                if (sb_append(&acc, rs.buf + rs.pos, avail) != 0) {
+                    s3_set_err(err, errcap, "out of memory");
+                    sb_free(&acc);
+                    rc = -1;
+                    goto out;
+                }
+                rs.pos = rs.len;
+            }
+            f = rs_fill(&rs);
+            if (f < 0) {
+                s3_set_err(err, errcap, "network error: failed to read body");
+                sb_free(&acc);
+                rc = 1;
+                goto out;
+            }
+            if (f == 0) {
+                break;
+            }
+        }
+        resp->body = (unsigned char *)acc.p;
+        resp->body_len = acc.len;
+        if (resp->body == NULL) {
+            resp->body = (unsigned char *)malloc(1u);
+            if (resp->body == NULL) {
+                s3_set_err(err, errcap, "out of memory");
+                rc = -1;
+                goto out;
+            }
+        }
+        rc = 0;
+    }
+
+out:
+    sb_free(&req);
+    rs_free(&rs);
+    s3_conn_close(&cn);
+    return rc;
+}
+
+/* ------------------------------------------------------------------------- */
+/* S3 XML error parsing                                                      */
+/* ------------------------------------------------------------------------- */
+
+static char *xml_extract(const unsigned char *body, size_t len,
+                         const char *tag)
+{
+    char open[64];
+    char close[64];
+    const char *p;
+    size_t openlen;
+    size_t closelen;
+    size_t start;
+    size_t end;
+
+    (void)snprintf(open, sizeof(open), "<%s>", tag);
+    (void)snprintf(close, sizeof(close), "</%s>", tag);
+    openlen = strlen(open);
+    closelen = strlen(close);
+    if (len < openlen + closelen) {
+        return NULL;
+    }
+    p = (const char *)body;
+    {
+        size_t i;
+        size_t idx = (size_t)-1;
+
+        for (i = 0; i + openlen <= len; i++) {
+            if (memcmp(p + i, open, openlen) == 0) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx == (size_t)-1) {
+            return NULL;
+        }
+        start = idx + openlen;
+    }
+    {
+        size_t i = start;
+        size_t idx = (size_t)-1;
+
+        for (; i + closelen <= len; i++) {
+            if (memcmp(p + i, close, closelen) == 0) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx == (size_t)-1) {
+            return NULL;
+        }
+        end = idx;
+    }
+    while (start < end && (p[start] == ' ' || p[start] == '\t' ||
+                           p[start] == '\r' || p[start] == '\n')) {
+        start++;
+    }
+    while (end > start && (p[end - 1] == ' ' || p[end - 1] == '\t' ||
+                           p[end - 1] == '\r' || p[end - 1] == '\n')) {
+        end--;
+    }
+    return xstrndup(p + start, end - start);
+}
+
+static void xml_unescape_inplace(char *s)
+{
+    char *src = s;
+    char *dst = s;
+
+    while (*src != '\0') {
+        if (*src == '&') {
+            if (strncmp(src, "&amp;", 5u) == 0) {
+                *dst++ = '&';
+                src += 5;
+                continue;
+            }
+            if (strncmp(src, "&lt;", 4u) == 0) {
+                *dst++ = '<';
+                src += 4;
+                continue;
+            }
+            if (strncmp(src, "&gt;", 4u) == 0) {
+                *dst++ = '>';
+                src += 4;
+                continue;
+            }
+            if (strncmp(src, "&quot;", 6u) == 0) {
+                *dst++ = '"';
+                src += 6;
+                continue;
+            }
+            if (strncmp(src, "&apos;", 6u) == 0) {
+                *dst++ = '\'';
+                src += 6;
+                continue;
+            }
+        }
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+}
+
+static void set_s3_error(s3_http_response *r, char *err, size_t errcap)
+{
+    char *code = xml_extract(r->body, r->body_len, "Code");
+    char *msg = xml_extract(r->body, r->body_len, "Message");
+
+    if (code != NULL) {
+        xml_unescape_inplace(code);
+    }
+    if (msg != NULL) {
+        xml_unescape_inplace(msg);
+    }
+    if (code != NULL && msg != NULL && msg[0] != '\0') {
+        s3_set_err(err, errcap, "S3 HTTP %d %s: %s", r->status, code, msg);
+    } else if (code != NULL) {
+        s3_set_err(err, errcap, "S3 HTTP %d %s", r->status, code);
+    } else {
+        s3_set_err(err, errcap, "S3 HTTP %d", r->status);
+    }
+    free(code);
+    free(msg);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Time + request construction                                               */
+/* ------------------------------------------------------------------------- */
+
+static long long s3_now_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        return 0;
+    }
+    return (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000L);
+}
+
+static void s3_amzdate_now(char out[17])
+{
+    time_t t = time(NULL);
+    struct tm tmv;
+
+    if (t == (time_t)-1 || gmtime_r(&t, &tmv) == NULL) {
+        (void)snprintf(out, 17u, "19700101T000000Z");
+        return;
+    }
+    (void)strftime(out, 17u, "%Y%m%dT%H%M%SZ", &tmv);
+}
+
+static int build_object_path(const s3_client *c, const char *key, s3_sbuf *out)
+{
+    if (c->base_path[0] != '\0') {
+        if (sb_puts(out, c->base_path) != 0) {
+            return -1;
+        }
+    }
+    if (sb_putc(out, '/') != 0) {
+        return -1;
+    }
+    if (c->path_style) {
+        if (pct_encode((const unsigned char *)c->bucket,
+                       strlen(c->bucket), 0, out) != 0) {
+            return -1;
+        }
+        if (sb_putc(out, '/') != 0) {
+            return -1;
+        }
+    }
+    if (pct_encode((const unsigned char *)key, strlen(key), 1, out) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Perform one signed S3 request. Retries exactly once on transport errors
+ * (never on a received 4xx/5xx reply).
+ */
+static int s3_request(s3_client *c, const char *method, const char *key,
+                      const unsigned char *body, size_t bodylen,
+                      long long expiry_ms, s3_http_response *resp,
+                      char *err, size_t errcap)
+{
+    s3_sbuf path, authz;
+    char payload[65];
+    char amzdate[17];
+    char host_line[1200];
+    char hash_line[96];
+    char date_line[64];
+    char meta_line[96];
+    char token_line[8192];
+    const char *hdr_lines[5];
+    size_t nhdrs = 0;
+    int attempt;
+    int rc = -1;
+
+    sb_init(&path);
+    sb_init(&authz);
+    memset(resp, 0, sizeof(*resp));
+
+    if (build_object_path(c, key, &path) != 0) {
+        s3_set_err(err, errcap, "out of memory");
+        goto out;
+    }
+    if (s3_sha256_hex(body != NULL ? body : (const unsigned char *)"",
+                   bodylen, payload) != 0) {
+        s3_set_err(err, errcap, "SHA-256 failed");
+        goto out;
+    }
+    s3_amzdate_now(amzdate);
+
+    if (snprintf(host_line, sizeof(host_line), "Host: %s",
+                 c->host_header) >= (int)sizeof(host_line)) {
+        s3_set_err(err, errcap, "Host header too long");
+        goto out;
+    }
+    if (snprintf(hash_line, sizeof(hash_line),
+                 "x-amz-content-sha256: %s", payload) >=
+        (int)sizeof(hash_line)) {
+        s3_set_err(err, errcap, "internal: hash header too long");
+        goto out;
+    }
+    if (snprintf(date_line, sizeof(date_line), "x-amz-date: %s",
+                 amzdate) >= (int)sizeof(date_line)) {
+        s3_set_err(err, errcap, "internal: date header too long");
+        goto out;
+    }
+    hdr_lines[nhdrs++] = host_line;
+    hdr_lines[nhdrs++] = hash_line;
+    hdr_lines[nhdrs++] = date_line;
+    if (expiry_ms > 0) {
+        if (snprintf(meta_line, sizeof(meta_line), "%s: %lld",
+                     S3_META_EXPIRY, expiry_ms) >=
+            (int)sizeof(meta_line)) {
+            s3_set_err(err, errcap, "internal: metadata header too long");
+            goto out;
+        }
+        hdr_lines[nhdrs++] = meta_line;
+    }
+    if (c->session_token != NULL) {
+        if (snprintf(token_line, sizeof(token_line),
+                     "x-amz-security-token: %s", c->session_token) >=
+            (int)sizeof(token_line)) {
+            s3_set_err(err, errcap, "AWS_SESSION_TOKEN is too long");
+            goto out;
+        }
+        hdr_lines[nhdrs++] = token_line;
+    }
+
+    if (sigv4_sign(method, path.p, "",
+                   hdr_lines, nhdrs, payload,
+                   c->access_key, c->secret_key, c->region, "s3", amzdate,
+                   &authz, NULL, NULL, NULL, err, errcap) != 0) {
+        goto out;
+    }
+
+    for (attempt = 0; attempt < 2; attempt++) {
+        int hr = http_exchange(c, method, path.p, hdr_lines, nhdrs, authz.p,
+                               body, bodylen, resp, err, errcap);
+
+        if (hr == 0) {
+            rc = 0;
+            break;
+        }
+        http_response_free(resp);
+        memset(resp, 0, sizeof(*resp));
+        if (hr != 1 || attempt == 1) {
+            rc = -1;
+            break;
+        }
+        /* Transport failure: retry once with a fresh connection. */
+    }
+
+out:
+    sb_free(&path);
+    sb_free(&authz);
+    return rc;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Public S3 operations                                                      */
+/* ------------------------------------------------------------------------- */
+
+int s3_ping(s3_client *c, char *err, size_t errcap)
+{
+    s3_http_response r;
+    int rc;
+
+    if (c == NULL) {
+        s3_set_err(err, errcap, "s3_ping: null client");
+        return -1;
+    }
+    if (s3_request(c, "GET", S3_PROBE_KEY, NULL, 0, 0, &r,
+                   err, errcap) != 0) {
+        return -1;
+    }
+    if (r.status == 404) {
+        http_response_free(&r);
+        return 0;
+    }
+    if (r.status >= 200 && r.status < 300) {
+        http_response_free(&r);
+        return 0;
+    }
+    {
+        char *code = xml_extract(r.body, r.body_len, "Code");
+
+        if (code != NULL) {
+            xml_unescape_inplace(code);
+            if (strcmp(code, "NoSuchKey") == 0) {
+                free(code);
+                http_response_free(&r);
+                return 0;
+            }
+            free(code);
+        }
+    }
+    set_s3_error(&r, err, errcap);
+    http_response_free(&r);
+    rc = -1;
+    return rc;
+}
+
+int s3_get(s3_client *c, const char *key, unsigned char **val, size_t *vallen,
+           long long *expiry_ms, char *err, size_t errcap)
+{
+    s3_http_response r;
+    char *code;
+
+    if (c == NULL || key == NULL || val == NULL || vallen == NULL ||
+        expiry_ms == NULL) {
+        s3_set_err(err, errcap, "s3_get: invalid arguments");
+        return -1;
+    }
+    *val = NULL;
+    *vallen = 0;
+    *expiry_ms = 0;
+
+    if (s3_request(c, "GET", key, NULL, 0, 0, &r, err, errcap) != 0) {
+        return -1;
+    }
+    if (r.status == 404) {
+        http_response_free(&r);
+        return 0;
+    }
+    if (r.status >= 200 && r.status < 300) {
+        if (r.has_expiry && r.expiry_ms > 0 && r.expiry_ms <= s3_now_ms()) {
+            char ignore[1];
+
+            ignore[0] = '\0';
+            http_response_free(&r);
+            (void)s3_delete(c, key, ignore, 0);
+            return 0;
+        }
+        *val = r.body;
+        *vallen = r.body_len;
+        *expiry_ms = r.has_expiry ? r.expiry_ms : 0;
+        r.body = NULL;
+        r.body_len = 0;
+        http_response_free(&r);
+        return 1;
+    }
+    code = xml_extract(r.body, r.body_len, "Code");
+    if (code != NULL) {
+        xml_unescape_inplace(code);
+        if (strcmp(code, "NoSuchKey") == 0) {
+            free(code);
+            http_response_free(&r);
+            return 0;
+        }
+        free(code);
+    }
+    set_s3_error(&r, err, errcap);
+    http_response_free(&r);
+    return -1;
+}
+
+int s3_put(s3_client *c, const char *key, const unsigned char *val,
+           size_t vallen, long long expiry_ms, char *err, size_t errcap)
+{
+    s3_http_response r;
+    int rc;
+
+    if (c == NULL || key == NULL || (val == NULL && vallen > 0)) {
+        s3_set_err(err, errcap, "s3_put: invalid arguments");
+        return -1;
+    }
+    if (vallen > S3_MAX_BODY_BYTES) {
+        s3_set_err(err, errcap, "s3_put: value exceeds %u bytes",
+                (unsigned)S3_MAX_BODY_BYTES);
+        return -1;
+    }
+    if (s3_request(c, "PUT", key, val, vallen, expiry_ms, &r,
+                   err, errcap) != 0) {
+        return -1;
+    }
+    if (r.status >= 200 && r.status < 300) {
+        http_response_free(&r);
+        rc = 0;
+    } else {
+        set_s3_error(&r, err, errcap);
+        http_response_free(&r);
+        rc = -1;
+    }
+    return rc;
+}
+
+int s3_delete(s3_client *c, const char *key, char *err, size_t errcap)
+{
+    s3_http_response r;
+    int rc;
+
+    if (c == NULL || key == NULL) {
+        s3_set_err(err, errcap, "s3_delete: invalid arguments");
+        return -1;
+    }
+    if (s3_request(c, "DELETE", key, NULL, 0, 0, &r, err, errcap) != 0) {
+        return -1;
+    }
+    if ((r.status >= 200 && r.status < 300) || r.status == 404) {
+        http_response_free(&r);
+        rc = 0;
+    } else {
+        set_s3_error(&r, err, errcap);
+        http_response_free(&r);
+        rc = -1;
+    }
+    return rc;
+}
+
+/* --------------------------------------------------------------- S3 store
+ *
+ * --store s3api:BUCKET is the object-storage backend: the same JSON records as
+ * bbolt and Valkey, under
+ *
+ *   betteranusbis/challenge/<id>
+ *   betteranusbis/honeypot/<network>
+ *
+ * with Anubis's x-amz-meta-x-anubis-expiry-ms metadata carrying the absolute
+ * expiry (S3 has no native TTL, and GetObject checks the metadata before using
+ * the body). Credentials and region come from the environment, as they do for
+ * upstream's AWS SDK client: AWS_REGION/AWS_DEFAULT_REGION, AWS_ACCESS_KEY_ID,
+ * AWS_SECRET_ACCESS_KEY, optional AWS_SESSION_TOKEN, and AWS_ENDPOINT_URL_S3 /
+ * AWS_ENDPOINT_URL for S3-compatible services. AWS_S3_PATH_STYLE=1 (or the
+ * policy's pathStyle) selects path-style addressing.
+ *
+ * Like Valkey, this is a shared backend: reads are remote-first for mutable
+ * state, so an instance can verify a challenge another instance issued. S3 is
+ * not atomic, so two instances racing on one challenge can both accept it once;
+ * the spent write is last-writer-wins. There is no startup list/scan (the keys
+ * are looked up on demand), which keeps startup independent of bucket size.
+ */
+#define S3_CH_PREFIX "betteranusbis/challenge/"
+#define S3_HP_PREFIX "betteranusbis/honeypot/"
+
+static time_t s3_backoff_until;
+
+static void s3_warn(const char *what, const char *err) {
+    static time_t last;
+    time_t now = time(NULL);
+    if (now - last >= 5) {
+        logmsg("store: s3 %s: %s", what, err && *err ? err : "error");
+        last = now;
+    }
+    s3_backoff_until = now + 5;
+}
+
+static int s3_available(void) {
+    return store_s3 && s3 != NULL && time(NULL) >= s3_backoff_until;
+}
+
+static int s3_get_challenge(const char *id, ch_entry *out) {
+    if (!s3_available() || !id || !*id) return 0;
+    char key[200], err[512] = "";
+    unsigned char *val = NULL;
+    size_t len = 0;
+    long long expiry = 0;
+    snprintf(key, sizeof key, S3_CH_PREFIX "%s", id);
+    int rc = s3_get(s3, key, &val, &len, &expiry, err, sizeof err);
+    if (rc < 0) { s3_warn("GET challenge", err); return -1; }
+    if (rc == 0) return 0;
+    char *json = malloc(len + 1);
+    if (!json) { free(val); return -1; }
+    memcpy(json, val, len);
+    json[len] = 0;
+    free(val);
+    int ok = challenge_from_json(json, out);
+    free(json);
+    if (!ok) return 0;
+    if (!out->id[0]) snprintf(out->id, sizeof out->id, "%s", id);
+    return 1;
+}
+
+static void s3_put_challenge(const ch_entry *e, long long ttl) {
+    if (!s3_available() || !e || !e->id[0]) return;
+    char key[200], json[4096], err[512] = "";
+    challenge_json(e, json, sizeof json);
+    snprintf(key, sizeof key, S3_CH_PREFIX "%s", e->id);
+    long long expiry = 0;
+    if (ttl > 0) expiry = (long long)time(NULL) * 1000 + ttl * 1000;
+    if (s3_put(s3, key, (const unsigned char *)json, strlen(json), expiry, err,
+               sizeof err) != 0)
+        s3_warn("PUT challenge", err);
+}
+
+static int s3_get_honeypot(uint64_t key, int *count, time_t *last) {
+    if (!s3_available()) return 0;
+    char name[200], err[512] = "";
+    unsigned char *val = NULL;
+    size_t len = 0;
+    long long expiry = 0;
+    snprintf(name, sizeof name, S3_HP_PREFIX "%llu", (unsigned long long)key);
+    int rc = s3_get(s3, name, &val, &len, &expiry, err, sizeof err);
+    if (rc < 0) { s3_warn("GET honeypot", err); return -1; }
+    if (rc == 0) return 0;
+    char json[512];
+    size_t n = len < sizeof json - 1 ? len : sizeof json - 1;
+    memcpy(json, val, n);
+    json[n] = 0;
+    free(val);
+    int c = (int)json_get_ll(json, "count", 0);
+    long long l = json_get_ll(json, "last", 0);
+    if (c <= 0 || l <= 0) return 0;
+    *count = c;
+    *last = (time_t)l;
+    return 1;
+}
+
+static void s3_put_honeypot(uint64_t key, int count, time_t last) {
+    if (!s3_available()) return;
+    char name[200], json[160], err[512] = "";
+    snprintf(name, sizeof name, S3_HP_PREFIX "%llu", (unsigned long long)key);
+    snprintf(json, sizeof json, "{\"count\":%d,\"last\":%lld}", count, (long long)last);
+    if (s3_put(s3, name, (const unsigned char *)json, strlen(json),
+               ((long long)last + HP_WINDOW) * 1000, err, sizeof err) != 0)
+        s3_warn("PUT honeypot", err);
+}
+
+static int s3_store_start(const char *bucket) {
+    char err[512] = "";
+    const char *ps = getenv("AWS_S3_PATH_STYLE");
+    if (ps && *ps && strcmp(ps, "0") && strcasecmp(ps, "false"))
+        s3_path_style = 1;
+    s3 = s3_connect(bucket, s3_path_style ? 1 : -1, err, sizeof err);
+    if (!s3) {
+        fprintf(stderr, "betterAnusbis: cannot configure the S3 store: %s\n",
+                err[0] ? err : "invalid configuration");
+        return -1;
+    }
+    if (s3_ping(s3, err, sizeof err) != 0) {
+        fprintf(stderr, "betterAnusbis: S3 bucket %s is not usable: %s\n", bucket,
+                err[0] ? err : "request failed");
+        s3_close(s3);
+        s3 = NULL;
+        return -1;
+    }
+    store_s3 = 1;
+    logmsg("store: s3api bucket %s%s, object metadata carries the expiry", bucket,
+           s3_path_style ? " (path style)" : "");
+    return 0;
+}
+
 /* ---------------------------------------------------------------- the store
  *
  * The challenge ledger and the honeypot counters live in memory, so a restart
@@ -6650,7 +9811,7 @@ static void on_shutdown(int sig) {
 static void store_mark_dirty(void) { store_dirty = 1; }
 
 static void store_write(void) {
-    if (store_valkey) return;       /* writes happen with the event, not on a timer */
+    if (store_valkey || store_s3) return;  /* writes happen with the event */
     if (store_bbolt) {
         if (bbolt_store_write() == 0) store_dirty = 0;
         return;
@@ -6700,6 +9861,7 @@ static void store_write(void) {
 
 static int store_load(void) {
     if (store_valkey) return valkey_store_start(store_path);
+    if (store_s3) return s3_store_start(store_path);
     if (store_bbolt) return bbolt_load_or_create();
     FILE *f = fopen(store_path, "r");
     if (!f) {
@@ -10727,6 +13889,7 @@ static void policy_apply_blocks(const y_node *root) {
         const y_node *params = y_get(store, "parameters");
         const char *path = y_str(y_get(params, "path"), NULL);
         const char *url = y_str(y_get(params, "url"), NULL);
+        const char *bucket = y_str(y_get(params, "bucketName"), NULL);
         if (!strcasecmp(backend, "memory")) {
             logmsg("policy: store backend memory");
         } else if (!strcasecmp(backend, "file") && path && *path) {
@@ -10752,10 +13915,17 @@ static void policy_apply_blocks(const y_node *root) {
             logmsg("policy: store backend valkey configured");
         } else if (!strcasecmp(backend, "valkey")) {
             logmsg("policy: store backend valkey needs parameters.url; using memory");
+        } else if (!strcasecmp(backend, "s3api") && bucket && *bucket) {
+            if (!cfg.store) {
+                char spec[1024];
+                snprintf(spec, sizeof spec, "s3api:%s", bucket);
+                cfg.store = y_dup(spec);
+            }
+            s3_path_style = y_bool(y_get(params, "pathStyle"), 0);
+            logmsg("policy: store backend s3api, bucket %s%s", bucket,
+                   s3_path_style ? " (path style)" : "");
         } else if (!strcasecmp(backend, "s3api")) {
-            logmsg("policy: store backend s3api is not implemented by betterAnusbis; the "
-                   "challenge ledger stays in memory (file, bbolt and valkey stores are "
-                   "implemented)");
+            logmsg("policy: store backend s3api needs parameters.bucketName; using memory");
         } else {
             logmsg("policy: store backend %s is unknown here, using memory", backend);
         }
@@ -14506,11 +17676,13 @@ static void usage(FILE *out) {
         "                         /api/check and the challenge\n"
         "  --public-url URL       where this gate is reachable, used to build the\n"
         "                         forwardAuth redirect\n"
-        "  --store file:PATH|bbolt:PATH|valkey:URL\n"
+        "  --store file:PATH|bbolt:PATH|valkey:URL|s3api:BUCKET\n"
         "                         keep the challenge ledger and the honeypot counters\n"
         "                         here: a snapshot text file, an Anubis-style bbolt DB\n"
-        "                         (single writer), or Valkey/Redis (redis://, rediss://,\n"
-        "                         unix:///path?db=N; S3 is not implemented)\n"
+        "                         (single writer), Valkey/Redis (redis://, rediss://,\n"
+        "                         unix:///path?db=N), or S3 (AWS_REGION,\n"
+        "                         AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,\n"
+        "                         AWS_ENDPOINT_URL_S3, AWS_S3_PATH_STYLE=1)\n"
         "  --challenge-extension NAME\n"
         "                         css-load: the page's stylesheet must be fetched\n"
         "                         before pass-challenge is accepted\n"
@@ -15181,11 +18353,19 @@ int main(int argc, char **argv) {
             }
             store_valkey = 1;
             if (store_load() != 0) return 1;
+        } else if (!strncmp(cfg.store, "s3api:", 6)) {
+            snprintf(store_path, sizeof store_path, "%s", cfg.store + 6);
+            if (!store_path[0]) {
+                fprintf(stderr, "betterAnusbis: --store s3api: wants a bucket name\n");
+                return 2;
+            }
+            store_s3 = 1;
+            if (store_load() != 0) return 1;
         } else if (!strcmp(cfg.store, "memory") || !strcmp(cfg.store, "none")) {
             logmsg("store: memory only, as before");
         } else {
             fprintf(stderr, "betterAnusbis: --store wants file:PATH, bbolt:PATH, "
-                            "valkey:URL or memory (S3 is not implemented)\n");
+                            "valkey:URL, s3api:BUCKET or memory\n");
             return 2;
         }
     }

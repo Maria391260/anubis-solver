@@ -71,8 +71,7 @@ policy: 41 rule(s) and 5 threshold(s) read from the Anubis format,
 ```
 
 If a line says something is ignored, that line is the truth: either it is an
-enterprise feature (`botstopper`) or a store backend this gate does not have
-(`s3api`). It will not fail silently.
+enterprise feature (`botstopper`). It will not fail silently.
 
 > **Why `--secret-file`?** Without it the signing key is random per run, so
 > every restart logs every client out. Anubis keeps its key on disk; give this
@@ -161,10 +160,11 @@ accepted as aliases so a copied compose file starts:
 `--target-insecure-skip-verify`→`--target-insecure`. Every flag is also an
 environment variable (`--cookie-same-site` is `COOKIE_SAME_SITE`).
 
-**Not here:** the `s3api` store, the metrics listener's TLS and basic auth,
-`--cookie-dynamic-domain`, and six locales of Anubis's thirty-one. The `bbolt`
-store is here: `--store bbolt:PATH`, with Anubis's on-disk layout, and the
-`valkey` store is here: `--store valkey:redis://HOST:PORT/DB`.
+**Not here:** the metrics listener's TLS and basic auth,
+`--cookie-dynamic-domain`, and six locales of Anubis's thirty-one. All four
+store backends are here: `--store file:PATH`, `bbolt:PATH`,
+`valkey:redis://HOST:PORT/DB`, and `s3api:BUCKET` with the AWS environment
+credentials upstream's SDK uses.
 HTTP/2 is here (ALPN `h2`, plus `h2c` prior knowledge on a plain listener), and
 HTTP/3 over QUIC is an extra this gate has and upstream does not — both are
 optional at build time and on by default only for HTTP/2.
@@ -257,9 +257,11 @@ In the order you are likely to hit them:
 1. **Six locales of thirty-one.** English, Dutch, German, French, Spanish,
    Italian. Everything else gets English.
 2. **One re-solve per client** on the swap, and per policy edit afterwards.
-3. **No S3 store.** `--store file:PATH` and `--store bbolt:PATH` survive
-   restarts on one host but share nothing between replicas; `--store
-   valkey:URL` is the multi-instance backend.
+3. **Simpler store clients than the upstream SDKs.** Valkey has no
+   cluster/Sentinel discovery; S3 uses static credentials from the environment
+   (no IMDS, profile chain, assume-role, or SDK retry/keep-alive layer), and one
+   HTTP connection per operation. file/bbolt share nothing between replicas;
+   valkey and S3 are the multi-instance backends.
 4. **WebSockets are HTTP/1.1 only.** HTTP/2 extended CONNECT and HTTP/3
    datagram tunnels are not implemented, so an h2/h3 client gets 400 for
    CONNECT; browsers use h1 for `ws://` regardless.
