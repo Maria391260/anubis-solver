@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="mascot/intelxe.png" alt="intel iRIS Xe — IASO" width="420">
-</p>
-
 # anubis-solver
 
 <img src="mascot/anti-anti-ai.png" alt="anubis-solver mascot" width="200">

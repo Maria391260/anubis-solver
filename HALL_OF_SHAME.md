@@ -250,6 +250,10 @@ how you ship one.
 
 ## 12. "Xe Iaso? more like Intel Iris Xe Iaso"
 
+<p align="center">
+  <img src="mascot/intelxe.png" alt="intel iRIS Xe — IASO" width="420">
+</p>
+
 **The claim: implicit, in the name.** The Anubis author's handle contains "Xe", which
 is also the name of Intel's integrated GPU architecture (gen12lp / Xe-LP), which is
 also the target of 30,260 hand-written assembly instructions in this repository
