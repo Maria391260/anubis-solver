@@ -162,8 +162,10 @@ accepted as aliases so a copied compose file starts:
 environment variable (`--cookie-same-site` is `COOKIE_SAME_SITE`).
 
 **Not here:** `bbolt`/`valkey`/`s3api` stores, the metrics listener's TLS and
-basic auth, `--cookie-dynamic-domain`, HTTP/2, and six locales of Anubis's
-thirty-one.
+basic auth, `--cookie-dynamic-domain`, and six locales of Anubis's thirty-one.
+HTTP/2 is here (ALPN `h2`, plus `h2c` prior knowledge on a plain listener), and
+HTTP/3 over QUIC is an extra this gate has and upstream does not — both are
+optional at build time and on by default only for HTTP/2.
 
 ## Making clients fast
 
@@ -255,7 +257,9 @@ In the order you are likely to hit them:
 2. **One re-solve per client** on the swap, and per policy edit afterwards.
 3. **No bbolt, valkey or S3 store.** `--store file:PATH` survives restarts but
    shares nothing between replicas.
-4. **No HTTP/2.** Terminate TLS at your proxy, which speaks HTTP/1.1 to the gate.
+4. **WebSockets are HTTP/1.1 only.** HTTP/2 extended CONNECT and HTTP/3
+   datagram tunnels are not implemented, so an h2/h3 client gets 400 for
+   CONNECT; browsers use h1 for `ws://` regardless.
 5. **No CEL engine** beyond the expressions Anubis's own policies use; anything
    else is reported by rule name at startup.
 6. **`botstopper` and the headless extension** are enterprise features and are

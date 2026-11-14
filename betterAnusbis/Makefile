@@ -14,6 +14,30 @@ LIBDIR  ?= ..
 RPATH   ?= '$$ORIGIN:$$ORIGIN/..'
 LDLIBS  ?= -L$(LIBDIR) -lanubis_solver -Wl,-rpath,$(RPATH) -lssl -lcrypto
 
+# HTTP/2 and HTTP/3 are optional at build time, and the binary always keeps
+# working without them: a gate that cannot be built because a distribution
+# packaged nghttp2 differently is worse than one that only speaks HTTP/1.1.
+# pkg-config is the whole detection story for nghttp2. nghttp3 is rarer, so it
+# is looked for in the usual place, in $(NGHTTP3_PREFIX), and in third_party/.
+NGHTTP2_CFLAGS ?= $(shell pkg-config --cflags libnghttp2 2>/dev/null)
+NGHTTP2_LIBS   ?= $(shell pkg-config --libs libnghttp2 2>/dev/null)
+HTTP_CFLAGS :=
+HTTP_LIBS   :=
+ifneq ($(strip $(NGHTTP2_LIBS)),)
+HTTP_CFLAGS += -DHAVE_NGHTTP2 $(NGHTTP2_CFLAGS)
+HTTP_LIBS   += $(NGHTTP2_LIBS)
+endif
+
+NGHTTP3_PREFIX ?= $(or $(shell pkg-config --variable=prefix libnghttp3 2>/dev/null),../third_party/nghttp3)
+NGHTTP3_CFLAGS ?= $(wildcard $(NGHTTP3_PREFIX)/include/nghttp3/nghttp3.h)
+NGHTTP3_LIB    ?= $(firstword $(wildcard $(NGHTTP3_PREFIX)/lib/libnghttp3.a $(NGHTTP3_PREFIX)/lib/libnghttp3.so) $(shell pkg-config --libs libnghttp3 2>/dev/null))
+ifneq ($(strip $(NGHTTP3_CFLAGS)),)
+ifneq ($(strip $(NGHTTP3_LIB)),)
+HTTP_CFLAGS += -DHAVE_NGHTTP3 -I$(NGHTTP3_PREFIX)/include
+HTTP_LIBS   += $(NGHTTP3_LIB)
+endif
+endif
+
 # the first rule in a makefile is its default goal, and the wasm copies below
 # must not become it
 .DEFAULT_GOAL := betterAnusbis
@@ -30,7 +54,7 @@ web/sha256_pow_batch.wasm: $(WASM)/sha256_pow_batch.wasm
 wasm-kernels: web/argon2id_pow.wasm web/hashx_pow.wasm web/sha256_pow_batch.wasm
 
 betterAnusbis: betterAnusbis.c $(LIBDIR)/libanubis_solver.so
-	$(CC) $(CFLAGS) -I$(LIBDIR)/include -o $@ betterAnusbis.c $(LDLIBS)
+	$(CC) $(CFLAGS) $(HTTP_CFLAGS) -I$(LIBDIR)/include -o $@ betterAnusbis.c $(LDLIBS) $(HTTP_LIBS)
 
 $(LIBDIR)/libanubis_solver.so:
 	$(MAKE) -C $(LIBDIR) libanubis_solver.so
@@ -49,7 +73,12 @@ slow: betterAnusbis wasm-kernels
 test-parity: betterAnusbis
 	python3 test_parity.py
 
+# HTTP/1.1, HTTP/2 and HTTP/3 on both the listener and the backend hop. Skips
+# the cases whose tooling (curl --http2, aioquic, python h2) is not installed.
+test-http23: betterAnusbis
+	python3 tests_http23.py -v
+
 clean:
 	rm -f betterAnusbis
 
-.PHONY: clean wasm-kernels slow test-parity
+.PHONY: clean wasm-kernels slow test-parity test-http23

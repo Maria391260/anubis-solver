@@ -69,6 +69,7 @@ And it actually rejects things:
 | challenge JSON | `<script id="anubis_challenge" type="application/json">` with `rules` + `challenge` exactly as Anubis emits it |
 | pass route | `/.within.website/x/cmd/anubis/api/pass-challenge?id=&response=&nonce=&redir=&elapsedTime=` |
 | other routes | `.../api/check` (200/401), `.../api/ping` |
+| protocols | HTTP/1.1 always; HTTP/2 (ALPN `h2`, and `h2c` prior knowledge on a plain listener) and HTTP/3 (QUIC, `Alt-Svc`) when built with the optional libraries. Upstream Anubis gets h2 from Go's `net/http` and has no h3; the backend hop here can do either |
 | cookie | `techaro.lol-anubis-auth`, a JWT HS256 with Anubis's claims (`challenge`, `method`, `policyRule`, `action`, `iat`, `exp`) |
 | test cookie | `techaro.lol-anubis-cookie-verification` |
 | metarefresh | no hashing: wait `difficulty × 800 ms`, echo `?challenge=<randomData>` — the same two checks as `lib/challenge/metarefresh/metarefresh.go` |
@@ -153,7 +154,13 @@ policy, honeypot, assets, TLS, metrics
   --no-honeypot  --stateless  --healthcheck  --slog-level LEVEL
   --bind-network tcp|unix  --socket-mode 0770  --metrics-bind-network tcp|unix
   --difficulty-in-jwt  --webmaster-email ADDR  --preserve-referer-query-param
-  --target-disable-keepalive (accepted; this gate always closes)
+  --target-disable-keepalive (accepted; the HTTP/1.1 origin hop always closes)
+  --http2[=B]  --http3[=B]   HTTP/2 on the listener (default on) and HTTP/3
+                              over QUIC on the same UDP port (default off,
+                              needs --tls-cert/--tls-key)
+  --target-http2[=B]  --target-http3[=B]
+                              speak h2/h3 to the backend when it offers them
+                              (h2 default on, h3 default off)
   --geoip-country PATH  --geoip-asn PATH  --geoip-lookup IP  --dnsbl
   --og-passthrough  --og-expiry-time SECS  --og-override "og:title=..."
   --og-cache-consider-host               key the cache on host and path
@@ -417,6 +424,63 @@ self-signed internal backend and says so when it uses it). Verified: HTTPS
 challenge page, full solve and pass over TLS, and plain HTTP to the TLS port fails
 the handshake as it should.
 
+## HTTP/2 and HTTP/3
+
+HTTP/2 is on by default and costs nothing when a client does not ask for it:
+
+```bash
+./betterAnusbis --target http://127.0.0.1:3000 --tls-cert cert.pem --tls-key key.pem
+curl --http2 -k https://127.0.0.1:8080/            # ALPN negotiates h2
+curl --http2-prior-knowledge http://127.0.0.1:8080/ # h2c on a plain listener
+```
+
+HTTP/3 is one flag more. It needs TLS, because QUIC always does, and it binds a
+UDP socket on the same address and port as the TCP listener. Every response then
+carries `Alt-Svc: h3=":PORT"; ma=86400`, which is how a browser finds it; an
+HTTP/3 client can also connect directly.
+
+```bash
+./betterAnusbis --target http://127.0.0.1:3000 \
+    --tls-cert cert.pem --tls-key key.pem --http3
+```
+
+Both are optional at build time. `make` detects nghttp2 through pkg-config and
+nghttp3 in `third_party/nghttp3` (or at `NGHTTP3_PREFIX`); without them the
+binary builds and serves HTTP/1.1, and `--http3` fails at startup with a clear
+message instead of pretending. nghttp2 is MIT, nghttp3 is MIT; both notices are
+in `THIRD_PARTY_NOTICES.md`.
+
+The design is the reason this did not become a second gate: a request is decoded
+from HTTP/2 or HTTP/3, handed to the same `handle_parsed()` the HTTP/1.1 reader
+uses, and its ordinary HTTP/1.1 answer is re-framed for the client. The challenge
+page, the cookie, the policy engine, the honeypot, the store and the proxy did
+not learn a second protocol. The listener side multiplexes: each stream is its
+own worker, and only one thread touches the protocol session.
+
+On the origin hop, `--target-http2` (default on) offers `h2` through ALPN on a
+TLS target and falls back to HTTP/1.1 when the origin does not pick it;
+`--target-http3` offers QUIC/h3 instead. Neither pools connections: one proxied
+request is one h2/h3 origin connection, unlike the HTTP/1.1 pool.
+
+What is deliberately not there:
+
+- **WebSockets are HTTP/1.1 only.** HTTP/2 needs extended CONNECT (RFC 8441),
+  HTTP/3 would need a datagram tunnel; the gate answers 400 for CONNECT on
+  h2/h3, and a browser uses h1 for `ws://` anyway. The upgrade splice is
+  unchanged.
+- **HTTP/3 uses one event loop for every QUIC connection**, with 64 connections
+  and 64 streams each. A worker's socketpair is drained on the tick: 10 ms while
+  a request is in flight, 100 ms otherwise (about 1% of one core idle). That is
+  plenty for a gate in front of a site, and the wrong shape for a CDN edge.
+- **A direct HTTP/3 client's address is not available** from OpenSSL 3.5.3's
+  public API, so it appears as `0.0.0.0` unless `X-Forwarded-For` is supplied by
+  a trusted proxy. HTTP/2 and HTTP/1.1 have the real peer address.
+- **Trailers are dropped** by the HTTP/2 and HTTP/3 response converters, and
+  `CONNECT` is refused. No server push, no 0-RTT.
+
+`python3 tests_http23.py -v` covers all of it: h2 ALPN, h2c, multiplexing, h3
+over QUIC, `Alt-Svc`, an h2 backend and an h3 backend, and the negative cases.
+
 ## What it costs
 
 Measured from `/proc` while serving 300 challenge pages and 40 pass-challenge
@@ -434,10 +498,12 @@ difference — Anubis re-checks through its wasm module via wazero, this calls
 
 ## What it does not do
 
-- **No HTTP/2, and the client side has no keep-alive.** The gate reads one
-  request, answers it with `Connection: close` and closes, which keeps the
-  listener readable. TLS itself is there (`--tls-cert`/`--tls-key`, and
-  `--target https://` with `--target-insecure` for a self-signed backend).
+- **HTTP/1.1 has no keep-alive on the client side**, and the h2/h3 origin hops
+  do not pool either: one proxied request is one origin connection. HTTP/2 and
+  HTTP/3 on the listener do multiplex. WebSockets remain HTTP/1.1 only. See the
+  HTTP/2 and HTTP/3 section above for the exact limits.
+- **TLS itself is there** (`--tls-cert`/`--tls-key`, and `--target https://`
+  with `--target-insecure` for a self-signed backend).
 - **The origin does get keep-alive.** Its connections are pooled and reused when
   the response was framed (Content-Length, chunked, or no body), idle for up to
   a minute, with one retry when a pooled connection turns out to be dead.
@@ -492,6 +558,7 @@ a site owner actually configures. That is the point: `--target` and you are done
 ```bash
 ./test-all-algorithms.sh      # all six algorithms, needs a backend on :8002
 python3 test_parity.py        # the flags taken from cmd/anubis, checked on the wire
+python3 tests_http23.py -v    # HTTP/2 and HTTP/3, listener and backend hop
 ```
 
 `test-all-algorithms.sh` starts a backend itself if one is not running and

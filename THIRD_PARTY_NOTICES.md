@@ -1,6 +1,6 @@
 # Third-party notices
 
-This project vendors two third-party components. They remain under their own
+This project vendors several third-party components. They remain under their own
 licenses; the `LICENSE` covers only the original code, under **MIT + attribution**
 (see [ATTRIBUTION.md](ATTRIBUTION.md)). The attribution requirement sits on top of
 the terms below and cannot loosen them — where they conflict, the third-party
@@ -53,3 +53,25 @@ package and carry the same CC0-1.0 / Apache-2.0 terms.
 They are used only as the comparison baseline in `wasm/bench.mjs`,
 `wasm/verify.mjs` and the demo page. The attribution condition in `LICENSE`
 section 3 applies to this repository's own work, not to them.
+
+## nghttp2 (`libnghttp2`)
+
+HTTP/2 framing and HPACK for the gate's listener and its optional backend hop.
+It is a normal system dependency (headers and library), not vendored here;
+`make` finds it through pkg-config.
+
+- Upstream: https://github.com/nghttp2/nghttp2
+- License: MIT
+- Used by: `betterAnusbis/betterAnusbis.c` when built with `-DHAVE_NGHTTP2`
+
+## nghttp3 (`betterAnusbis/third_party/nghttp3/`)
+
+HTTP/3 framing and QPACK, paired with OpenSSL's QUIC stack. A Release,
+library-only static build is vendored so the gate can be built and tested
+offline; the provenance and rebuild commands are in that directory's README.
+
+- Upstream: https://github.com/ngtcp2/nghttp3
+- Version: 1.8.0
+- License: MIT
+- Full text: [`betterAnusbis/third_party/nghttp3/COPYING`](betterAnusbis/third_party/nghttp3/COPYING)
+- Used by: `betterAnusbis/betterAnusbis.c` when built with `-DHAVE_NGHTTP3`

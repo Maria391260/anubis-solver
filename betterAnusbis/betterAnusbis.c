@@ -15,6 +15,11 @@
  * Verification is done by libanubis_solver.so — the same engine the CLI solves
  * with — so the server and its clients agree bit for bit by construction.
  *
+ * HTTP/2 (nghttp2) and HTTP/3 (OpenSSL QUIC + nghttp3) are optional at build
+ * time, on the listener and on the backend hop. A request in any of them is
+ * decoded into the same `request` struct and answered through the same
+ * handle_parsed(), so the gate did not grow a second implementation.
+ *
  * Build:  make            (or: cc -O2 -pthread -o betterAnusbis betterAnusbis.c -L.. -lanubis_solver)
  */
 #define _GNU_SOURCE
@@ -44,6 +49,13 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
+#ifdef HAVE_NGHTTP2
+#include <nghttp2/nghttp2.h>
+#endif
+#ifdef HAVE_NGHTTP3
+#include <nghttp3/nghttp3.h>
+#include <openssl/quic.h>
+#endif
 
 #include "anubis-solver.h"
 
@@ -144,6 +156,13 @@ typedef struct {
     int jwt_alg;                 /* 0 HS256, 1 HS512, 2 EdDSA */
     EVP_PKEY *jwt_pkey;
     char verify_name[256];       /* the -cookie-verification name, suffix and all */
+    /* HTTP/2 and HTTP/3. The listener and the target hop each get their own
+     * switch: an environment that terminates h3 at the edge and speaks h1 to a
+     * legacy backend is the normal one, and so is the reverse. */
+    int http2;                   /* ALPN h2 and h2c prior knowledge (default on) */
+    int http3;                   /* QUIC listener on the same port (needs TLS) */
+    int target_http2;            /* use h2 to the backend when ALPN offers it */
+    int target_http3;            /* use h3/QUIC to the backend */
 } config;
 
 static config cfg = {
@@ -199,6 +218,10 @@ static config cfg = {
     .dynamic_cookie_suffix = 1,  /* upstream's default */
     .webmaster_email = NULL,
     .preserve_referer_qp = 0,
+    .http2 = 1,
+    .http3 = 0,
+    .target_http2 = 1,
+    .target_http3 = 0,
 };
 
 static int log_quiet;            /* WARN and ERROR: keep the startup lines, drop info */
@@ -578,6 +601,7 @@ typedef struct {
 } conn;
 
 static SSL_CTX *server_ctx;       /* the listener's context, once TLS is on */
+static int h3_port;               /* the UDP port QUIC is on, 0 when HTTP/3 is off */
 
 static ssize_t conn_read(conn *c, void *buf, size_t n);
 static ssize_t conn_write(conn *c, const void *buf, size_t n);
@@ -1497,7 +1521,10 @@ static const char *query_param(const char *query, const char *name, char *out, s
 
 static void respond(conn *c, int status, const char *reason, const char *content_type,
                     const char *extra_headers, const char *body, size_t body_len) {
-    char head[2048];
+    char head[2176];
+    char alt[96] = "";
+    if (cfg.http3 && h3_port)
+        snprintf(alt, sizeof alt, "Alt-Svc: h3=\":%d\"; ma=86400\r\n", h3_port);
     int n = snprintf(head, sizeof head,
                      "HTTP/1.1 %d %s\r\n"
                      "Content-Type: %s\r\n"
@@ -1505,26 +1532,29 @@ static void respond(conn *c, int status, const char *reason, const char *content
                      "Connection: close\r\n"
                      "Cache-Control: no-store\r\n"
                      "X-Powered-By: betterAnusbis/" VERSION "\r\n"
-                     "%s"
+                     "%s%s"
                      "\r\n",
                      status, reason, content_type ? content_type : "text/plain; charset=utf-8",
-                     body_len, extra_headers ? extra_headers : "");
+                     body_len, extra_headers ? extra_headers : "", alt);
     if (n > 0) send_all(c, head, (size_t)n);
     if (body && body_len) send_all(c, body, body_len);
 }
 
 static void respond_redirect_with(conn *c, int status, const char *location,
                                   const char *extra_headers) {
-    char head[4096];
+    char head[4192];
+    char alt[96] = "";
+    if (cfg.http3 && h3_port)
+        snprintf(alt, sizeof alt, "Alt-Svc: h3=\":%d\"; ma=86400\r\n", h3_port);
     int n = snprintf(head, sizeof head,
                      "HTTP/1.1 %d %s\r\n"
                      "Location: %s\r\n"
                      "Content-Length: 0\r\n"
                      "Connection: close\r\n"
-                     "%s"
+                     "%s%s"
                      "\r\n",
                      status, reason_for(status), location,
-                     extra_headers ? extra_headers : "");
+                     extra_headers ? extra_headers : "", alt);
     if (n > 0) send_all(c, head, (size_t)n);
 }
 
@@ -2614,7 +2644,11 @@ static void pool_put(conn *up) {
  * body bytes that arrived with the headers are not lost. */
 typedef struct {
     conn *up;
-    char buf[8192];
+    /* at least as large as relay_response()'s head buffer: the first read can
+     * carry the whole head and a chunk of body, and that leftover is memcpy'd
+     * here verbatim. 8 KiB was smaller than the 32 KiB head, which is a buffer
+     * overflow the moment the origin answers quickly. */
+    char buf[32768];
     size_t pos, len;
 } rd_t;
 
@@ -2687,8 +2721,19 @@ static int relay_response(conn *up_c, conn *c, const char *method) {
     int conn_close = ce && ce < body && strcasestr(ce, "close") != NULL;
     int head_only = method && !strcasecmp(method, "HEAD");
 
-    /* the head only; the leftover bytes are the start of the body */
-    if (send_all(c, head, (size_t)(body - head)) < 0) return 0;
+    /* the head only; the leftover bytes are the start of the body. When HTTP/3
+     * is on, every response is the place a browser learns the QUIC endpoint. */
+    if (cfg.http3 && h3_port) {
+        size_t hlen = (size_t)(body - head);
+        char alt[96];
+        int an = snprintf(alt, sizeof alt, "Alt-Svc: h3=\":%d\"; ma=86400\r\n",
+                          h3_port);
+        if (send_all(c, head, hlen - 2) < 0) return 0;
+        if (send_all(c, alt, (size_t)an) < 0) return 0;
+        if (send_all(c, "\r\n", 2) < 0) return 0;
+    } else if (send_all(c, head, (size_t)(body - head)) < 0) {
+        return 0;
+    }
 
     rd_t r;
     memset(&r, 0, sizeof r);
@@ -2736,11 +2781,34 @@ static int relay_response(conn *up_c, conn *c, const char *method) {
     return 0;
 }
 
+#ifdef HAVE_NGHTTP2
+static int proxy_request_h2(conn *c, const request *req, const char *client_ip,
+                            const char *path);
+#endif
+#ifdef HAVE_NGHTTP3
+static int proxy_request_h3(conn *c, const request *req, const char *client_ip,
+                            const char *path);
+#endif
+
 static void proxy_request(conn *c, const request *req, const char *client_ip, const char *path) {
     if (upgrade_requested(req)) {
         proxy_upgrade(c, req, client_ip, path);
         return;
     }
+#ifdef HAVE_NGHTTP3
+    /* --target-http3 asks for QUIC first; a 0 means the handshake did not
+     * happen and the ordinary path below is the fallback. */
+    if (cfg.target_http3 && cfg.target_tls &&
+        proxy_request_h3(c, req, client_ip, path))
+        return;
+#endif
+#ifdef HAVE_NGHTTP2
+    /* --target-http2: when the origin's TLS offers h2, use it. A 0 means the
+     * origin selected HTTP/1.1 and the ordinary path below dials again. */
+    if (cfg.target_http2 && cfg.target_tls &&
+        proxy_request_h2(c, req, client_ip, path))
+        return;
+#endif
 
     char head[8192];
     const char *host_hdr = cfg.target_host_hdr && *cfg.target_host_hdr
@@ -6212,7 +6280,7 @@ static void policy_load(const char *path) {
     while (fgets(line, sizeof line, f)) {
         char *hash = strchr(line, '#');
         if (hash) *hash = 0;
-        char action[32] = "", sel[64] = "", how[32] = "", value[128] = "";
+        char action[32] = "", sel[64] = "", how[32] = "", value[256] = "";
         int difficulty = 0;
         int n = sscanf(line, "%31s %63s %31s %255s", action, sel, how, value);
         if (n < 2) continue;
@@ -6321,25 +6389,25 @@ static void policy_load(const char *path) {
 
 /* ------------------------------------------------------------ the routes */
 
-static void handle_connection(conn *c, const char *peer_ip) {
-    char *raw = malloc(MAX_HEADER + 1);
-    if (!raw) { close(c->fd); return; }
-    int n = read_headers(c, raw, MAX_HEADER + 1);
-    if (n <= 0) { free(raw); close(c->fd); return; }
-    raw[n] = 0;
-
-    request req;
-    if (parse_request(raw, &req) != 0) {
-        respond(c, 400, "Bad Request", NULL, NULL, "bad request\n", 12);
-        free(raw);
-        close(c->fd);
-        return;
-    }
+/* The part of request handling that runs after bytes have become a `request`.
+ *
+ * This used to be the second half of handle_connection(). It is separate so the
+ * HTTP/2 and HTTP/3 frontends can hand a decoded request straight to it: those
+ * protocols do not have an HTTP/1.1 header block to parse, and using a socketpair
+ * per stream means this function needs no knowledge of the framing at all.
+ * It owns req->headers/req->body and the connection's fd. */
+static void handle_parsed(conn *c, request *req_in, const char *peer_ip) {
+    request req = *req_in;
+    req_in->headers = NULL;
+    req_in->body = NULL;
 
     if (!path_is_sane(req.path)) {
         const char *msg = "betterAnusbis: that path has a . or .. segment\n";
         respond(c, 400, "Bad Request", NULL, NULL, msg, strlen(msg));
-        goto done;
+        free(req.headers);
+        free(req.body);
+        close(c->fd);
+        return;
     }
     collapse_slashes(req.path, req.ppath, sizeof req.ppath);
 
@@ -6368,24 +6436,9 @@ static void handle_connection(conn *c, const char *peer_ip) {
         }
     }
 
-    /* body, if the client sent one */
-    char *hdr_end = strstr(raw, "\r\n\r\n");
-    size_t already = hdr_end ? (size_t)(raw + n - (hdr_end + 4)) : 0;
-    const char *cl = header_value(&req, "Content-Length");
-    size_t content_length = cl ? (size_t)strtoull(cl, NULL, 10) : 0;
-    if (content_length && content_length <= MAX_BODY) {
-        req.body = calloc(1, content_length);
-        if (req.body) {
-            size_t got = already < content_length ? already : content_length;
-            if (got) memcpy(req.body, hdr_end + 4, got);
-            while (got < content_length) {
-                ssize_t r = conn_read(c, req.body + got, content_length - got);
-                if (r <= 0) break;
-                got += (size_t)r;
-            }
-            req.body_len = got;
-        }
-    }
+    /* body, if the client sent one, is already in req.body: the HTTP/1.1
+     * reader below filled it, and the HTTP/2 and HTTP/3 frontends collect it
+     * from DATA frames before they get here. */
 
     /* --base-prefix: route as if the gate were mounted at the root. The request
      * keeps its own path for the policy and for the log; what goes upstream is
@@ -6895,9 +6948,2637 @@ static void handle_connection(conn *c, const char *peer_ip) {
 done:
     free(req.headers);
     free(req.body);
-    free(raw);
     close(c->fd);
 }
+
+/* HTTP/1.1 and HTTP/1.0: read one request off the connection, then hand the
+ * decoded request to handle_parsed(). The whole connection is one request and
+ * the answer says Connection: close, which is what the rest of this file has
+ * always done. */
+static void handle_connection(conn *c, const char *peer_ip) {
+    char *raw = malloc(MAX_HEADER + 1);
+    if (!raw) { close(c->fd); return; }
+    int n = read_headers(c, raw, MAX_HEADER + 1);
+    if (n <= 0) { free(raw); close(c->fd); return; }
+    raw[n] = 0;
+
+    request req;
+    memset(&req, 0, sizeof req);
+    if (parse_request(raw, &req) != 0) {
+        respond(c, 400, "Bad Request", NULL, NULL, "bad request\n", 12);
+        free(raw);
+        close(c->fd);
+        return;
+    }
+
+    if (!path_is_sane(req.path)) {
+        const char *msg = "betterAnusbis: that path has a . or .. segment\n";
+        respond(c, 400, "Bad Request", NULL, NULL, msg, strlen(msg));
+        free(req.headers);
+        free(raw);
+        close(c->fd);
+        return;
+    }
+
+    /* body, if the client sent one */
+    char *hdr_end = strstr(raw, "\r\n\r\n");
+    size_t already = hdr_end ? (size_t)(raw + n - (hdr_end + 4)) : 0;
+    const char *cl = header_value(&req, "Content-Length");
+    size_t content_length = cl ? (size_t)strtoull(cl, NULL, 10) : 0;
+    if (content_length && content_length <= MAX_BODY) {
+        req.body = calloc(1, content_length);
+        if (req.body) {
+            size_t got = already < content_length ? already : content_length;
+            if (got) memcpy(req.body, hdr_end + 4, got);
+            while (got < content_length) {
+                ssize_t r = conn_read(c, req.body + got, content_length - got);
+                if (r <= 0) break;
+                got += (size_t)r;
+            }
+            req.body_len = got;
+        }
+    }
+    free(raw);
+    handle_parsed(c, &req, peer_ip);
+}
+
+/* --------------------------------------------------------------- HTTP/2
+ *
+ * The listener side of HTTP/2. The design is deliberately boring: the HTTP/1.1
+ * request handler stays exactly as it is, and each HTTP/2 stream gets a
+ * socketpair. A worker thread runs handle_parsed() on one end with a request
+ * decoded from HEADERS/DATA; this thread reads the ordinary HTTP/1.1 response
+ * from the other end, parses it once, and turns it into HEADERS plus DATA.
+ *
+ * That means the challenge page, the cookie, the pass route, the proxy, the
+ * honeypot, the policy engine and the OpenGraph cache did not have to learn a
+ * second protocol. Multiplexing is real: the socket is owned by this thread,
+ * every stream is a separate worker, and a stream that is still being written
+ * never blocks another one. Only one thread ever touches nghttp2.
+ */
+#ifdef HAVE_NGHTTP2
+
+#define H2_MAX_STREAMS      128
+#define H2_RESP_HEAD_MAX    (64u << 10)   /* a response head we are willing to read */
+#define H2_RESP_BUFFER_MAX  (1u << 20)    /* how far a handler may run ahead of the socket */
+
+typedef struct h2_stream h2_stream;
+
+struct h2_stream {
+    int32_t id;
+    char *hdrs;                 /* raw "name: value\r\n" lines from HEADERS */
+    size_t hdrs_len, hdrs_cap;
+    char *body;
+    size_t body_len, body_cap;
+    int body_too_big;
+    int req_done;
+    int dispatched;
+    int closed;
+    char method[16];
+    char path[4096];
+    char query[4096];
+    char authority[512];
+    int rfd;                    /* socketpair read end, -1 once gone */
+    int rfd_eof;
+    /* response, parsed from the handler's HTTP/1.1 bytes */
+    int headers_sent;
+    char *head;
+    size_t head_len, head_cap;
+    char *out;                  /* body bytes not yet handed to nghttp2 */
+    size_t out_len, out_off, out_cap;
+    int out_eof;
+    int framing;                /* 0 until close, 1 Content-Length, 2 chunked */
+    long long remaining;        /* framing 1 */
+    int ch_state;               /* framing 2: 0 size line, 1 data, 2 CRLF, 3 trailers */
+    long long ch_rem;
+    int ch_skip;
+    char ch_line[256];
+    size_t ch_line_len;
+    int no_body;
+    int is_head;
+};
+
+typedef struct {
+    conn *c;
+    nghttp2_session *sess;
+    h2_stream *streams[H2_MAX_STREAMS];
+    size_t nstreams;
+    char peer[64];
+    int dead;
+} h2_conn;
+
+typedef struct {
+    int fd;
+    request *req;
+    char *ip;
+} h2_job;
+
+static ssize_t h2_data_read(nghttp2_session *sess, int32_t id, uint8_t *buf, size_t length,
+                            uint32_t *flags, nghttp2_data_source *source, void *user_data);
+static void h2_stream_feed(h2_conn *h, h2_stream *st, const unsigned char *data, size_t len);
+
+static h2_stream *h2_get(h2_conn *h, int32_t id) {
+    for (size_t i = 0; i < h->nstreams; i++)
+        if (h->streams[i]->id == id) return h->streams[i];
+    return NULL;
+}
+
+static h2_stream *h2_add(h2_conn *h, int32_t id) {
+    h2_stream *st = h2_get(h, id);
+    if (st) return st;
+    if (h->nstreams >= H2_MAX_STREAMS) return NULL;
+    st = calloc(1, sizeof *st);
+    if (!st) return NULL;
+    st->id = id;
+    st->rfd = -1;
+    h->streams[h->nstreams++] = st;
+    return st;
+}
+
+static void h2_stream_free(h2_stream *st) {
+    if (!st) return;
+    if (st->rfd >= 0) close(st->rfd);
+    free(st->hdrs);
+    free(st->body);
+    free(st->head);
+    free(st->out);
+    free(st);
+}
+
+/* Append to the small header block or the body queue. Both are bounded; a
+ * handler that produces more than H2_RESP_BUFFER_MAX is simply not read from
+ * until nghttp2 has drained what it already has, which is the backpressure a
+ * socketpair would have given us anyway. */
+static int h2_append(char **buf, size_t *len, size_t *cap, const void *data, size_t n) {
+    /* +1 because the caller (and strstr) expects a NUL after the bytes */
+    if (*len + n + 1 > *cap) {
+        size_t want = *cap ? *cap : 256;
+        while (want < *len + n + 1) want *= 2;
+        char *nb = realloc(*buf, want);
+        if (!nb) return -1;
+        *buf = nb;
+        *cap = want;
+    }
+    memcpy(*buf + *len, data, n);
+    *len += n;
+    (*buf)[*len] = 0;
+    return 0;
+}
+
+static char *h2_lower(char *s) {
+    for (char *p = s; *p; p++) *p = (char)tolower((unsigned char)*p);
+    return s;
+}
+
+static void h2_stream_parse_head(h2_conn *h, h2_stream *st) {
+    char statusbuf[8];
+    nghttp2_nv nva[64];
+    /* These must outlive the loop: nghttp2_nv holds pointers, and nghttp2 copies
+     * at submit time, which is after the loop. A per-iteration stack buffer left
+     * every entry pointing at the last header, which is how the first version
+     * sent a set-cookie whose value was the tail of another header. */
+    char names[64][96];
+    char values[64][1024];
+    size_t nv = 0;
+    char *end = strstr(st->head, "\r\n\r\n");
+    int status = 0;
+
+    if (!end) return;
+    if (!strncmp(st->head, "HTTP/1.", 7)) status = atoi(st->head + 9);
+    if (status < 100 || status > 599) status = 502;
+    snprintf(statusbuf, sizeof statusbuf, "%d", status);
+    nva[nv++] = (nghttp2_nv){(uint8_t *)":status", (uint8_t *)statusbuf,
+                             sizeof(":status") - 1, strlen(statusbuf),
+                             NGHTTP2_NV_FLAG_NONE};
+
+    int chunked = 0;
+    long long clen = -1;
+    char *p = strstr(st->head, "\r\n");
+    p = p ? p + 2 : st->head;
+    while (p < end) {
+        char *eol = strstr(p, "\r\n");
+        if (!eol || eol > end) break;
+        char *colon = memchr(p, ':', (size_t)(eol - p));
+        if (colon && colon > p && nv < sizeof nva / sizeof nva[0]) {
+            char *name = names[nv];
+            char *value = values[nv];
+            size_t nl = (size_t)(colon - p);
+            size_t vl;
+            if (nl >= sizeof names[0]) nl = sizeof names[0] - 1;
+            memcpy(name, p, nl);
+            name[nl] = 0;
+            h2_lower(name);
+            const char *v = colon + 1;
+            while (v < eol && (*v == ' ' || *v == '\t')) v++;
+            vl = (size_t)(eol - v);
+            if (vl >= sizeof values[0]) vl = sizeof values[0] - 1;
+            memcpy(value, v, vl);
+            value[vl] = 0;
+
+            if (!strcmp(name, "content-length")) {
+                clen = atoll(value);
+            } else if (!strcmp(name, "transfer-encoding")) {
+                if (strcasestr(value, "chunked")) chunked = 1;
+            } else if (!strcmp(name, "connection") || !strcmp(name, "keep-alive") ||
+                       !strcmp(name, "proxy-connection") || !strcmp(name, "upgrade") ||
+                       !strcmp(name, "te") || !strcmp(name, "trailer") ||
+                       !strcmp(name, "transfer-encoding") || !strcmp(name, "content-length")) {
+                /* connection-specific: HTTP/2 has its own framing */
+            } else {
+                nva[nv] = (nghttp2_nv){(uint8_t *)name, (uint8_t *)value, strlen(name),
+                                       strlen(value), NGHTTP2_NV_FLAG_NONE};
+                nv++;
+            }
+        }
+        p = eol + 2;
+    }
+
+    st->is_head = !strcasecmp(st->method, "HEAD");
+    st->no_body = st->is_head || status == 204 || status == 304 || status < 200;
+
+    size_t after = (size_t)(st->head + st->head_len - (end + 4));
+    char *rest = end + 4;
+    if (st->no_body) {
+        st->out_eof = 1;
+        after = 0;
+    } else if (chunked) {
+        st->framing = 2;
+        st->ch_state = 0;
+    } else if (clen >= 0) {
+        st->framing = 1;
+        st->remaining = clen;
+        if (clen == 0) st->out_eof = 1;
+    } else {
+        st->framing = 0;             /* the handler's close is the delimiter */
+    }
+
+    nghttp2_data_provider dp;
+    memset(&dp, 0, sizeof dp);
+    dp.source.ptr = st;
+    dp.read_callback = h2_data_read;
+    if (st->no_body || (st->framing == 1 && st->remaining == 0))
+        nghttp2_submit_response(h->sess, st->id, nva, nv, NULL);
+    else
+        nghttp2_submit_response(h->sess, st->id, nva, nv, &dp);
+    st->headers_sent = 1;
+    st->head_len = 0;
+
+    if (after) {
+        /* the read that finished the head usually started the body too */
+        h2_stream_feed(h, st, (const unsigned char *)rest, after);
+    }
+}
+
+/* Decode the body half of one handler response. Chunked is de-framed here
+ * because HTTP/2 has no Transfer-Encoding: the relay in this file writes
+ * chunked to a plain socket, and a browser speaking h2 must not see it. */
+static void h2_body_append(h2_conn *h, h2_stream *st, const unsigned char *data, size_t len) {
+    (void)h;
+    if (!st->out_eof && h2_append(&st->out, &st->out_len, &st->out_cap, data, len) != 0)
+        st->out_eof = 1;
+}
+
+static void h2_stream_feed_body(h2_conn *h, h2_stream *st, const unsigned char *data, size_t len) {
+    while (len && !st->out_eof) {
+        if (st->framing == 0) {
+            h2_body_append(h, st, data, len);
+            len = 0;
+        } else if (st->framing == 1) {
+            size_t take = (size_t)st->remaining < len ? (size_t)st->remaining : len;
+            h2_body_append(h, st, data, take);
+            st->remaining -= (long long)take;
+            data += take;
+            len -= take;
+            if (st->remaining == 0) st->out_eof = 1;
+        } else {
+            switch (st->ch_state) {
+            case 0: /* chunk-size line */
+                while (len) {
+                    char ch = (char)*data++;
+                    len--;
+                    if (st->ch_line_len + 1 < sizeof st->ch_line)
+                        st->ch_line[st->ch_line_len++] = ch;
+                    if (ch == '\n') {
+                        char num[64];
+                        size_t n = st->ch_line_len;
+                        st->ch_line[n] = 0;
+                        while (n && (st->ch_line[n - 1] == '\r' || st->ch_line[n - 1] == '\n'))
+                            st->ch_line[--n] = 0;
+                        char *semi = strchr(st->ch_line, ';');
+                        if (semi) *semi = 0;
+                        snprintf(num, sizeof num, "%s", st->ch_line);
+                        long long sz = strtoll(num, NULL, 16);
+                        st->ch_line_len = 0;
+                        if (sz < 0) { st->out_eof = 1; len = 0; break; }
+                        if (sz == 0) {
+                            st->ch_state = 3;
+                        } else {
+                            st->ch_rem = sz;
+                            st->ch_state = 1;
+                        }
+                        break;
+                    }
+                }
+                break;
+            case 1: /* chunk payload */
+                if (st->ch_rem > 0) {
+                    size_t take = (size_t)st->ch_rem < len ? (size_t)st->ch_rem : len;
+                    h2_body_append(h, st, data, take);
+                    st->ch_rem -= (long long)take;
+                    data += take;
+                    len -= take;
+                }
+                if (st->ch_rem == 0) {
+                    st->ch_skip = 2;
+                    st->ch_state = 2;
+                }
+                break;
+            case 2: /* CRLF after a chunk */
+                while (len && st->ch_skip > 0) { data++; len--; st->ch_skip--; }
+                if (st->ch_skip == 0) st->ch_state = 0;
+                break;
+            default: /* trailers, then the empty line */
+                while (len) {
+                    char ch = (char)*data++;
+                    len--;
+                    if (st->ch_line_len + 1 < sizeof st->ch_line)
+                        st->ch_line[st->ch_line_len++] = ch;
+                    if (ch == '\n') {
+                        size_t n = st->ch_line_len;
+                        st->ch_line[n] = 0;
+                        if (n == 2 && st->ch_line[0] == '\r') { st->out_eof = 1; len = 0; }
+                        st->ch_line_len = 0;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    if (st->out_eof) nghttp2_session_resume_data(h->sess, st->id);
+    else if (st->out_len > st->out_off) nghttp2_session_resume_data(h->sess, st->id);
+}
+
+static void h2_stream_feed(h2_conn *h, h2_stream *st, const unsigned char *data, size_t len) {
+    if (!st || st->closed) return;
+    if (!st->headers_sent) {
+        if (h2_append(&st->head, &st->head_len, &st->head_cap, data, len) != 0) {
+            st->out_eof = 1;
+            return;
+        }
+        char *end = strstr(st->head, "\r\n\r\n");
+        if (end) {
+            h2_stream_parse_head(h, st);
+        } else if (st->head_len > H2_RESP_HEAD_MAX) {
+            /* a handler that never ends its headers: give the client a 502 */
+            st->head_len = 0;
+            const char *bad = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
+                              "Connection: close\r\n\r\n";
+            h2_stream_feed(h, st, (const unsigned char *)bad, strlen(bad));
+        }
+    } else {
+        h2_stream_feed_body(h, st, data, len);
+    }
+}
+
+static void h2_inject(h2_conn *h, h2_stream *st, int status, const char *ctype,
+                      const char *body) {
+    if (!st || st->closed || st->headers_sent) return;
+    char head[768];
+    size_t blen = body ? strlen(body) : 0;
+    int n = snprintf(head, sizeof head,
+                     "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+                     "Connection: close\r\n\r\n",
+                     status, reason_for(status), ctype ? ctype : "text/plain; charset=utf-8",
+                     blen);
+    if (n <= 0) return;
+    h2_stream_feed(h, st, (const unsigned char *)head, (size_t)n);
+    if (blen) h2_stream_feed(h, st, (const unsigned char *)body, blen);
+}
+
+static ssize_t h2_data_read(nghttp2_session *sess, int32_t id, uint8_t *buf, size_t length,
+                            uint32_t *flags, nghttp2_data_source *source, void *user_data) {
+    (void)sess; (void)source;
+    h2_conn *h = user_data;
+    h2_stream *st = h2_get(h, id);
+    if (!st) { *flags |= NGHTTP2_DATA_FLAG_EOF; return 0; }
+    size_t have = st->out_len - st->out_off;
+    if (have == 0) {
+        if (st->out_eof) { *flags |= NGHTTP2_DATA_FLAG_EOF; return 0; }
+        return NGHTTP2_ERR_DEFERRED;
+    }
+    size_t take = have < length ? have : length;
+    memcpy(buf, st->out + st->out_off, take);
+    st->out_off += take;
+    if (st->out_off == st->out_len) {
+        st->out_len = st->out_off = 0;
+        if (st->out_eof) *flags |= NGHTTP2_DATA_FLAG_EOF;
+    }
+    return (ssize_t)take;
+}
+
+static ssize_t h2_send_cb(nghttp2_session *sess, const uint8_t *data, size_t length,
+                          int flags, void *user_data) {
+    (void)sess; (void)flags;
+    h2_conn *h = user_data;
+    ssize_t w = conn_write(h->c, data, length);
+    if (w < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+            return NGHTTP2_ERR_WOULDBLOCK;
+        h->dead = 1;
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    return w;
+}
+
+static int h2_on_begin_headers(nghttp2_session *sess, const nghttp2_frame *frame,
+                               void *user_data) {
+    (void)sess;
+    h2_conn *h = user_data;
+    if (frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_REQUEST)
+        h2_add(h, frame->hd.stream_id);
+    return 0;
+}
+
+static int h2_on_header(nghttp2_session *sess, const nghttp2_frame *frame,
+                        const uint8_t *name, size_t namelen, const uint8_t *value,
+                        size_t valuelen, uint8_t flags, void *user_data) {
+    (void)sess; (void)frame; (void)flags;
+    h2_conn *h = user_data;
+    h2_stream *st = h2_get(h, frame->hd.stream_id);
+    if (!st) return 0;
+    if (namelen && name[0] == ':') {
+        if (namelen == 7 && !memcmp(name, ":method", 7)) {
+            size_t n = valuelen < sizeof st->method - 1 ? valuelen : sizeof st->method - 1;
+            memcpy(st->method, value, n);
+            st->method[n] = 0;
+        } else if (namelen == 5 && !memcmp(name, ":path", 5)) {
+            size_t n = valuelen < sizeof st->path - 1 ? valuelen : sizeof st->path - 1;
+            memcpy(st->path, value, n);
+            st->path[n] = 0;
+        } else if (namelen == 10 && !memcmp(name, ":authority", 10)) {
+            size_t n = valuelen < sizeof st->authority - 1 ? valuelen
+                                                           : sizeof st->authority - 1;
+            memcpy(st->authority, value, n);
+            st->authority[n] = 0;
+        }
+        return 0;
+    }
+    if (h2_append(&st->hdrs, &st->hdrs_len, &st->hdrs_cap, name, namelen) != 0 ||
+        h2_append(&st->hdrs, &st->hdrs_len, &st->hdrs_cap, ": ", 2) != 0 ||
+        h2_append(&st->hdrs, &st->hdrs_len, &st->hdrs_cap, value, valuelen) != 0 ||
+        h2_append(&st->hdrs, &st->hdrs_len, &st->hdrs_cap, "\r\n", 2) != 0) {
+        st->body_too_big = 1;       /* header memory: treat as unservable */
+    }
+    return 0;
+}
+
+static int h2_on_data(nghttp2_session *sess, uint8_t flags, int32_t stream_id,
+                      const uint8_t *data, size_t length, void *user_data) {
+    (void)sess; (void)flags;
+    h2_conn *h = user_data;
+    h2_stream *st = h2_get(h, stream_id);
+    if (!st) return 0;
+    if (st->body_len + length > MAX_BODY) {
+        st->body_too_big = 1;
+        return 0;
+    }
+    if (h2_append(&st->body, &st->body_len, &st->body_cap, data, length) != 0)
+        st->body_too_big = 1;
+    return 0;
+}
+
+static void *h2_job_main(void *arg) {
+    h2_job *j = arg;
+    conn cc = {.fd = j->fd, .ssl = NULL};
+    handle_parsed(&cc, j->req, j->ip);
+    free(j->req);
+    free(j->ip);
+    free(j);
+    return NULL;
+}
+
+static void h2_dispatch(h2_conn *h, h2_stream *st) {
+    if (!st || st->req_done || st->closed) return;
+    st->req_done = 1;
+    if (st->body_too_big) {
+        h2_inject(h, st, 413, NULL, "betterAnusbis: request too large\n");
+        return;
+    }
+    if (!st->method[0]) {
+        h2_inject(h, st, 400, NULL, "bad request\n");
+        return;
+    }
+    if (!strcasecmp(st->method, "CONNECT")) {
+        /* WebSocket over HTTP/2 (RFC 8441) is not implemented; an Upgrade
+         * cannot be carried by an ordinary request. */
+        h2_inject(h, st, 400, NULL, "betterAnusbis: extended CONNECT is not supported\n");
+        return;
+    }
+
+    request *rq = calloc(1, sizeof *rq);
+    if (!rq) { h2_inject(h, st, 500, NULL, "oom\n"); return; }
+    snprintf(rq->method, sizeof rq->method, "%s", st->method);
+    snprintf(rq->version, sizeof rq->version, "HTTP/2.0");
+    const char *path = st->path[0] ? st->path : "/";
+    const char *q = strchr(path, '?');
+    if (q) {
+        size_t n = (size_t)(q - path);
+        if (n >= sizeof rq->path) n = sizeof rq->path - 1;
+        memcpy(rq->path, path, n);
+        rq->path[n] = 0;
+        snprintf(rq->query, sizeof rq->query, "%s", q + 1);
+    } else {
+        snprintf(rq->path, sizeof rq->path, "%s", path);
+    }
+
+    /* Host is spelled :authority in HTTP/2 and the handler wants a header.
+     * If the client also sent host, keep it; otherwise synthesize one. */
+    int have_host = 0;
+    for (const char *p = st->hdrs; p && *p; ) {
+        const char *eol = strstr(p, "\r\n");
+        if (!eol) break;
+        if ((size_t)(eol - p) >= 5 && !strncasecmp(p, "host:", 5)) { have_host = 1; break; }
+        p = eol + 2;
+    }
+    size_t need = st->hdrs_len + strlen(st->authority) + 64;
+    rq->headers = malloc(need);
+    if (!rq->headers) {
+        free(rq);
+        h2_inject(h, st, 500, NULL, "oom\n");
+        return;
+    }
+    size_t o = 0;
+    if (!have_host && st->authority[0])
+        o += (size_t)snprintf(rq->headers + o, need - o, "Host: %s\r\n", st->authority);
+    if (st->hdrs_len) {
+        memcpy(rq->headers + o, st->hdrs, st->hdrs_len);
+        o += st->hdrs_len;
+    }
+    rq->headers[o] = 0;
+    rq->body = st->body;
+    rq->body_len = st->body_len;
+    st->body = NULL;
+    st->body_len = 0;
+
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) {
+        free(rq->headers);
+        free(rq);
+        h2_inject(h, st, 500, NULL, "socketpair\n");
+        return;
+    }
+    h2_job *job = calloc(1, sizeof *job);
+    if (!job) {
+        close(sp[0]); close(sp[1]);
+        free(rq->headers);
+        free(rq);
+        h2_inject(h, st, 500, NULL, "oom\n");
+        return;
+    }
+    job->fd = sp[1];
+    job->req = rq;
+    job->ip = strdup(h->peer);
+    st->rfd = sp[0];
+    st->dispatched = 1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, h2_job_main, job) == 0) {
+        pthread_detach(t);
+    } else {
+        close(sp[0]); close(sp[1]);
+        st->rfd = -1;
+        free(job->ip);
+        free(rq->headers);
+        free(rq);
+        free(job);
+        h2_inject(h, st, 500, NULL, "thread\n");
+    }
+}
+
+static int h2_on_frame(nghttp2_session *sess, const nghttp2_frame *frame, void *user_data) {
+    h2_conn *h = user_data;
+    h2_stream *st = h2_get(h, frame->hd.stream_id);
+    if (!st) return 0;
+    if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
+        (void)sess;
+        h2_dispatch(h, st);
+    }
+    return 0;
+}
+
+static int h2_on_close(nghttp2_session *sess, int32_t stream_id, uint32_t error_code,
+                       void *user_data) {
+    (void)sess; (void)error_code;
+    h2_conn *h = user_data;
+    h2_stream *st = h2_get(h, stream_id);
+    if (st) {
+        st->closed = 1;
+        st->req_done = 1;
+        if (st->rfd >= 0) { close(st->rfd); st->rfd = -1; }
+    }
+    return 0;
+}
+
+static int h2_is_prior_knowledge(int fd) {
+    char pre[24];
+    ssize_t n = recv(fd, pre, sizeof pre, MSG_PEEK);
+    return n == (ssize_t)sizeof pre && !memcmp(pre, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24);
+}
+
+/* One HTTP/2 connection. Only this thread touches the nghttp2 session and the
+ * socket; workers only write to their own socketpair. */
+static void h2_serve(conn *c, const char *peer_ip) {
+    h2_conn *h = calloc(1, sizeof *h);
+    if (!h) { close(c->fd); return; }
+    h->c = c;
+    snprintf(h->peer, sizeof h->peer, "%s", peer_ip ? peer_ip : "0.0.0.0");
+
+    nghttp2_session_callbacks *cbs = NULL;
+    if (nghttp2_session_callbacks_new(&cbs) != 0) {
+        free(h);
+        close(c->fd);
+        return;
+    }
+    nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, h2_on_begin_headers);
+    nghttp2_session_callbacks_set_on_header_callback(cbs, h2_on_header);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, h2_on_data);
+    nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, h2_on_frame);
+    nghttp2_session_callbacks_set_on_stream_close_callback(cbs, h2_on_close);
+    nghttp2_session_callbacks_set_send_callback(cbs, h2_send_cb);
+    /* nghttp2 copies what it needs, so the callbacks object can go right away */
+    int srv_rc = nghttp2_session_server_new(&h->sess, cbs, h);
+    nghttp2_session_callbacks_del(cbs);
+    if (srv_rc != 0) {
+        free(h);
+        close(c->fd);
+        return;
+    }
+
+    nghttp2_settings_entry iv[] = {
+        {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, H2_MAX_STREAMS},
+        {NGHTTP2_SETTINGS_ENABLE_PUSH, 0},
+    };
+    nghttp2_submit_settings(h->sess, NGHTTP2_FLAG_NONE, iv, sizeof iv / sizeof iv[0]);
+    nghttp2_session_send(h->sess);
+
+    unsigned char buf[16384];
+    while (!h->dead) {
+        struct pollfd pfds[1 + H2_MAX_STREAMS];
+        h2_stream *watch[H2_MAX_STREAMS];
+        int n = 0, nw = 0;
+        pfds[n].fd = c->fd;
+        pfds[n].events = POLLIN;
+        pfds[n].revents = 0;
+        n++;
+        for (size_t i = 0; i < h->nstreams; i++) {
+            h2_stream *st = h->streams[i];
+            if (st->rfd < 0 || st->closed) continue;
+            if (st->out_len - st->out_off >= H2_RESP_BUFFER_MAX) continue;
+            watch[nw] = st;
+            pfds[n].fd = st->rfd;
+            pfds[n].events = POLLIN;
+            pfds[n].revents = 0;
+            n++, nw++;
+        }
+        int pr = poll(pfds, (nfds_t)n, 60000);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) break;          /* idle HTTP/2 connection */
+
+        if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+            ssize_t r = conn_read(c, buf, sizeof buf);
+            if (r <= 0) break;
+            ssize_t used = nghttp2_session_mem_recv(h->sess, buf, (size_t)r);
+            if (used < 0) break;
+        }
+        for (int i = 0; i < nw; i++) {
+            h2_stream *st = watch[i];
+            if (st->rfd < 0 || st->closed) continue;
+            if (!(pfds[i + 1].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            unsigned char rbuf[16384];
+            ssize_t r = read(st->rfd, rbuf, sizeof rbuf);
+            if (r > 0) {
+                h2_stream_feed(h, st, rbuf, (size_t)r);
+            } else if (r == 0) {
+                st->rfd_eof = 1;
+                if (!st->headers_sent)
+                    h2_inject(h, st, 500, NULL, "betterAnusbis: no response\n");
+                if (st->framing == 0 || st->framing == 2) st->out_eof = 1;
+                else if (st->remaining > 0) st->out_eof = 1;
+                nghttp2_session_resume_data(h->sess, st->id);
+                close(st->rfd);
+                st->rfd = -1;
+            }
+        }
+        if (nghttp2_session_send(h->sess) != 0) break;
+
+        /* retire streams the session has finished with */
+        for (size_t i = 0; i < h->nstreams; ) {
+            if (h->streams[i]->closed) {
+                h2_stream_free(h->streams[i]);
+                h->streams[i] = h->streams[--h->nstreams];
+            } else {
+                i++;
+            }
+        }
+        int live = 0;
+        for (size_t i = 0; i < h->nstreams; i++)
+            if (h->streams[i]->rfd >= 0 || !h->streams[i]->out_eof) live = 1;
+        if (!nghttp2_session_want_read(h->sess) && !nghttp2_session_want_write(h->sess) && !live)
+            break;
+    }
+
+    for (size_t i = 0; i < h->nstreams; i++) h2_stream_free(h->streams[i]);
+    nghttp2_session_del(h->sess);
+    free(h);
+    close(c->fd);
+}
+
+
+/* --------------------------------------------------- HTTP/2 to the backend
+ *
+ * The origin hop is a synchronous h2 client: one request, one stream, the
+ * response streamed back into the ordinary HTTP/1.1 relay format (chunked),
+ * which the frontend (HTTP/1.1, HTTP/2 or HTTP/3) already knows how to carry.
+ * No multiplexing and no pooling here yet; the gate's own clients are the ones
+ * that benefit from multiplexing, and a pooled h2 connection is a much larger
+ * piece of state to own than a pooled h1 one.
+ */
+typedef struct {
+    conn *out;                  /* where the synthesized HTTP/1.1 response goes */
+    conn *up;                   /* the h2 origin connection */
+    request *req;
+    int32_t stream_id;
+    int status;
+    int head_emitted;
+    int done;
+    int failed;
+    int no_body;
+    int chunked_out;
+    int head_only;
+    char *hdrs;
+    size_t hdrs_len, hdrs_cap;
+} h2_up_ctx;
+
+typedef struct {
+    const char *data;
+    size_t len, off;
+} h2_up_body;
+
+static ssize_t h2_up_data_read(nghttp2_session *sess, int32_t stream_id, uint8_t *buf,
+                               size_t length, uint32_t *flags, nghttp2_data_source *source,
+                               void *user_data) {
+    (void)sess; (void)stream_id; (void)user_data;
+    h2_up_body *b = source->ptr;
+    size_t left = b->len - b->off;
+    if (left == 0) { *flags |= NGHTTP2_DATA_FLAG_EOF; return 0; }
+    size_t take = left < length ? left : length;
+    memcpy(buf, b->data + b->off, take);
+    b->off += take;
+    if (b->off == b->len) *flags |= NGHTTP2_DATA_FLAG_EOF;
+    return (ssize_t)take;
+}
+
+static void h2_up_write_out(h2_up_ctx *u, const void *data, size_t len) {
+    if (!u->failed && len && send_all(u->out, data, len) < 0) u->failed = 1;
+}
+
+static void h2_up_emit_head(h2_up_ctx *u) {
+    if (u->head_emitted || u->failed) return;
+    char head[512];
+    int n = snprintf(head, sizeof head, "HTTP/1.1 %d %s\r\n", u->status,
+                     reason_for(u->status));
+    h2_up_write_out(u, head, (size_t)n);
+    if (u->chunked_out) h2_up_write_out(u, "Transfer-Encoding: chunked\r\n", 28);
+    h2_up_write_out(u, "Connection: close\r\n", 19);
+    /* content-length and chunked cannot both be present */
+    const char *p = u->hdrs;
+    while (p && *p) {
+        const char *eol = strstr(p, "\r\n");
+        if (!eol) break;
+        size_t len = (size_t)(eol - p);
+        int skip = u->chunked_out && len >= 15 && !strncasecmp(p, "content-length:", 15);
+        if (!skip) h2_up_write_out(u, p, len + 2);
+        p = eol + 2;
+    }
+    h2_up_write_out(u, "\r\n", 2);
+    u->head_emitted = 1;
+}
+
+static int h2_up_on_header(nghttp2_session *sess, const nghttp2_frame *frame,
+                           const uint8_t *name, size_t namelen, const uint8_t *value,
+                           size_t valuelen, uint8_t flags, void *user_data) {
+    (void)sess; (void)flags;
+    h2_up_ctx *u = user_data;
+    if (frame->hd.type != NGHTTP2_HEADERS || frame->hd.stream_id != u->stream_id) return 0;
+    if (namelen && name[0] == ':') {
+        if (namelen == 7 && !memcmp(name, ":status", 7)) {
+            char s[8];
+            size_t n = valuelen < sizeof s - 1 ? valuelen : sizeof s - 1;
+            memcpy(s, value, n);
+            s[n] = 0;
+            u->status = atoi(s);
+        }
+        return 0;
+    }
+    /* Hop-by-hop fields do not survive the tunnel. content-length is dropped
+     * when we re-frame as chunked, kept when the body is empty. */
+    if ((namelen == 10 && !strncasecmp((const char *)name, "connection", 10)) ||
+        (namelen == 10 && !strncasecmp((const char *)name, "keep-alive", 10)) ||
+        (namelen == 17 && !strncasecmp((const char *)name, "transfer-encoding", 17)) ||
+        (namelen == 16 && !strncasecmp((const char *)name, "proxy-connection", 16)) ||
+        (namelen == 7 && !strncasecmp((const char *)name, "upgrade", 7)) ||
+        (namelen == 2 && !strncasecmp((const char *)name, "te", 2)) ||
+        (namelen == 7 && !strncasecmp((const char *)name, "trailer", 7)))
+        return 0;
+    if (h2_append(&u->hdrs, &u->hdrs_len, &u->hdrs_cap, name, namelen) != 0 ||
+        h2_append(&u->hdrs, &u->hdrs_len, &u->hdrs_cap, ": ", 2) != 0 ||
+        h2_append(&u->hdrs, &u->hdrs_len, &u->hdrs_cap, value, valuelen) != 0 ||
+        h2_append(&u->hdrs, &u->hdrs_len, &u->hdrs_cap, "\r\n", 2) != 0)
+        u->failed = 1;
+    return 0;
+}
+
+static int h2_up_on_data(nghttp2_session *sess, uint8_t flags, int32_t stream_id,
+                         const uint8_t *data, size_t length, void *user_data) {
+    (void)sess; (void)flags;
+    h2_up_ctx *u = user_data;
+    if (stream_id != u->stream_id || u->failed) return 0;
+    if (u->no_body) return 0;
+    char ch[40];
+    int n = snprintf(ch, sizeof ch, "%zx\r\n", length);
+    h2_up_write_out(u, ch, (size_t)n);
+    h2_up_write_out(u, data, length);
+    h2_up_write_out(u, "\r\n", 2);
+    return 0;
+}
+
+static int h2_up_on_frame(nghttp2_session *sess, const nghttp2_frame *frame, void *user_data) {
+    (void)sess;
+    h2_up_ctx *u = user_data;
+    if (frame->hd.stream_id != u->stream_id) return 0;
+    if (frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_RESPONSE) {
+        u->no_body = !strcasecmp(u->req->method, "HEAD") || u->status == 204 ||
+                     u->status == 304 || u->status < 200;
+        u->chunked_out = !u->no_body;
+        if (!u->head_emitted) h2_up_emit_head(u);
+    }
+    if (frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA) {
+        if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) u->done = 1;
+    }
+    return 0;
+}
+
+static int h2_up_on_close(nghttp2_session *sess, int32_t stream_id, uint32_t error_code,
+                          void *user_data) {
+    (void)sess;
+    h2_up_ctx *u = user_data;
+    if (stream_id == u->stream_id) {
+        if (error_code != 0 || !u->head_emitted) u->failed = 1;
+        u->done = 1;
+    }
+    return 0;
+}
+
+static ssize_t h2_up_send(nghttp2_session *sess, const uint8_t *data, size_t length,
+                          int flags, void *user_data) {
+    (void)sess; (void)flags;
+    h2_up_ctx *u = user_data;
+    ssize_t w = send_all(u->up, data, length);
+    return w < 0 ? NGHTTP2_ERR_CALLBACK_FAILURE : w;
+}
+
+/* Connect with h2 offered. Returns 1 when the origin selected h2, 0 when it
+ * selected something else (the caller then does a fresh HTTP/1.1 connection),
+ * and -1 after writing a 502 itself. */
+static int target_connect_h2(conn *up) {
+    if (!cfg.target_tls) return 0;
+    int fd = connect_target();
+    if (fd < 0) return 0;
+    static SSL_CTX *h2_client_ctx;
+    if (!h2_client_ctx) {
+        h2_client_ctx = SSL_CTX_new(TLS_client_method());
+        if (!h2_client_ctx) { close(fd); return 0; }
+        SSL_CTX_set_min_proto_version(h2_client_ctx, TLS1_2_VERSION);
+        if (cfg.target_insecure) SSL_CTX_set_verify(h2_client_ctx, SSL_VERIFY_NONE, NULL);
+        else {
+            SSL_CTX_set_verify(h2_client_ctx, SSL_VERIFY_PEER, NULL);
+            SSL_CTX_set_default_verify_paths(h2_client_ctx);
+        }
+    }
+    SSL *ssl = SSL_new(h2_client_ctx);
+    if (!ssl) { close(fd); return 0; }
+    SSL_set_fd(ssl, fd);
+    static const unsigned char protos[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    SSL_set_alpn_protos(ssl, protos, sizeof protos);
+    const char *sni = cfg.target_sni && *cfg.target_sni ? cfg.target_sni : cfg.target_host;
+    if (!strcasecmp(sni, "auto")) sni = cfg.target_host;
+    if (strcmp(sni, "0.0.0.0") != 0) SSL_set_tlsext_host_name(ssl, sni);
+    if (SSL_connect(ssl) != 1) {
+        SSL_free(ssl);
+        close(fd);
+        return 0;
+    }
+    if (!cfg.target_insecure && SSL_get_verify_result(ssl) != X509_V_OK) {
+        logmsg("target certificate did not verify: %s",
+               X509_verify_cert_error_string(SSL_get_verify_result(ssl)));
+        SSL_free(ssl);
+        close(fd);
+        return 0;
+    }
+    const unsigned char *proto = NULL;
+    unsigned int plen = 0;
+    SSL_get0_alpn_selected(ssl, &proto, &plen);
+    if (plen != 2 || !proto || memcmp(proto, "h2", 2) != 0) {
+        SSL_free(ssl);
+        close(fd);
+        return 0;
+    }
+    up->fd = fd;
+    up->ssl = ssl;
+    return 1;
+}
+
+/* Returns 1 when it handled the request, 0 when the backend did not select h2
+ * and the ordinary HTTP/1.1 path should run. */
+static int proxy_request_h2(conn *c, const request *req, const char *client_ip,
+                            const char *path) {
+    conn up_c = {.fd = -1, .ssl = NULL};
+    int rc = target_connect_h2(&up_c);
+    if (rc == 0) return 0;
+    if (rc < 0) return 1;
+
+    h2_up_ctx u;
+    memset(&u, 0, sizeof u);
+    u.out = c;
+    u.up = &up_c;
+    u.req = (request *)req;
+    u.status = 0;
+    u.head_only = !strcasecmp(req->method, "HEAD");
+
+    nghttp2_session_callbacks *cbs = NULL;
+    nghttp2_session *sess = NULL;
+    if (nghttp2_session_callbacks_new(&cbs) != 0) {
+        up_close(&up_c);
+        return 0;
+    }
+    nghttp2_session_callbacks_set_on_header_callback(cbs, h2_up_on_header);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, h2_up_on_data);
+    nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, h2_up_on_frame);
+    nghttp2_session_callbacks_set_on_stream_close_callback(cbs, h2_up_on_close);
+    nghttp2_session_callbacks_set_send_callback(cbs, h2_up_send);
+    int sr = nghttp2_session_client_new(&sess, cbs, &u);
+    nghttp2_session_callbacks_del(cbs);
+    if (sr != 0) {
+        up_close(&up_c);
+        return 0;
+    }
+
+    nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_ENABLE_PUSH, 0}};
+    nghttp2_submit_settings(sess, NGHTTP2_FLAG_NONE, iv, sizeof iv / sizeof iv[0]);
+
+    /* request headers: same forwarding rules as the HTTP/1.1 path */
+    const char *host_hdr = cfg.target_host_hdr && *cfg.target_host_hdr
+                               ? cfg.target_host_hdr : cfg.target_host;
+    char pathbuf[8192];
+    if (req->query[0])
+        snprintf(pathbuf, sizeof pathbuf, "%s?%s", path, req->query);
+    else
+        snprintf(pathbuf, sizeof pathbuf, "%s", path);
+    char methodbuf[16];
+    snprintf(methodbuf, sizeof methodbuf, "%s", req->method);
+
+    nghttp2_nv nva[96];
+    char names[96][96];
+    char values[96][1024];
+    size_t nv = 0;
+#define H2UP_NV(N, V) do { \
+        snprintf(names[nv], sizeof names[nv], "%s", (N)); \
+        snprintf(values[nv], sizeof values[nv], "%s", (V)); \
+        nva[nv] = (nghttp2_nv){(uint8_t *)names[nv], (uint8_t *)values[nv], \
+                               strlen(names[nv]), strlen(values[nv]), NGHTTP2_NV_FLAG_NONE}; \
+        nv++; \
+    } while (0)
+    H2UP_NV(":method", methodbuf);
+    H2UP_NV(":path", pathbuf);
+    H2UP_NV(":scheme", "https");
+    H2UP_NV(":authority", host_hdr);
+    const char *p = req->headers;
+    while (p && *p && nv < sizeof nva / sizeof nva[0]) {
+        const char *eol = strstr(p, "\r\n");
+        if (!eol) break;
+        size_t n = (size_t)(eol - p);
+        char line[1200];
+        if (n > 0 && n < sizeof line) {
+            memcpy(line, p, n);
+            line[n] = 0;
+            char *colon = strchr(line, ':');
+            if (colon && colon > line) {
+                *colon = 0;
+                char *val = colon + 1;
+                while (*val == ' ' || *val == '\t') val++;
+                if (strcasecmp(line, "host") && strcasecmp(line, "connection") &&
+                    strcasecmp(line, "keep-alive") && strcasecmp(line, "proxy-connection") &&
+                    strcasecmp(line, "upgrade") && strcasecmp(line, "te") &&
+                    strcasecmp(line, "trailer") && strcasecmp(line, "transfer-encoding") &&
+                    strcasecmp(line, "content-length"))
+                    H2UP_NV(line, val);
+            }
+        }
+        p = eol + 2;
+    }
+    H2UP_NV("x-real-ip", client_ip);
+    H2UP_NV("x-forwarded-for", client_ip);
+    if (req->body_len) {
+        char clbuf[32];
+        snprintf(clbuf, sizeof clbuf, "%zu", req->body_len);
+        H2UP_NV("content-length", clbuf);
+    }
+#undef H2UP_NV
+
+    h2_up_body body = {.data = req->body, .len = req->body_len, .off = 0};
+    nghttp2_data_provider dp;
+    memset(&dp, 0, sizeof dp);
+    dp.source.ptr = &body;
+    dp.read_callback = h2_up_data_read;
+    int32_t id = nghttp2_submit_request(sess, NULL, nva, nv,
+                                        req->body_len ? &dp : NULL, NULL);
+    if (id < 0) {
+        nghttp2_session_del(sess);
+        up_close(&up_c);
+        return 0;
+    }
+    u.stream_id = id;
+
+    struct timeval tv = {.tv_sec = 60, .tv_usec = 0};
+    setsockopt(up_c.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    unsigned char buf[16384];
+    while (!u.done && !u.failed) {
+        if (nghttp2_session_send(sess) != 0) { u.failed = 1; break; }
+        ssize_t n = conn_read(&up_c, buf, sizeof buf);
+        if (n <= 0) { u.failed = 1; break; }
+        ssize_t used = nghttp2_session_mem_recv(sess, buf, (size_t)n);
+        if (used < 0) { u.failed = 1; break; }
+    }
+    nghttp2_session_send(sess);
+    if (!u.head_emitted) {
+        u.failed = 1;
+    }
+    if (u.chunked_out && !u.failed) h2_up_write_out(&u, "0\r\n\r\n", 5);
+    nghttp2_session_del(sess);
+    up_close(&up_c);
+    free(u.hdrs);
+    if (u.failed && !u.head_emitted) {
+        const char *msg = "betterAnusbis: the target closed without answering\n";
+        respond(c, 502, "Bad Gateway", NULL, NULL, msg, strlen(msg));
+    }
+    return 1;
+}
+
+#endif /* HAVE_NGHTTP2 */
+
+
+
+/* --------------------------------------------------------------- HTTP/3
+ *
+ * QUIC from OpenSSL 3.5, HTTP/3 framing and QPACK from nghttp3. The structure
+ * mirrors the HTTP/2 frontend: the QUIC event loop owns every nghttp3 object
+ * and the UDP socket, and a completed request is handed to an ordinary worker
+ * thread over a socketpair. The worker writes HTTP/1.1; this loop parses it and
+ * turns it into HEADERS plus DATA. Nothing in the gate below this comment
+ * knows which protocol it is answering.
+ *
+ * Deliberate limits, all visible in this file: one thread for all QUIC
+ * connections, 64 connections and 64 streams per connection, a 20 ms tick
+ * (QUIC needs SSL_handle_events anyway, and the handler's socketpair is read on
+ * that tick), QPACK with a zero-sized dynamic table for maximum interop, and no
+ * 0-RTT. HTTP/3 is opt-in with --http3 and never touches a plain listener.
+ */
+#ifdef HAVE_NGHTTP3
+
+#define H3_MAX_CONNS        64
+#define H3_MAX_STREAMS      64
+#define H3_RBUF_SIZE        (64u << 10)
+#define H3_RESP_HEAD_MAX    (64u << 10)
+#define H3_RESP_BUFFER_MAX  (1u << 20)
+#define H3_TICK_US          20000
+
+typedef struct h3_stream h3_stream;
+typedef struct h3_conn h3_conn;
+
+struct h3_stream {
+    h3_conn *c;
+    SSL *ssl;                   /* the QUIC stream SSL object */
+    int64_t id;
+    int is_uni;
+    int dead;                   /* free at reap time */
+    int closed_by_h3;
+    int fin_sent;
+    int blocked;
+
+    /* request */
+    int headers_done;
+    int req_fin;
+    int got_fin;
+    int too_large;
+    int dispatched;
+    char method[16];
+    char path[4096];
+    char query[4096];
+    char authority[512];
+    char *hdrs;
+    size_t hdrs_len, hdrs_cap;
+    char *body;
+    size_t body_len, body_cap;
+
+    /* response, parsed from the worker's HTTP/1.1 */
+    int rfd;
+    int headers_sent;
+    char *head;
+    size_t head_len, head_cap;
+    char *out;
+    size_t out_len, out_off, out_cap;
+    int out_eof;
+    int want_resume;
+    int framing;
+    long long remaining;
+    int ch_state;
+    long long ch_rem;
+    int ch_skip;
+    char ch_line[256];
+    size_t ch_line_len;
+    int no_body;
+    int is_head;
+};
+
+struct h3_conn {
+    SSL *ssl;
+    nghttp3_conn *h3;
+    int uni_created;
+    SSL *uni_ctl, *uni_enc, *uni_dec;
+    int closing;
+    int dead;
+    h3_stream *streams[H3_MAX_STREAMS];
+    size_t app_bytes;
+    char peer[64];
+};
+
+typedef struct {
+    int fd;
+    request *req;
+    char *ip;
+} h3_job;
+
+static SSL_CTX *h3_ctx;
+static SSL *h3_listener;
+static int h3_udp_fd = -1;
+static h3_conn *h3_conns[H3_MAX_CONNS];
+static size_t h3_nconns;
+
+static h3_stream *h3_get(h3_conn *c, int64_t id) {
+    for (size_t i = 0; i < H3_MAX_STREAMS; i++)
+        if (c->streams[i] && !c->streams[i]->dead && c->streams[i]->id == id)
+            return c->streams[i];
+    return NULL;
+}
+
+static h3_stream *h3_add(h3_conn *c, SSL *ssl, int64_t id, int is_uni) {
+    for (size_t i = 0; i < H3_MAX_STREAMS; i++) {
+        if (!c->streams[i]) {
+            h3_stream *st = calloc(1, sizeof *st);
+            if (!st) return NULL;
+            st->c = c;
+            st->ssl = ssl;
+            st->id = id;
+            st->is_uni = is_uni;
+            st->rfd = -1;
+            c->streams[i] = st;
+            return st;
+        }
+    }
+    return NULL;
+}
+
+static void h3_stream_free(h3_stream *st) {
+    if (!st) return;
+    if (st->rfd >= 0) close(st->rfd);
+    if (st->ssl) SSL_free(st->ssl);
+    free(st->hdrs);
+    free(st->body);
+    free(st->head);
+    free(st->out);
+    free(st);
+}
+
+static void h3_conn_close(h3_conn *c, const char *why) {
+    if (c->dead) return;
+    if (cfg.verbose && why) logmsg("http3: closing a connection: %s", why);
+    c->dead = 1;
+}
+
+/* Best effort client address for a QUIC connection. OpenSSL 3.5 does not
+ * expose a peer-address getter for a connection SSL, so this asks the
+ * connection BIO; when that is unavailable the address is left unspecified
+ * rather than invented. */
+static void h3_peer_ip(const h3_conn *c, char *out, size_t cap) {
+    snprintf(out, cap, "0.0.0.0");
+    if (!c->ssl) return;
+    BIO *b = SSL_get_rbio(c->ssl);
+    if (!b) return;
+    const BIO_ADDR *pa = BIO_get_conn_address(b);
+    BIO_ADDR *made = NULL;
+    if (!pa) {
+        made = BIO_ADDR_new();
+        if (!made) return;
+        if (BIO_dgram_get_peer(b, made) <= 0) { BIO_ADDR_free(made); return; }
+        pa = made;
+    }
+    char *s = BIO_ADDR_hostname_string(pa, 1);
+    if (s) {
+        snprintf(out, cap, "%s", s);
+        OPENSSL_free(s);
+    }
+    if (made) BIO_ADDR_free(made);
+}
+
+/* Reuse the HTTP/2 response parser's rules; the bytes are the same HTTP/1.1
+ * a worker writes, only the sink differs (nghttp3 vectors instead of a
+ * nghttp2 data provider). */
+static void h3_append_bytes(char **buf, size_t *len, size_t *cap, const void *data,
+                            size_t n) {
+    if (*len + n + 1 > *cap) {
+        size_t want = *cap ? *cap : 256;
+        while (want < *len + n + 1) want *= 2;
+        char *nb = realloc(*buf, want);
+        if (!nb) return;
+        *buf = nb;
+        *cap = want;
+    }
+    memcpy(*buf + *len, data, n);
+    *len += n;
+    (*buf)[*len] = 0;
+}
+
+static char *h3_lower(char *s) {
+    for (char *p = s; *p; p++) *p = (char)tolower((unsigned char)*p);
+    return s;
+}
+
+static void h3_feed_body(h3_stream *st, const unsigned char *data, size_t len);
+
+static void h3_result_append(h3_stream *st, const unsigned char *data, size_t len) {
+    h3_append_bytes(&st->out, &st->out_len, &st->out_cap, data, len);
+}
+
+static nghttp3_ssize h3_read_data(nghttp3_conn *h3, int64_t sid, nghttp3_vec *vec,
+                                  size_t veccnt, uint32_t *pflags, void *cud, void *sud) {
+    (void)h3; (void)sud;
+    h3_conn *c = cud;
+    h3_stream *st = h3_get(c, sid);
+    if (!st || veccnt == 0) return NGHTTP3_ERR_WOULDBLOCK;
+    size_t have = st->out_len - st->out_off;
+    if (have == 0) {
+        if (st->out_eof) { *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
+        st->want_resume = 1;
+        return NGHTTP3_ERR_WOULDBLOCK;
+    }
+    size_t take = have < H3_RESP_BUFFER_MAX ? have : H3_RESP_BUFFER_MAX;
+    vec[0].base = (uint8_t *)st->out + st->out_off;
+    vec[0].len = take;
+    st->out_off += take;
+    if (st->out_off == st->out_len) {
+        st->out_len = st->out_off = 0;
+        if (st->out_eof) *pflags |= NGHTTP3_DATA_FLAG_EOF;
+    }
+    return 1;
+}
+
+static void h3_submit_head(h3_stream *st) {
+    char statusbuf[8];
+    nghttp3_nv nva[64];
+    char names[64][96];
+    char values[64][1024];
+    size_t nv = 0;
+    char *end = strstr(st->head, "\r\n\r\n");
+    int status = 0;
+
+    if (!end) return;
+    if (!strncmp(st->head, "HTTP/1.", 7)) status = atoi(st->head + 9);
+    if (status < 100 || status > 599) status = 502;
+    snprintf(statusbuf, sizeof statusbuf, "%d", status);
+    nva[nv++] = (nghttp3_nv){(uint8_t *)":status", (uint8_t *)statusbuf,
+                             sizeof(":status") - 1, strlen(statusbuf),
+                             NGHTTP3_NV_FLAG_NONE};
+
+    int chunked = 0;
+    long long clen = -1;
+    char *p = strstr(st->head, "\r\n");
+    p = p ? p + 2 : st->head;
+    while (p < end) {
+        char *eol = strstr(p, "\r\n");
+        if (!eol || eol > end) break;
+        char *colon = memchr(p, ':', (size_t)(eol - p));
+        if (colon && colon > p && nv < sizeof nva / sizeof nva[0]) {
+            char *name = names[nv];
+            char *value = values[nv];
+            size_t nl = (size_t)(colon - p);
+            size_t vl;
+            if (nl >= sizeof names[0]) nl = sizeof names[0] - 1;
+            memcpy(name, p, nl);
+            name[nl] = 0;
+            h3_lower(name);
+            const char *v = colon + 1;
+            while (v < eol && (*v == ' ' || *v == '\t')) v++;
+            vl = (size_t)(eol - v);
+            if (vl >= sizeof values[0]) vl = sizeof values[0] - 1;
+            memcpy(value, v, vl);
+            value[vl] = 0;
+
+            if (!strcmp(name, "content-length")) {
+                clen = atoll(value);
+            } else if (!strcmp(name, "transfer-encoding")) {
+                if (strcasestr(value, "chunked")) chunked = 1;
+            } else if (!strcmp(name, "connection") || !strcmp(name, "keep-alive") ||
+                       !strcmp(name, "proxy-connection") || !strcmp(name, "upgrade") ||
+                       !strcmp(name, "te") || !strcmp(name, "trailer") ||
+                       !strcmp(name, "transfer-encoding") || !strcmp(name, "content-length")) {
+                /* HTTP/2 and HTTP/3 have their own framing */
+            } else {
+                nva[nv] = (nghttp3_nv){(uint8_t *)name, (uint8_t *)value, strlen(name),
+                                       strlen(value), NGHTTP3_NV_FLAG_NONE};
+                nv++;
+            }
+        }
+        p = eol + 2;
+    }
+
+    st->is_head = !strcasecmp(st->method, "HEAD");
+    st->no_body = st->is_head || status == 204 || status == 304 || status < 200;
+    size_t after = (size_t)(st->head + st->head_len - (end + 4));
+    char *rest = end + 4;
+    if (st->no_body) {
+        st->out_eof = 1;
+        after = 0;
+    } else if (chunked) {
+        st->framing = 2;
+        st->ch_state = 0;
+    } else if (clen >= 0) {
+        st->framing = 1;
+        st->remaining = clen;
+        if (clen == 0) st->out_eof = 1;
+    } else {
+        st->framing = 0;
+    }
+
+    nghttp3_data_reader dr;
+    memset(&dr, 0, sizeof dr);
+    dr.read_data = h3_read_data;
+    int body = !st->no_body && !(st->framing == 1 && st->remaining == 0);
+    int rc = nghttp3_conn_submit_response(st->c->h3, st->id, nva, nv, body ? &dr : NULL);
+    if (rc < 0) h3_conn_close(st->c, "nghttp3_conn_submit_response");
+    st->headers_sent = 1;
+    st->head_len = 0;
+    if (after) h3_feed_body(st, (const unsigned char *)rest, after);
+}
+
+static void h3_feed_body(h3_stream *st, const unsigned char *data, size_t len) {
+    while (len && !st->out_eof) {
+        if (st->framing == 0) {
+            h3_result_append(st, data, len);
+            len = 0;
+        } else if (st->framing == 1) {
+            size_t take = (size_t)st->remaining < len ? (size_t)st->remaining : len;
+            h3_result_append(st, data, take);
+            st->remaining -= (long long)take;
+            data += take;
+            len -= take;
+            if (st->remaining == 0) st->out_eof = 1;
+        } else {
+            switch (st->ch_state) {
+            case 0:
+                while (len) {
+                    char ch = (char)*data++;
+                    len--;
+                    if (st->ch_line_len + 1 < sizeof st->ch_line)
+                        st->ch_line[st->ch_line_len++] = ch;
+                    if (ch == '\n') {
+                        size_t n = st->ch_line_len;
+                        st->ch_line[n] = 0;
+                        while (n && (st->ch_line[n - 1] == '\r' || st->ch_line[n - 1] == '\n'))
+                            st->ch_line[--n] = 0;
+                        char *semi = strchr(st->ch_line, ';');
+                        if (semi) *semi = 0;
+                        long long sz = strtoll(st->ch_line, NULL, 16);
+                        st->ch_line_len = 0;
+                        if (sz < 0) { st->out_eof = 1; len = 0; break; }
+                        if (sz == 0) st->ch_state = 3;
+                        else { st->ch_rem = sz; st->ch_state = 1; }
+                        break;
+                    }
+                }
+                break;
+            case 1:
+                if (st->ch_rem > 0) {
+                    size_t take = (size_t)st->ch_rem < len ? (size_t)st->ch_rem : len;
+                    h3_result_append(st, data, take);
+                    st->ch_rem -= (long long)take;
+                    data += take;
+                    len -= take;
+                }
+                if (st->ch_rem == 0) { st->ch_skip = 2; st->ch_state = 2; }
+                break;
+            case 2:
+                while (len && st->ch_skip > 0) { data++; len--; st->ch_skip--; }
+                if (st->ch_skip == 0) st->ch_state = 0;
+                break;
+            default:
+                while (len) {
+                    char ch = (char)*data++;
+                    len--;
+                    if (st->ch_line_len + 1 < sizeof st->ch_line)
+                        st->ch_line[st->ch_line_len++] = ch;
+                    if (ch == '\n') {
+                        size_t n = st->ch_line_len;
+                        st->ch_line[n] = 0;
+                        if (n == 2 && st->ch_line[0] == '\r') { st->out_eof = 1; len = 0; }
+                        st->ch_line_len = 0;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    if (st->want_resume && (st->out_eof || st->out_len > st->out_off)) {
+        st->want_resume = 0;
+        nghttp3_conn_resume_stream(st->c->h3, st->id);
+    }
+}
+
+static void h3_feed(h3_stream *st, const unsigned char *data, size_t len) {
+    if (!st || st->dead) return;
+    if (!st->headers_sent) {
+        h3_append_bytes(&st->head, &st->head_len, &st->head_cap, data, len);
+        char *end = strstr(st->head, "\r\n\r\n");
+        if (end) {
+            h3_submit_head(st);
+        } else if (st->head_len > H3_RESP_HEAD_MAX) {
+            const char *bad = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
+                              "Connection: close\r\n\r\n";
+            st->head_len = 0;
+            h3_feed(st, (const unsigned char *)bad, strlen(bad));
+        }
+    } else {
+        h3_feed_body(st, data, len);
+    }
+}
+
+static void h3_inject(h3_stream *st, int status, const char *ctype, const char *body) {
+    if (!st || st->dead || st->headers_sent) return;
+    char head[768];
+    size_t blen = body ? strlen(body) : 0;
+    int n = snprintf(head, sizeof head,
+                     "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+                     "Connection: close\r\n\r\n",
+                     status, reason_for(status),
+                     ctype ? ctype : "text/plain; charset=utf-8", blen);
+    if (n > 0) h3_feed(st, (const unsigned char *)head, (size_t)n);
+    if (blen) h3_feed(st, (const unsigned char *)body, blen);
+}
+
+static void *h3_job_main(void *arg) {
+    h3_job *j = arg;
+    conn cc = {.fd = j->fd, .ssl = NULL};
+    handle_parsed(&cc, j->req, j->ip);
+    free(j->req);
+    free(j->ip);
+    free(j);
+    return NULL;
+}
+
+static void h3_dispatch(h3_stream *st) {
+    if (!st || st->req_fin == 0 || st->dispatched || st->dead) return;
+    st->dispatched = 1;
+    if (st->too_large) {
+        h3_inject(st, 413, NULL, "betterAnusbis: request too large\n");
+        return;
+    }
+    if (!st->method[0] || !strcasecmp(st->method, "CONNECT")) {
+        h3_inject(st, 400, NULL, "betterAnusbis: extended CONNECT is not supported\n");
+        return;
+    }
+    request *rq = calloc(1, sizeof *rq);
+    if (!rq) { h3_inject(st, 500, NULL, "oom\n"); return; }
+    snprintf(rq->method, sizeof rq->method, "%s", st->method);
+    snprintf(rq->version, sizeof rq->version, "HTTP/3.0");
+    const char *path = st->path[0] ? st->path : "/";
+    const char *q = strchr(path, '?');
+    if (q) {
+        size_t n = (size_t)(q - path);
+        if (n >= sizeof rq->path) n = sizeof rq->path - 1;
+        memcpy(rq->path, path, n);
+        rq->path[n] = 0;
+        snprintf(rq->query, sizeof rq->query, "%s", q + 1);
+    } else {
+        snprintf(rq->path, sizeof rq->path, "%s", path);
+    }
+
+    int have_host = 0;
+    for (const char *p = st->hdrs; p && *p; ) {
+        const char *eol = strstr(p, "\r\n");
+        if (!eol) break;
+        if ((size_t)(eol - p) >= 5 && !strncasecmp(p, "host:", 5)) { have_host = 1; break; }
+        p = eol + 2;
+    }
+    size_t need = st->hdrs_len + strlen(st->authority) + 64;
+    rq->headers = malloc(need);
+    if (!rq->headers) { free(rq); h3_inject(st, 500, NULL, "oom\n"); return; }
+    size_t o = 0;
+    if (!have_host && st->authority[0])
+        o += (size_t)snprintf(rq->headers + o, need - o, "Host: %s\r\n", st->authority);
+    if (st->hdrs_len) {
+        memcpy(rq->headers + o, st->hdrs, st->hdrs_len);
+        o += st->hdrs_len;
+    }
+    rq->headers[o] = 0;
+    rq->body = st->body;
+    rq->body_len = st->body_len;
+    st->body = NULL;
+    st->body_len = 0;
+
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) {
+        free(rq->headers);
+        free(rq);
+        h3_inject(st, 500, NULL, "socketpair\n");
+        return;
+    }
+    h3_job *job = calloc(1, sizeof *job);
+    char ip[64];
+    h3_peer_ip(st->c, ip, sizeof ip);
+    if (!job) {
+        close(sp[0]); close(sp[1]);
+        free(rq->headers);
+        free(rq);
+        h3_inject(st, 500, NULL, "oom\n");
+        return;
+    }
+    job->fd = sp[1];
+    job->req = rq;
+    job->ip = strdup(ip);
+    st->rfd = sp[0];
+    int fl = fcntl(st->rfd, F_GETFL, 0);
+    if (fl >= 0) fcntl(st->rfd, F_SETFL, fl | O_NONBLOCK);
+    pthread_t t;
+    if (pthread_create(&t, NULL, h3_job_main, job) == 0) {
+        pthread_detach(t);
+    } else {
+        close(sp[0]); close(sp[1]);
+        st->rfd = -1;
+        free(job->ip);
+        free(rq->headers);
+        free(rq);
+        free(job);
+        h3_inject(st, 500, NULL, "thread\n");
+    }
+}
+
+static int h3_cb_header(nghttp3_conn *h3, int64_t sid, int32_t token,
+                        nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
+                        void *cud, void *sud) {
+    (void)h3; (void)token; (void)flags; (void)sud;
+    h3_conn *c = cud;
+    h3_stream *st = h3_get(c, sid);
+    if (!st) return 0;
+    nghttp3_vec n = nghttp3_rcbuf_get_buf(name);
+    nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
+    if (n.len && n.base[0] == ':') {
+        if (n.len == 7 && !memcmp(n.base, ":method", 7)) {
+            size_t k = v.len < sizeof st->method - 1 ? v.len : sizeof st->method - 1;
+            memcpy(st->method, v.base, k);
+            st->method[k] = 0;
+        } else if (n.len == 5 && !memcmp(n.base, ":path", 5)) {
+            size_t k = v.len < sizeof st->path - 1 ? v.len : sizeof st->path - 1;
+            memcpy(st->path, v.base, k);
+            st->path[k] = 0;
+        } else if (n.len == 10 && !memcmp(n.base, ":authority", 10)) {
+            size_t k = v.len < sizeof st->authority - 1 ? v.len : sizeof st->authority - 1;
+            memcpy(st->authority, v.base, k);
+            st->authority[k] = 0;
+        }
+        return 0;
+    }
+    h3_append_bytes(&st->hdrs, &st->hdrs_len, &st->hdrs_cap, n.base, n.len);
+    h3_append_bytes(&st->hdrs, &st->hdrs_len, &st->hdrs_cap, ": ", 2);
+    h3_append_bytes(&st->hdrs, &st->hdrs_len, &st->hdrs_cap, v.base, v.len);
+    h3_append_bytes(&st->hdrs, &st->hdrs_len, &st->hdrs_cap, "\r\n", 2);
+    return 0;
+}
+
+static int h3_cb_end_headers(nghttp3_conn *h3, int64_t sid, int fin,
+                             void *cud, void *sud) {
+    (void)h3; (void)sud;
+    h3_conn *c = cud;
+    h3_stream *st = h3_get(c, sid);
+    if (!st) return 0;
+    st->headers_done = 1;
+    if (fin) st->req_fin = 1;
+    if (fin) h3_dispatch(st);
+    return 0;
+}
+
+static int h3_cb_data(nghttp3_conn *h3, int64_t sid, const uint8_t *data, size_t datalen,
+                      void *cud, void *sud) {
+    (void)h3; (void)sud;
+    h3_conn *c = cud;
+    h3_stream *st = h3_get(c, sid);
+    c->app_bytes += datalen;
+    if (!st) return 0;
+    if (st->too_large) return 0;
+    if (st->body_len + datalen > MAX_BODY) {
+        st->too_large = 1;
+        return 0;
+    }
+    h3_append_bytes(&st->body, &st->body_len, &st->body_cap, data, datalen);
+    return 0;
+}
+
+static int h3_cb_end_stream(nghttp3_conn *h3, int64_t sid, void *cud, void *sud) {
+    (void)h3; (void)sud;
+    h3_conn *c = cud;
+    h3_stream *st = h3_get(c, sid);
+    if (!st) return 0;
+    st->req_fin = 1;
+    h3_dispatch(st);
+    return 0;
+}
+
+static int h3_cb_close(nghttp3_conn *h3, int64_t sid, uint64_t aec, void *cud, void *sud) {
+    (void)h3; (void)aec; (void)sud;
+    h3_conn *c = cud;
+    h3_stream *st = h3_get(c, sid);
+    if (!st) return 0;
+    st->dead = 1;
+    st->req_fin = 1;
+    if (st->rfd >= 0) { close(st->rfd); st->rfd = -1; }
+    return 0;
+}
+
+static int h3_cb_reset(nghttp3_conn *h3, int64_t sid, uint64_t aec, void *cud, void *sud) {
+    (void)h3; (void)sud;
+    h3_conn *c = cud;
+    h3_stream *st = h3_get(c, sid);
+    if (!st || !st->ssl) return 0;
+    SSL_STREAM_RESET_ARGS args;
+    memset(&args, 0, sizeof args);
+    args.quic_error_code = aec;
+    SSL_stream_reset(st->ssl, &args, sizeof args);
+    return 0;
+}
+
+static int h3_create_uni(h3_conn *c) {
+    if (c->uni_created) return 0;
+    if (!SSL_is_init_finished(c->ssl)) return 0;
+    c->uni_ctl = SSL_new_stream(c->ssl, SSL_STREAM_FLAG_UNI);
+    c->uni_enc = SSL_new_stream(c->ssl, SSL_STREAM_FLAG_UNI);
+    c->uni_dec = SSL_new_stream(c->ssl, SSL_STREAM_FLAG_UNI);
+    if (!c->uni_ctl || !c->uni_enc || !c->uni_dec) return -1;
+    if (nghttp3_conn_bind_control_stream(c->h3,
+            (int64_t)SSL_get_stream_id(c->uni_ctl)) < 0) return -1;
+    if (nghttp3_conn_bind_qpack_streams(c->h3,
+            (int64_t)SSL_get_stream_id(c->uni_enc),
+            (int64_t)SSL_get_stream_id(c->uni_dec)) < 0) return -1;
+    if (!h3_add(c, c->uni_ctl, (int64_t)SSL_get_stream_id(c->uni_ctl), 1) ||
+        !h3_add(c, c->uni_enc, (int64_t)SSL_get_stream_id(c->uni_enc), 1) ||
+        !h3_add(c, c->uni_dec, (int64_t)SSL_get_stream_id(c->uni_dec), 1))
+        return -1;
+    c->uni_created = 1;
+    return 0;
+}
+
+static void h3_pump_read(h3_stream *st) {
+    if (!st || st->dead || !st->ssl) return;
+    h3_conn *c = st->c;
+    for (int guard = 0; guard < 1024; guard++) {
+        size_t nread = 0;
+        unsigned char buf[H3_RBUF_SIZE];
+
+        if (SSL_get_stream_read_state(st->ssl) == SSL_STREAM_STATE_RESET_REMOTE) {
+            uint64_t aec = 0;
+            SSL_get_stream_read_error_code(st->ssl, &aec);
+            /* one stream reset is not a connection error */
+            nghttp3_conn_close_stream(c->h3, st->id, aec);
+            return;
+        }
+        if (!SSL_read_ex(st->ssl, buf, sizeof buf, &nread)) {
+            int err = SSL_get_error(st->ssl, 0);
+            if (err == SSL_ERROR_WANT_READ) return;
+            if (err == SSL_ERROR_ZERO_RETURN) {
+                if (st->got_fin) return;
+                st->got_fin = 1;
+                c->app_bytes = 0;
+                if (nghttp3_conn_read_stream(c->h3, st->id, NULL, 0, 1) < 0)
+                    h3_conn_close(c, "nghttp3 fin error");
+                return;
+            }
+            h3_conn_close(c, "SSL_read");
+            return;
+        }
+        if (nread == 0) return;
+        c->app_bytes = 0;
+        nghttp3_ssize used = nghttp3_conn_read_stream(c->h3, st->id, buf, nread, 0);
+        size_t app = c->app_bytes;
+        c->app_bytes = 0;
+        if (used < 0) { h3_conn_close(c, "nghttp3 read"); return; }
+        if ((size_t)used + app < nread) return;
+        if (st->dead) return;
+    }
+}
+
+static void h3_pump_write(h3_conn *c) {
+    if (c->dead) return;
+    for (int round = 0; round < 1024; round++) {
+        nghttp3_vec vec[16];
+        int64_t sid = -1;
+        int fin = 0;
+        nghttp3_ssize nv = nghttp3_conn_writev_stream(c->h3, &sid, &fin, vec, 16);
+        if (nv < 0) { h3_conn_close(c, "nghttp3 writev"); return; }
+        if (nv == 0) {
+            if (sid >= 0 && fin) {
+                h3_stream *st = h3_get(c, sid);
+                nghttp3_conn_add_write_offset(c->h3, sid, 0);
+                if (st && st->ssl && !st->fin_sent) {
+                    st->fin_sent = 1;
+                    SSL_stream_conclude(st->ssl, 0);
+                }
+                continue;
+            }
+            break;
+        }
+        h3_stream *st = h3_get(c, sid);
+        size_t total = 0, wanted = 0;
+        int stop = 0;
+        for (size_t i = 0; i < (size_t)nv; i++) wanted += vec[i].len;
+        for (size_t i = 0; i < (size_t)nv; i++) {
+            size_t written = 0;
+            if (vec[i].len == 0) continue;
+            if (!st || !st->ssl) { written = vec[i].len; }
+            else if (!SSL_write_ex2(st->ssl, vec[i].base, vec[i].len, 0, &written)) {
+                if (SSL_get_error(st->ssl, 0) == SSL_ERROR_WANT_WRITE) {
+                    if (!st->blocked) {
+                        nghttp3_conn_block_stream(c->h3, sid);
+                        st->blocked = 1;
+                    }
+                    written = 0;
+                    stop = 1;
+                } else {
+                    h3_conn_close(c, "SSL_write");
+                    return;
+                }
+            } else if (st->blocked) {
+                st->blocked = 0;
+                nghttp3_conn_unblock_stream(c->h3, sid);
+            }
+            total += written;
+            if (stop || written < vec[i].len) break;
+        }
+        if (total > 0) {
+            nghttp3_conn_add_write_offset(c->h3, sid, total);
+            nghttp3_conn_add_ack_offset(c->h3, sid, total);
+        }
+        if (fin && !stop && total == wanted) {
+            if (st && st->ssl && !st->fin_sent) {
+                st->fin_sent = 1;
+                SSL_stream_conclude(st->ssl, 0);
+            }
+        }
+        if (stop || total < wanted || total == 0) break;
+    }
+}
+
+/* Read whatever a worker has produced and push it towards QUIC. */
+static int h3_service_bridges(h3_conn *c, int *need_write) {
+    int progressed = 0;
+    for (size_t i = 0; i < H3_MAX_STREAMS; i++) {
+        h3_stream *st = c->streams[i];
+        if (!st || st->dead || st->rfd < 0) continue;
+        for (;;) {
+            unsigned char buf[16384];
+            ssize_t r = read(st->rfd, buf, sizeof buf);
+            if (r > 0) {
+                h3_feed(st, buf, (size_t)r);
+                progressed = 1;
+                if (st->out_len - st->out_off >= H3_RESP_BUFFER_MAX) break;
+            } else if (r == 0) {
+                if (!st->headers_sent)
+                    h3_inject(st, 500, NULL, "betterAnusbis: no response\n");
+                if (st->framing == 0 || st->framing == 2) st->out_eof = 1;
+                else if (st->framing == 1 && st->remaining > 0) st->out_eof = 1;
+                if (st->want_resume) {
+                    st->want_resume = 0;
+                    nghttp3_conn_resume_stream(c->h3, st->id);
+                }
+                close(st->rfd);
+                st->rfd = -1;
+                break;
+            } else {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                if (errno == EINTR) continue;
+                close(st->rfd);
+                st->rfd = -1;
+                break;
+            }
+        }
+    }
+    if (progressed) *need_write = 1;
+    return 0;
+}
+
+static void h3_accept_streams(h3_conn *c) {
+    for (;;) {
+        SSL *s = SSL_accept_stream(c->ssl, SSL_ACCEPT_STREAM_NO_BLOCK);
+        if (!s) break;
+        int64_t id = (int64_t)SSL_get_stream_id(s);
+        int type = SSL_get_stream_type(s);
+        if (h3_create_uni(c) < 0) { SSL_free(s); h3_conn_close(c, "uni streams"); return; }
+        h3_stream *st = h3_add(c, s, id, type != SSL_STREAM_TYPE_BIDI);
+        if (!st) { SSL_free(s); h3_conn_close(c, "stream slots"); return; }
+        h3_pump_read(st);
+        if (c->dead) return;
+    }
+}
+
+static h3_conn *h3_accept_conns(void) {
+    h3_conn *first = NULL;
+    for (;;) {
+        SSL *s = SSL_accept_connection(h3_listener, SSL_ACCEPT_CONNECTION_NO_BLOCK);
+        if (!s) break;
+        if (h3_nconns >= H3_MAX_CONNS) { SSL_free(s); break; }
+        h3_conn *c = calloc(1, sizeof *c);
+        if (!c) { SSL_free(s); break; }
+        c->ssl = s;
+        SSL_set_default_stream_mode(s, SSL_DEFAULT_STREAM_MODE_NONE);
+        SSL_set_incoming_stream_policy(s, SSL_INCOMING_STREAM_POLICY_ACCEPT, 0);
+
+        nghttp3_callbacks cbs;
+        nghttp3_settings settings;
+        memset(&cbs, 0, sizeof cbs);
+        cbs.recv_header = h3_cb_header;
+        cbs.end_headers = h3_cb_end_headers;
+        cbs.recv_data = h3_cb_data;
+        cbs.end_stream = h3_cb_end_stream;
+        cbs.stream_close = h3_cb_close;
+        cbs.reset_stream = h3_cb_reset;
+        nghttp3_settings_default(&settings);
+        settings.qpack_max_dtable_capacity = 0;
+        settings.qpack_encoder_max_dtable_capacity = 0;
+        settings.qpack_blocked_streams = 0;
+        if (nghttp3_conn_server_new(&c->h3, &cbs, &settings, NULL, c) < 0) {
+            SSL_free(s);
+            free(c);
+            break;
+        }
+        h3_peer_ip(c, c->peer, sizeof c->peer);
+        h3_conns[h3_nconns++] = c;
+        if (h3_create_uni(c) < 0) h3_conn_close(c, "uni at accept");
+        if (!first) first = c;
+    }
+    return first;
+}
+
+static void h3_maybe_close(h3_conn *c) {
+    for (size_t i = 0; i < H3_MAX_STREAMS; i++) {
+        h3_stream *st = c->streams[i];
+        if (!st || st->dead || !st->ssl || st->is_uni) continue;
+        if (st->closed_by_h3 || !st->fin_sent || !st->req_fin) continue;
+        int ws = SSL_get_stream_write_state(st->ssl);
+        int rs = SSL_get_stream_read_state(st->ssl);
+        if (ws != SSL_STREAM_STATE_FINISHED) continue;
+        if (rs != SSL_STREAM_STATE_FINISHED && rs != SSL_STREAM_STATE_RESET_REMOTE &&
+            rs != SSL_STREAM_STATE_CONN_CLOSED)
+            continue;
+        st->closed_by_h3 = 1;
+        nghttp3_conn_close_stream(c->h3, st->id, NGHTTP3_H3_NO_ERROR);
+    }
+}
+
+static void h3_reap(void) {
+    for (size_t i = 0; i < h3_nconns; ) {
+        h3_conn *c = h3_conns[i];
+        for (size_t j = 0; j < H3_MAX_STREAMS; j++)
+            if (c->streams[j] && c->streams[j]->dead) {
+                h3_stream_free(c->streams[j]);
+                c->streams[j] = NULL;
+            }
+        if (c->dead) {
+            for (size_t j = 0; j < H3_MAX_STREAMS; j++)
+                if (c->streams[j]) { h3_stream_free(c->streams[j]); c->streams[j] = NULL; }
+            nghttp3_conn_del(c->h3);
+            if (c->ssl) SSL_free(c->ssl);
+            free(c);
+            h3_conns[i] = h3_conns[--h3_nconns];
+        } else {
+            i++;
+        }
+    }
+}
+
+static int h3_alpn_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
+                      const unsigned char *in, unsigned int inlen, void *arg) {
+    (void)ssl; (void)arg;
+    static const unsigned char h3[] = {2, 'h', '3'};
+    if (SSL_select_next_proto((unsigned char **)out, outlen, h3, sizeof h3, in, inlen) ==
+        OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_OK;
+    return SSL_TLSEXT_ERR_NOACK;
+}
+
+static void *h3_server_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        SSL_POLL_ITEM items[1 + H3_MAX_CONNS * (1 + H3_MAX_STREAMS)];
+        size_t nitems = 0, result_count = 0;
+        int bridge_live = 0;
+        for (size_t k = 0; k < h3_nconns; k++) {
+            h3_conn *ck = h3_conns[k];
+            if (!ck || ck->dead) continue;
+            for (size_t j = 0; j < H3_MAX_STREAMS; j++)
+                if (ck->streams[j] && ck->streams[j]->rfd >= 0) bridge_live = 1;
+        }
+        /* A worker's socketpair has no SSL to poll, so it is drained on the
+         * tick. 10 ms while one is live is invisible; 100 ms when none is keeps
+         * an idle gate asleep. */
+        struct timeval tv = {.tv_sec = 0, .tv_usec = bridge_live ? 10000 : 100000};
+
+        items[nitems].desc = SSL_as_poll_descriptor(h3_listener);
+        items[nitems].events = SSL_POLL_EVENT_IC | SSL_POLL_EVENT_EL;
+        nitems++;
+        for (size_t i = 0; i < h3_nconns; i++) {
+            h3_conn *c = h3_conns[i];
+            if (!c || c->dead) continue;
+            items[nitems].desc = SSL_as_poll_descriptor(c->ssl);
+            items[nitems].events = c->closing ? SSL_POLL_EVENT_ECD
+                : (SSL_POLL_EVENT_ISB | SSL_POLL_EVENT_ISU | SSL_POLL_EVENT_EC |
+                   SSL_POLL_EVENT_ECD);
+            nitems++;
+            if (c->closing) continue;
+            for (size_t j = 0; j < H3_MAX_STREAMS; j++) {
+                h3_stream *st = c->streams[j];
+                if (!st || st->dead || !st->ssl) continue;
+                items[nitems].desc = SSL_as_poll_descriptor(st->ssl);
+                items[nitems].events = SSL_POLL_EVENT_R | SSL_POLL_EVENT_ER |
+                                       SSL_POLL_EVENT_W | SSL_POLL_EVENT_EW;
+                nitems++;
+            }
+        }
+        if (!SSL_poll(items, nitems, sizeof(SSL_POLL_ITEM), &tv, 0, &result_count))
+            break;
+
+        if (items[0].revents & SSL_POLL_EVENT_IC) h3_accept_conns();
+
+        for (size_t i = 0; i < h3_nconns; i++) {
+            h3_conn *c = h3_conns[i];
+            if (!c || c->dead) continue;
+            uint64_t crev = 0;
+            for (size_t k = 1; k < nitems; k++)
+                if (items[k].desc.value.ssl == c->ssl) { crev = items[k].revents; break; }
+
+            if (crev & (SSL_POLL_EVENT_ISB | SSL_POLL_EVENT_ISU)) h3_accept_streams(c);
+            if (crev & SSL_POLL_EVENT_EC) { c->closing = 1; }
+            if (crev & SSL_POLL_EVENT_ECD) {
+                h3_conn_close(c, "QUIC close complete");
+                continue;
+            }
+            if (c->dead) continue;
+
+            int need_write = 0;
+            if (crev & (SSL_POLL_EVENT_R | SSL_POLL_EVENT_W | SSL_POLL_EVENT_ER |
+                        SSL_POLL_EVENT_EW))
+                need_write = 1;
+            for (size_t j = 0; j < H3_MAX_STREAMS; j++) {
+                h3_stream *st = c->streams[j];
+                if (!st || st->dead || !st->ssl) continue;
+                uint64_t rev = 0;
+                for (size_t k = 1; k < nitems; k++)
+                    if (items[k].desc.value.ssl == st->ssl) { rev = items[k].revents; break; }
+                if (rev & SSL_POLL_EVENT_R) { h3_pump_read(st); need_write = 1; }
+                if (rev & SSL_POLL_EVENT_W) {
+                    if (st->blocked) { st->blocked = 0; nghttp3_conn_unblock_stream(c->h3, st->id); }
+                    need_write = 1;
+                }
+                if (rev & SSL_POLL_EVENT_ER) {
+                    uint64_t aec = 0;
+                    SSL_get_stream_read_error_code(st->ssl, &aec);
+                    nghttp3_conn_close_stream(c->h3, st->id, aec);
+                }
+                if (rev & SSL_POLL_EVENT_EW) {
+                    uint64_t aec = 0;
+                    SSL_get_stream_write_error_code(st->ssl, &aec);
+                    nghttp3_conn_close_stream(c->h3, st->id, aec);
+                }
+                if (c->dead) break;
+            }
+            if (c->dead) continue;
+            h3_service_bridges(c, &need_write);
+            if (need_write) h3_pump_write(c);
+            h3_maybe_close(c);
+        }
+        h3_reap();
+    }
+    return NULL;
+}
+
+/* Bind the UDP socket and start the QUIC listener thread. Called from main
+ * after the TCP listener is up; returns 0 when HTTP/3 is now being served. */
+static int h3_start(const struct sockaddr_in6 *addr) {
+    SSL_CTX *ctx = SSL_CTX_new(OSSL_QUIC_server_method());
+    if (!ctx) return -1;
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_alpn_select_cb(ctx, h3_alpn_cb, NULL);
+    if (SSL_CTX_use_certificate_chain_file(ctx, cfg.tls_cert) != 1 ||
+        SSL_CTX_use_PrivateKey_file(ctx, cfg.tls_key, SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_check_private_key(ctx) != 1) {
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+    int fd = socket(addr->sin6_family, SOCK_DGRAM, 0);
+    if (fd < 0) { SSL_CTX_free(ctx); return -1; }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (bind(fd, (const struct sockaddr *)addr, sizeof *addr) != 0) {
+        close(fd);
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+    h3_listener = SSL_new_listener(ctx, 0);
+    if (!h3_listener || !SSL_set_fd(h3_listener, fd) || !SSL_listen(h3_listener) ||
+        !SSL_set_blocking_mode(h3_listener, 0)) {
+        if (h3_listener) SSL_free(h3_listener);
+        close(fd);
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+    h3_ctx = ctx;
+    h3_udp_fd = fd;
+    h3_port = ntohs(addr->sin6_port);
+    pthread_t t;
+    if (pthread_create(&t, NULL, h3_server_main, NULL) != 0) {
+        SSL_free(h3_listener);
+        h3_listener = NULL;
+        close(fd);
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+    pthread_detach(t);
+    return 0;
+}
+
+
+/* --------------------------------------------------- HTTP/3 to the backend
+ *
+ * A synchronous one-request h3 client, the QUIC twin of proxy_request_h2().
+ * It writes the same ordinary HTTP/1.1 response (chunked) into the client
+ * connection, so the relay above does not care which protocol the origin
+ * spoke. --target-http3 is off by default; h3 to the edge is common, h3 to the
+ * origin is not.
+ */
+#define H3U_MAX_STREAMS 16
+
+typedef struct {
+    SSL *ssl;
+    int64_t id;
+    int is_uni;
+    int dead;
+    int fin_sent;
+    int blocked;
+    int got_fin;
+} h3u_stream;
+
+typedef struct {
+    conn *out;
+    request *req;
+    SSL *conn;
+    nghttp3_conn *h3;
+    int64_t req_id;
+    h3u_stream streams[H3U_MAX_STREAMS];
+    size_t app_bytes;
+    int status;
+    int head_emitted;
+    int no_body;
+    int is_head;
+    int done;
+    int failed;
+    char *hdrs;
+    size_t hdrs_len, hdrs_cap;
+    const unsigned char *body;
+    size_t body_len, body_off;
+    nghttp3_data_reader dr;
+} h3u_ctx;
+
+static h3u_stream *h3u_get(h3u_ctx *u, int64_t id) {
+    for (size_t i = 0; i < H3U_MAX_STREAMS; i++)
+        if (u->streams[i].ssl && !u->streams[i].dead && u->streams[i].id == id)
+            return &u->streams[i];
+    return NULL;
+}
+
+static h3u_stream *h3u_add(h3u_ctx *u, SSL *ssl, int64_t id, int is_uni) {
+    for (size_t i = 0; i < H3U_MAX_STREAMS; i++)
+        if (!u->streams[i].ssl) {
+            u->streams[i].ssl = ssl;
+            u->streams[i].id = id;
+            u->streams[i].is_uni = is_uni;
+            return &u->streams[i];
+        }
+    return NULL;
+}
+
+static void h3u_write_out(h3u_ctx *u, const void *data, size_t len) {
+    if (!u->failed && len && send_all(u->out, data, len) < 0) u->failed = 1;
+}
+
+static void h3u_emit_head(h3u_ctx *u) {
+    if (u->head_emitted || u->failed) return;
+    char head[512];
+    int n = snprintf(head, sizeof head, "HTTP/1.1 %d %s\r\n", u->status,
+                     reason_for(u->status));
+    h3u_write_out(u, head, (size_t)n);
+    if (!u->no_body) h3u_write_out(u, "Transfer-Encoding: chunked\r\n", 28);
+    h3u_write_out(u, "Connection: close\r\n", 19);
+    const char *p = u->hdrs;
+    while (p && *p) {
+        const char *eol = strstr(p, "\r\n");
+        if (!eol) break;
+        size_t len = (size_t)(eol - p);
+        int skip = !u->no_body && len >= 15 && !strncasecmp(p, "content-length:", 15);
+        if (!skip) h3u_write_out(u, p, len + 2);
+        p = eol + 2;
+    }
+    h3u_write_out(u, "\r\n", 2);
+    u->head_emitted = 1;
+}
+
+static nghttp3_ssize h3u_read_body(nghttp3_conn *h3, int64_t sid, nghttp3_vec *vec,
+                                   size_t veccnt, uint32_t *pflags, void *cud, void *sud) {
+    (void)h3; (void)sid; (void)sud;
+    h3u_ctx *u = cud;
+    if (veccnt == 0) return NGHTTP3_ERR_WOULDBLOCK;
+    size_t left = u->body_len - u->body_off;
+    if (left == 0) { *pflags = NGHTTP3_DATA_FLAG_EOF; return 0; }
+    size_t take = left < (64u << 10) ? left : (64u << 10);
+    vec[0].base = (uint8_t *)u->body + u->body_off;
+    vec[0].len = take;
+    u->body_off += take;
+    if (u->body_off == u->body_len) *pflags = NGHTTP3_DATA_FLAG_EOF;
+    return 1;
+}
+
+static int h3u_cb_header(nghttp3_conn *h3, int64_t sid, int32_t token,
+                         nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
+                         void *cud, void *sud) {
+    (void)h3; (void)token; (void)flags; (void)sud;
+    h3u_ctx *u = cud;
+    if (sid != u->req_id) return 0;
+    nghttp3_vec n = nghttp3_rcbuf_get_buf(name);
+    nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
+    if (n.len && n.base[0] == ':') {
+        if (n.len == 7 && !memcmp(n.base, ":status", 7)) {
+            char s[8];
+            size_t k = v.len < sizeof s - 1 ? v.len : sizeof s - 1;
+            memcpy(s, v.base, k);
+            s[k] = 0;
+            u->status = atoi(s);
+        }
+        return 0;
+    }
+    if ((n.len == 10 && !strncasecmp((const char *)n.base, "connection", 10)) ||
+        (n.len == 10 && !strncasecmp((const char *)n.base, "keep-alive", 10)) ||
+        (n.len == 17 && !strncasecmp((const char *)n.base, "transfer-encoding", 17)) ||
+        (n.len == 16 && !strncasecmp((const char *)n.base, "proxy-connection", 16)) ||
+        (n.len == 7 && !strncasecmp((const char *)n.base, "upgrade", 7)) ||
+        (n.len == 2 && !strncasecmp((const char *)n.base, "te", 2)) ||
+        (n.len == 7 && !strncasecmp((const char *)n.base, "trailer", 7)))
+        return 0;
+    h3u_ctx *c = u;
+    if (c->hdrs_len + n.len + v.len + 4 > c->hdrs_cap) {
+        size_t want = c->hdrs_cap ? c->hdrs_cap : 1024;
+        while (want < c->hdrs_len + n.len + v.len + 5) want *= 2;
+        char *nb = realloc(c->hdrs, want);
+        if (!nb) { c->failed = 1; return 0; }
+        c->hdrs = nb;
+        c->hdrs_cap = want;
+    }
+    memcpy(c->hdrs + c->hdrs_len, n.base, n.len);
+    c->hdrs_len += n.len;
+    memcpy(c->hdrs + c->hdrs_len, ": ", 2);
+    c->hdrs_len += 2;
+    memcpy(c->hdrs + c->hdrs_len, v.base, v.len);
+    c->hdrs_len += v.len;
+    memcpy(c->hdrs + c->hdrs_len, "\r\n", 2);
+    c->hdrs_len += 2;
+    c->hdrs[c->hdrs_len] = 0;
+    return 0;
+}
+
+static int h3u_cb_end_headers(nghttp3_conn *h3, int64_t sid, int fin, void *cud, void *sud) {
+    (void)h3; (void)fin; (void)sud;
+    h3u_ctx *u = cud;
+    if (sid != u->req_id) return 0;
+    u->is_head = !strcasecmp(u->req->method, "HEAD");
+    u->no_body = u->is_head || u->status == 204 || u->status == 304 || u->status < 200;
+    h3u_emit_head(u);
+    return 0;
+}
+
+static int h3u_cb_data(nghttp3_conn *h3, int64_t sid, const uint8_t *data, size_t datalen,
+                       void *cud, void *sud) {
+    (void)h3; (void)sud;
+    h3u_ctx *u = cud;
+    u->app_bytes += datalen;
+    if (sid != u->req_id || u->no_body || u->failed) return 0;
+    char ch[40];
+    int n = snprintf(ch, sizeof ch, "%zx\r\n", datalen);
+    h3u_write_out(u, ch, (size_t)n);
+    h3u_write_out(u, data, datalen);
+    h3u_write_out(u, "\r\n", 2);
+    return 0;
+}
+
+static int h3u_cb_end_stream(nghttp3_conn *h3, int64_t sid, void *cud, void *sud) {
+    (void)h3; (void)sud;
+    h3u_ctx *u = cud;
+    if (sid == u->req_id) u->done = 1;
+    return 0;
+}
+
+static int h3u_cb_close(nghttp3_conn *h3, int64_t sid, uint64_t aec, void *cud, void *sud) {
+    (void)h3; (void)aec; (void)sud;
+    h3u_ctx *u = cud;
+    h3u_stream *st = h3u_get(u, sid);
+    if (st) st->dead = 1;
+    if (sid == u->req_id) {
+        if (!u->head_emitted) u->failed = 1;
+        u->done = 1;
+    }
+    return 0;
+}
+
+static void h3u_pump_read(h3u_ctx *u, h3u_stream *st) {
+    if (!u->h3 || !st || st->dead || !st->ssl) return;
+    for (int guard = 0; guard < 256; guard++) {
+        unsigned char buf[H3_RBUF_SIZE];
+        size_t nread = 0;
+        if (SSL_get_stream_read_state(st->ssl) == SSL_STREAM_STATE_RESET_REMOTE) {
+            uint64_t aec = 0;
+            SSL_get_stream_read_error_code(st->ssl, &aec);
+            nghttp3_conn_close_stream(u->h3, st->id, aec);
+            return;
+        }
+        if (!SSL_read_ex(st->ssl, buf, sizeof buf, &nread)) {
+            int err = SSL_get_error(st->ssl, 0);
+            if (err == SSL_ERROR_WANT_READ) return;
+            if (err == SSL_ERROR_ZERO_RETURN) {
+                if (st->got_fin) return;
+                st->got_fin = 1;
+                u->app_bytes = 0;
+                nghttp3_conn_read_stream(u->h3, st->id, NULL, 0, 1);
+                return;
+            }
+            u->failed = 1;
+            return;
+        }
+        if (nread == 0) return;
+        u->app_bytes = 0;
+        nghttp3_ssize used = nghttp3_conn_read_stream(u->h3, st->id, buf, nread, 0);
+        size_t app = u->app_bytes;
+        u->app_bytes = 0;
+        if (used < 0) { u->failed = 1; return; }
+        if ((size_t)used + app < nread) return;   /* nghttp3 left bytes for later */
+        if (st->dead) return;
+    }
+}
+
+static void h3u_pump_write(h3u_ctx *u) {
+    if (!u->h3) return;
+    for (int round = 0; round < 512; round++) {
+        nghttp3_vec vec[16];
+        int64_t sid = -1;
+        int fin = 0;
+        nghttp3_ssize nv = nghttp3_conn_writev_stream(u->h3, &sid, &fin, vec, 16);
+        if (nv < 0) { u->failed = 1; return; }
+        if (nv == 0) {
+            if (sid >= 0 && fin) {
+                h3u_stream *st = h3u_get(u, sid);
+                nghttp3_conn_add_write_offset(u->h3, sid, 0);
+                if (st && st->ssl && !st->fin_sent) {
+                    st->fin_sent = 1;
+                    SSL_stream_conclude(st->ssl, 0);
+                }
+                continue;
+            }
+            break;
+        }
+        h3u_stream *st = h3u_get(u, sid);
+        size_t total = 0, wanted = 0;
+        int stop = 0;
+        for (size_t i = 0; i < (size_t)nv; i++) wanted += vec[i].len;
+        for (size_t i = 0; i < (size_t)nv; i++) {
+            size_t written = 0;
+            if (vec[i].len == 0) continue;
+            if (!st || !st->ssl) written = vec[i].len;
+            else if (!SSL_write_ex2(st->ssl, vec[i].base, vec[i].len, 0, &written)) {
+                if (SSL_get_error(st->ssl, 0) == SSL_ERROR_WANT_WRITE) {
+                    if (!st->blocked) {
+                        nghttp3_conn_block_stream(u->h3, sid);
+                        st->blocked = 1;
+                    }
+                    written = 0;
+                    stop = 1;
+                } else {
+                    u->failed = 1;
+                    return;
+                }
+            } else if (st->blocked) {
+                st->blocked = 0;
+                nghttp3_conn_unblock_stream(u->h3, sid);
+            }
+            total += written;
+            if (stop || written < vec[i].len) break;
+        }
+        if (total > 0) {
+            nghttp3_conn_add_write_offset(u->h3, sid, total);
+            nghttp3_conn_add_ack_offset(u->h3, sid, total);
+        }
+        if (fin && !stop && total == wanted) {
+            if (st && st->ssl && !st->fin_sent) {
+                st->fin_sent = 1;
+                SSL_stream_conclude(st->ssl, 0);
+            }
+        }
+        if (stop || total < wanted || total == 0) break;
+    }
+}
+
+static int h3u_poll(h3u_ctx *u, int timeout_ms) {
+    SSL_POLL_ITEM items[1 + H3U_MAX_STREAMS];
+    struct timeval tv = {.tv_sec = timeout_ms / 1000,
+                         .tv_usec = (timeout_ms % 1000) * 1000};
+    size_t nitems = 0, result_count = 0;
+    items[nitems].desc = SSL_as_poll_descriptor(u->conn);
+    items[nitems].events = SSL_POLL_EVENT_ISB | SSL_POLL_EVENT_ISU |
+                           SSL_POLL_EVENT_EC | SSL_POLL_EVENT_ECD;
+    nitems++;
+    for (size_t i = 0; i < H3U_MAX_STREAMS; i++) {
+        h3u_stream *st = &u->streams[i];
+        if (!st->ssl || st->dead) continue;
+        items[nitems].desc = SSL_as_poll_descriptor(st->ssl);
+        items[nitems].events = SSL_POLL_EVENT_R | SSL_POLL_EVENT_ER |
+                               SSL_POLL_EVENT_W | SSL_POLL_EVENT_EW;
+        nitems++;
+    }
+    if (!SSL_poll(items, nitems, sizeof(SSL_POLL_ITEM), &tv, 0, &result_count))
+        return -1;
+    if ((items[0].revents & (SSL_POLL_EVENT_ISB | SSL_POLL_EVENT_ISU)) && u->h3) {
+        for (;;) {
+            SSL *s = SSL_accept_stream(u->conn, SSL_ACCEPT_STREAM_NO_BLOCK);
+            if (!s) break;
+            int64_t id = (int64_t)SSL_get_stream_id(s);
+            h3u_stream *st = h3u_add(u, s, id, SSL_get_stream_type(s) != SSL_STREAM_TYPE_BIDI);
+            if (!st) { SSL_free(s); break; }
+            h3u_pump_read(u, st);
+        }
+    }
+    if (items[0].revents & SSL_POLL_EVENT_ECD) return -1;
+    for (size_t i = 0; i < H3U_MAX_STREAMS; i++) {
+        h3u_stream *st = &u->streams[i];
+        uint64_t rev = 0;
+        if (!st->ssl || st->dead) continue;
+        for (size_t k = 1; k < nitems; k++)
+            if (items[k].desc.value.ssl == st->ssl) { rev = items[k].revents; break; }
+        if (rev & SSL_POLL_EVENT_R) h3u_pump_read(u, st);
+        if (rev & SSL_POLL_EVENT_W) {
+            if (st->blocked) { st->blocked = 0; nghttp3_conn_unblock_stream(u->h3, st->id); }
+        }
+        if (rev & (SSL_POLL_EVENT_ER | SSL_POLL_EVENT_EW)) {
+            uint64_t aec = 0;
+            if (SSL_get_stream_read_state(st->ssl) == SSL_STREAM_STATE_RESET_REMOTE)
+                SSL_get_stream_read_error_code(st->ssl, &aec);
+            nghttp3_conn_close_stream(u->h3, st->id, aec);
+        }
+    }
+    h3u_pump_write(u);
+    return u->failed ? -1 : 0;
+}
+
+static int h3u_create_uni(h3u_ctx *u) {
+    SSL *ctl = SSL_new_stream(u->conn, SSL_STREAM_FLAG_UNI);
+    SSL *enc = SSL_new_stream(u->conn, SSL_STREAM_FLAG_UNI);
+    SSL *dec = SSL_new_stream(u->conn, SSL_STREAM_FLAG_UNI);
+    if (!ctl || !enc || !dec) return -1;
+    if (nghttp3_conn_bind_control_stream(u->h3, (int64_t)SSL_get_stream_id(ctl)) < 0 ||
+        nghttp3_conn_bind_qpack_streams(u->h3, (int64_t)SSL_get_stream_id(enc),
+                                        (int64_t)SSL_get_stream_id(dec)) < 0)
+        return -1;
+    if (!h3u_add(u, ctl, (int64_t)SSL_get_stream_id(ctl), 1) ||
+        !h3u_add(u, enc, (int64_t)SSL_get_stream_id(enc), 1) ||
+        !h3u_add(u, dec, (int64_t)SSL_get_stream_id(dec), 1))
+        return -1;
+    return 0;
+}
+
+/* Returns 1 when it handled the request and 0 when the caller should fall back
+ * to HTTP/1.1 (the usual reason: this build cannot connect over QUIC). */
+static int proxy_request_h3(conn *c, const request *req, const char *client_ip,
+                            const char *path) {
+    if (!cfg.target_http3 || !cfg.target_tls) return 0;
+
+    h3u_ctx u;
+    memset(&u, 0, sizeof u);
+    u.out = c;
+    u.req = (request *)req;
+    u.status = 0;
+    u.body = (const unsigned char *)req->body;
+    u.body_len = req->body_len;
+
+    SSL_CTX *ctx = SSL_CTX_new(OSSL_QUIC_client_method());
+    BIO *bio = NULL;
+    if (!ctx) return 0;
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+    if (cfg.target_insecure) SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    else {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        SSL_CTX_set_default_verify_paths(ctx);
+    }
+    bio = BIO_new_ssl_connect(ctx);
+    if (!bio) { SSL_CTX_free(ctx); return 0; }
+    char hostport[320];
+    if (strchr(cfg.target_host, ':'))
+        snprintf(hostport, sizeof hostport, "[%s]:%d", cfg.target_host, cfg.target_port);
+    else
+        snprintf(hostport, sizeof hostport, "%s:%d", cfg.target_host, cfg.target_port);
+    if (!BIO_set_conn_hostname(bio, hostport) || !BIO_get_ssl(bio, &u.conn)) {
+        BIO_free_all(bio); SSL_CTX_free(ctx); return 0;
+    }
+    BIO_set_nbio(bio, 1);
+    SSL_set_blocking_mode(u.conn, 0);
+    SSL_set_default_stream_mode(u.conn, SSL_DEFAULT_STREAM_MODE_NONE);
+    static const unsigned char alpn_h3[] = {2, 'h', '3'};
+    SSL_set_alpn_protos(u.conn, alpn_h3, sizeof alpn_h3);
+    SSL_set_tlsext_host_name(u.conn, cfg.target_host);
+    ERR_clear_error();
+    if (!cfg.target_insecure) {
+        X509_VERIFY_PARAM *param = SSL_get0_param(u.conn);
+        struct in_addr a4;
+        struct in6_addr a6;
+        if (param && inet_pton(AF_INET, cfg.target_host, &a4) == 1)
+            X509_VERIFY_PARAM_set1_ip_asc(param, cfg.target_host);
+        else if (param && inet_pton(AF_INET6, cfg.target_host, &a6) == 1)
+            X509_VERIFY_PARAM_set1_ip_asc(param, cfg.target_host);
+        else
+            SSL_set1_host(u.conn, cfg.target_host);
+    }
+
+    /* handshake */
+    int ok = 0;
+    for (int tries = 0; tries < 600; tries++) {
+        int r = SSL_connect(u.conn);
+        if (r == 1) { ok = 1; break; }
+        int e = SSL_get_error(u.conn, r);
+        if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) break;
+        if (h3u_poll(&u, 50) < 0) break;
+    }
+    if (!ok) {
+        if (cfg.verbose) logmsg("HTTP/3 handshake to %s failed", cfg.target_host);
+        BIO_free_all(bio);
+        SSL_CTX_free(ctx);
+        return 0;
+    }
+
+    nghttp3_callbacks cbs;
+    nghttp3_settings settings;
+    memset(&cbs, 0, sizeof cbs);
+    cbs.recv_header = h3u_cb_header;
+    cbs.end_headers = h3u_cb_end_headers;
+    cbs.recv_data = h3u_cb_data;
+    cbs.end_stream = h3u_cb_end_stream;
+    cbs.stream_close = h3u_cb_close;
+    nghttp3_settings_default(&settings);
+    settings.qpack_max_dtable_capacity = 0;
+    settings.qpack_encoder_max_dtable_capacity = 0;
+    settings.qpack_blocked_streams = 0;
+    if (nghttp3_conn_client_new(&u.h3, &cbs, &settings, NULL, &u) < 0) {
+        BIO_free_all(bio);
+        SSL_CTX_free(ctx);
+        return 0;
+    }
+    if (h3u_create_uni(&u) < 0) {
+        nghttp3_conn_del(u.h3);
+        BIO_free_all(bio);
+        SSL_CTX_free(ctx);
+        return 0;
+    }
+
+    SSL *rq = SSL_new_stream(u.conn, 0);
+    if (!rq) {
+        nghttp3_conn_del(u.h3);
+        BIO_free_all(bio);
+        SSL_CTX_free(ctx);
+        return 0;
+    }
+    h3u_stream *rst = h3u_add(&u, rq, (int64_t)SSL_get_stream_id(rq), 0);
+    if (!rst) {
+        SSL_free(rq);
+        nghttp3_conn_del(u.h3);
+        BIO_free_all(bio);
+        SSL_CTX_free(ctx);
+        return 0;
+    }
+    u.req_id = rst->id;
+
+    const char *host_hdr = cfg.target_host_hdr && *cfg.target_host_hdr
+                               ? cfg.target_host_hdr : cfg.target_host;
+    char pathbuf[8192];
+    if (req->query[0]) snprintf(pathbuf, sizeof pathbuf, "%s?%s", path, req->query);
+    else snprintf(pathbuf, sizeof pathbuf, "%s", path);
+
+    nghttp3_nv nva[96];
+    char names[96][96];
+    char values[96][1024];
+    size_t nv = 0;
+#define H3U_NV(N, V) do { \
+        snprintf(names[nv], sizeof names[nv], "%s", (N)); \
+        snprintf(values[nv], sizeof values[nv], "%s", (V)); \
+        nva[nv].name = (uint8_t *)names[nv]; nva[nv].value = (uint8_t *)values[nv]; \
+        nva[nv].namelen = strlen(names[nv]); nva[nv].valuelen = strlen(values[nv]); \
+        nva[nv].flags = NGHTTP3_NV_FLAG_NONE; nv++; \
+    } while (0)
+    H3U_NV(":method", req->method);
+    H3U_NV(":path", pathbuf);
+    H3U_NV(":scheme", "https");
+    H3U_NV(":authority", host_hdr);
+    const char *p = req->headers;
+    while (p && *p && nv < sizeof nva / sizeof nva[0]) {
+        const char *eol = strstr(p, "\r\n");
+        if (!eol) break;
+        size_t n = (size_t)(eol - p);
+        char line[1200];
+        if (n > 0 && n < sizeof line) {
+            memcpy(line, p, n);
+            line[n] = 0;
+            char *colon = strchr(line, ':');
+            if (colon && colon > line) {
+                *colon = 0;
+                char *val = colon + 1;
+                while (*val == ' ' || *val == '\t') val++;
+                if (strcasecmp(line, "host") && strcasecmp(line, "connection") &&
+                    strcasecmp(line, "keep-alive") && strcasecmp(line, "proxy-connection") &&
+                    strcasecmp(line, "upgrade") && strcasecmp(line, "te") &&
+                    strcasecmp(line, "trailer") && strcasecmp(line, "transfer-encoding") &&
+                    strcasecmp(line, "content-length"))
+                    H3U_NV(line, val);
+            }
+        }
+        p = eol + 2;
+    }
+    H3U_NV("x-real-ip", client_ip);
+    H3U_NV("x-forwarded-for", client_ip);
+    if (req->body_len) {
+        char clbuf[32];
+        snprintf(clbuf, sizeof clbuf, "%zu", req->body_len);
+        H3U_NV("content-length", clbuf);
+    }
+#undef H3U_NV
+
+    memset(&u.dr, 0, sizeof u.dr);
+    u.dr.read_data = h3u_read_body;
+    if (nghttp3_conn_submit_request(u.h3, u.req_id, nva, nv,
+                                    req->body_len ? &u.dr : NULL, NULL) < 0) {
+        nghttp3_conn_del(u.h3);
+        BIO_free_all(bio);
+        SSL_CTX_free(ctx);
+        return 0;
+    }
+
+    for (int guard = 0; guard < 12000 && !u.done && !u.failed; guard++)
+        if (h3u_poll(&u, 10) < 0) break;
+    if (u.done && u.head_emitted && !u.no_body && !u.failed)
+        h3u_write_out(&u, "0\r\n\r\n", 5);
+
+    /* free streams before the connection */
+    for (size_t i = 0; i < H3U_MAX_STREAMS; i++)
+        if (u.streams[i].ssl) SSL_free(u.streams[i].ssl);
+    nghttp3_conn_del(u.h3);
+    BIO_free_all(bio);
+    SSL_CTX_free(ctx);
+    free(u.hdrs);
+    if (!u.head_emitted) {
+        const char *msg = "betterAnusbis: the HTTP/3 target closed without answering\n";
+        respond(c, 502, "Bad Gateway", NULL, NULL, msg, strlen(msg));
+    }
+    return 1;
+}
+
+#endif /* HAVE_NGHTTP3 */
 
 /* ------------------------------------------------------------- main loop */
 
@@ -6905,6 +9586,26 @@ typedef struct {
     int fd;
     int tls;
 } accepted;
+
+/* ALPN on the TLS listener. h2 first, HTTP/1.1 second: that ordering is what
+ * tells every browser and curl that this gate can multiplex. When --no-http2 is
+ * given the list still offers http/1.1 so clients that require ALPN work. */
+static int alpn_select_cb(SSL *ssl, const unsigned char **out, unsigned char *outlen,
+                          const unsigned char *in, unsigned int inlen, void *arg) {
+    (void)ssl; (void)arg;
+#ifdef HAVE_NGHTTP2
+    static const unsigned char protos[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    if (cfg.http2 &&
+        SSL_select_next_proto((unsigned char **)out, outlen, protos, sizeof protos, in, inlen) ==
+            OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_OK;
+#endif
+    static const unsigned char h1[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    if (SSL_select_next_proto((unsigned char **)out, outlen, h1, sizeof h1, in, inlen) ==
+        OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_OK;
+    return SSL_TLSEXT_ERR_NOACK;
+}
 
 static void *thread_main(void *arg) {
     accepted a = *(accepted *)arg;
@@ -6936,6 +9637,27 @@ static void *thread_main(void *arg) {
              * which is what the deployment wants */
             snprintf(ip, sizeof ip, "127.0.0.1");
     }
+    int use_h2 = 0;
+#ifdef HAVE_NGHTTP2
+    if (cfg.http2) {
+        if (c.ssl) {
+            const unsigned char *proto = NULL;
+            unsigned int plen2 = 0;
+            SSL_get0_alpn_selected((SSL *)c.ssl, &proto, &plen2);
+            use_h2 = plen2 == 2 && proto && !memcmp(proto, "h2", 2);
+        } else {
+            use_h2 = h2_is_prior_knowledge(fd);
+        }
+    }
+    if (use_h2) {
+        h2_serve(&c, ip);
+        if (c.ssl) {
+            SSL_shutdown((SSL *)c.ssl);
+            SSL_free((SSL *)c.ssl);
+        }
+        return NULL;
+    }
+#endif
     handle_connection(&c, ip);
     if (c.ssl) {
         SSL_shutdown((SSL *)c.ssl);
@@ -7159,6 +9881,13 @@ static void usage(FILE *out) {
         "TLS, metrics, noise\n"
         "  --tls-cert FILE        serve HTTPS with this PEM certificate chain\n"
         "  --tls-key FILE         ...and this PEM private key\n"
+        "  --http2[=B]            HTTP/2 on the listener: ALPN h2 over TLS, and\n"
+        "                         h2c prior knowledge on a plain listener (default on)\n"
+        "  --http3[=B]            HTTP/3 over QUIC on the same port; needs --tls-cert\n"
+        "                         and --tls-key, and advertises Alt-Svc (default off)\n"
+        "  --target-http2[=B]     use HTTP/2 to the backend when its TLS offers h2\n"
+        "                         (default on; HTTP/1.1 is used when it does not)\n"
+        "  --target-http3[=B]     use HTTP/3 over QUIC to the backend (default off)\n"
         "  --hs512-secret KEY     sign tokens with HS512 and this key\n"
         "  --ed25519-private-key-hex HEX\n"
         "                         sign tokens with EdDSA (32 or 64 bytes of hex)\n"
@@ -7278,6 +10007,10 @@ static const arg_spec args[] = {
     {"webmaster-email", ARG_STR, &cfg.webmaster_email},
     {"preserve-referer-query-param", ARG_BOOL, &cfg.preserve_referer_qp},
     {"target-disable-keepalive", ARG_BOOL, &cfg.target_disable_keepalive},
+    {"http2", ARG_BOOL, &cfg.http2},
+    {"http3", ARG_BOOL, &cfg.http3},
+    {"target-http2", ARG_BOOL, &cfg.target_http2},
+    {"target-http3", ARG_BOOL, &cfg.target_http3},
 };
 
 static int arg_apply(const arg_spec *spec, const char *val, int negated) {
@@ -7776,6 +10509,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "betterAnusbis: --bind-network wants tcp or unix\n");
         return 2;
     }
+    if (cfg.http3 && strcasecmp(cfg.bind_network, "unix")) {
+        /* fine: UDP can share the port number with the TCP listener */
+    } else if (cfg.http3) {
+        fprintf(stderr, "betterAnusbis: --http3 needs --bind-network tcp\n");
+        return 2;
+    }
     if (strcasecmp(cfg.metrics_network, "tcp") && strcasecmp(cfg.metrics_network, "unix")) {
         fprintf(stderr, "betterAnusbis: --metrics-bind-network wants tcp or unix\n");
         return 2;
@@ -7784,6 +10523,24 @@ int main(int argc, char **argv) {
         fprintf(stderr, "betterAnusbis: --tls-cert and --tls-key go together\n");
         return 2;
     }
+    if (cfg.http3 && !cfg.tls_cert) {
+        fprintf(stderr, "betterAnusbis: --http3 needs --tls-cert and --tls-key; QUIC is "
+                        "always TLS 1.3\n");
+        return 2;
+    }
+#ifndef HAVE_NGHTTP3
+    if (cfg.http3) {
+        fprintf(stderr, "betterAnusbis: this build has no HTTP/3 support (nghttp3 was not "
+                        "found at build time)\n");
+        return 2;
+    }
+#endif
+#ifndef HAVE_NGHTTP2
+    if (cfg.http2) {
+        /* Not an error: saying so once is better than silently downgrading. */
+        logmsg("this build has no HTTP/2 support; --http2 has no effect");
+    }
+#endif
     int use_tls = cfg.tls_cert != NULL;
     if (use_tls) {
         OPENSSL_init_ssl(0, NULL);
@@ -7804,6 +10561,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "betterAnusbis: certificate and key do not match\n");
             return 1;
         }
+        SSL_CTX_set_alpn_select_cb(server_ctx, alpn_select_cb, NULL);
     }
 
     int srv_unix = 0;
@@ -7817,6 +10575,15 @@ int main(int argc, char **argv) {
         logmsg("open %s://127.0.0.1:%d/ and the challenge page solves it for you",
                use_tls ? "https" : "http", ntohs(addr.sin6_port));
 
+#ifdef HAVE_NGHTTP3
+    if (cfg.http3) {
+        if (h3_start(&addr) != 0) {
+            fprintf(stderr, "betterAnusbis: cannot start HTTP/3 on UDP %s\n", cfg.listen);
+            return 1;
+        }
+        logmsg("HTTP/3 over QUIC on the same port (%s), Alt-Svc advertised", cfg.listen);
+    }
+#endif
     if (cfg.metrics_bind && *cfg.metrics_bind) {
         int munix = 0;
         int mfd = make_listener(cfg.metrics_bind, cfg.metrics_network, cfg.socket_mode, &munix);
