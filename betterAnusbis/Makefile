@@ -3,7 +3,7 @@
 #   make              # needs libanubis_solver.so (built by the parent Makefile)
 #   make clean
 CC      ?= cc
-CFLAGS  ?= -O2 -g -Wall -Wextra -pthread
+CFLAGS  ?= -O2 -g -Wall -Wextra -pthread -std=gnu17
 LIBDIR  ?= ..
 # Our engine for verification, OpenSSL for the TLS listener and the TLS backend.
 # The runpath is $ORIGIN, not the build directory: a released binary and its

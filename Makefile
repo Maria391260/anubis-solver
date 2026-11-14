@@ -1,6 +1,6 @@
 CC      ?= cc
 PY      ?= python3
-CFLAGS  ?= -O3 -fPIC -Wall -Wextra
+CFLAGS  ?= -O3 -fPIC -Wall -Wextra -std=gnu17
 NATIVE  ?= -march=native
 LDFLAGS ?= -shared -pthread
 INC     := -Isrc -Isrc/core -Isrc/hashx -Isrc/cpu -Isrc/cuda \
@@ -82,11 +82,16 @@ LDFLAGS  += -ldl
 endif
 endif
 
+# The architecture of what we are building, not of what we are building on:
+#   make ARCH=aarch64 CC=aarch64-linux-gnu-gcc NATIVE=
+# is how the released ARM binaries are produced on an x86 box.
+ARCH     ?= $(shell uname -m)
+
 # Assembly kernels: x86-64 (AVX2 + SHA-NI) or AArch64 (NEON + SHA-2).
 # The portable C fallbacks are always compiled.
-ifeq ($(shell uname -m),x86_64)
+ifeq ($(ARCH),x86_64)
 ASM_SRC  := src/cpu/avx2.s src/cpu/shani.s src/cpu/avx512.s
-else ifeq ($(shell uname -m),aarch64)
+else ifeq ($(ARCH),aarch64)
 ASM_SRC  := src/cpu/neon.s
 CFLAGS   += -DANUBIS_HAVE_NEON_ASM
 else
@@ -94,7 +99,7 @@ ASM_SRC  :=
 endif
 ARGON2_ALL := $(wildcard third_party/argon2/*.c third_party/argon2/blake2/*.c)
 # opt.c needs x86 SSE/AVX intrinsics; ref.c is the portable implementation.
-ifeq ($(shell uname -m),x86_64)
+ifeq ($(ARCH),x86_64)
 ARGON2_SRC := $(filter-out third_party/argon2/ref.c,$(ARGON2_ALL))
 else
 ARGON2_SRC := $(filter-out third_party/argon2/opt.c,$(ARGON2_ALL))

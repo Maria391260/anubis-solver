@@ -549,7 +549,8 @@ int anubis_gpu_verify(void) {
     }
 }
 
-#if defined(ANUBIS_HAVE_CUDA) || defined(ANUBIS_HAVE_LEVELZERO) || defined(ANUBIS_HAVE_VULKAN)
+#if defined(ANUBIS_HAVE_CUDA) || defined(ANUBIS_HAVE_LEVELZERO) || \
+    defined(ANUBIS_HAVE_VULKAN) || defined(ANUBIS_HAVE_OPENCL)
 static int gpu_hit_ok_nibbles(const char *ch, uint64_t nonce, int diff,
                               const char *hex) {
     char v[65];
