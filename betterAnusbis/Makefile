@@ -78,7 +78,12 @@ test-parity: betterAnusbis
 test-http23: betterAnusbis
 	python3 tests_http23.py -v
 
+# The Valkey store against the test file's in-process RESP2 mock (or a real
+# valkey-server/redis-server when one is on PATH).
+test-valkey: betterAnusbis
+	python3 tests_valkey.py
+
 clean:
 	rm -f betterAnusbis
 
-.PHONY: clean wasm-kernels slow test-parity test-http23
+.PHONY: clean wasm-kernels slow test-parity test-http23 test-valkey

@@ -90,3 +90,17 @@ and `expiry` (RFC3339Nano).
 - Tests: when Go and the cached bbolt module are available, `test_parity.py`
   opens the gate's bbolt file with the real `go.etcd.io/bbolt` and runs
   `tx.Check`; otherwise those checks skip.
+
+## Valkey / RESP protocol
+
+The optional `--store valkey:URL` backend speaks RESP2 to Valkey, Redis, or any
+compatible server.
+
+- Protocol: https://github.com/valkey-io/valkey (BSD-3-Clause) /
+  https://redis.io/docs/latest/develop/reference/protocol-spec/
+- Vendored: **no**. The small RESP2 client in `betterAnusbis/betterAnusbis.c`
+  is an independent implementation of the public protocol; no Valkey or Redis
+  source is copied here.
+- Tests: `tests_valkey.py` runs an in-process RESP2 mock server, so no Valkey
+  installation is required; it uses a real `valkey-server`/`redis-server` from
+  PATH when one is present.

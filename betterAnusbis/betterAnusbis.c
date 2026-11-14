@@ -616,6 +616,12 @@ static void respond_redirect(conn *c, const char *location, const char *extra_he
  * cannot. With state on, an id is looked up, checked, and retired on use, which is
  * what "state verification" means here. The table is fixed: 4096 entries, one per
  * challenge, expiring with the cookie window. */
+/* The Valkey client type lives further down with the store code; the ledger
+ * hooks above it need the forward declaration and the shared handle. */
+typedef struct vk_client vk_client;
+static int store_valkey;
+static vk_client *vk;
+
 #define CH_BUCKETS 4096
 typedef struct {
     char id[80];
@@ -629,6 +635,17 @@ typedef struct {
     int spent;
     int used;
 } ch_entry;
+
+/* defined with the Valkey store below; the ledger calls them in place */
+static int vk_available(void);
+static int vk_get_challenge(const char *id, ch_entry *out);
+static void vk_put_challenge(const ch_entry *e, long long ttl);
+static void ch_cache_put(const ch_entry *src);
+static int vk_get_honeypot(uint64_t key, int *count, time_t *last);
+static void vk_put_honeypot(uint64_t key, int count, time_t last);
+static void hp_cache_put(uint64_t key, int count, time_t last);
+static int vk_miss_seen(uint64_t key);
+static void vk_miss_mark(uint64_t key);
 
 static ch_entry ch_table[CH_BUCKETS];
 static pthread_mutex_t ch_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -659,7 +676,9 @@ static void ch_issue(const char *id, const char *rd, int difficulty, const char 
             e->used = 1;
             store_mark_dirty();
             ch_issued++;
+            ch_entry snap = *e;
             pthread_mutex_unlock(&ch_lock);
+            if (store_valkey) vk_put_challenge(&snap, COOKIE_TTL);
             return;
         }
         if (!strcmp(e->id, id)) {          /* re-issued: refresh it */
@@ -674,7 +693,9 @@ static void ch_issue(const char *id, const char *rd, int difficulty, const char 
                 e->issued_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
             }
             e->spent = 0;
+            ch_entry snap = *e;
             pthread_mutex_unlock(&ch_lock);
+            if (store_valkey) vk_put_challenge(&snap, COOKIE_TTL);
             return;
         }
     }
@@ -685,9 +706,30 @@ static void ch_issue(const char *id, const char *rd, int difficulty, const char 
 static int ch_take(const char *id, char *rd_out, size_t rd_cap, int *difficulty_out,
                    char *algo_out, size_t algo_cap) {
     time_t now = time(NULL);
+    if (store_valkey) {
+        ch_entry remote;
+        int got = vk_get_challenge(id, &remote);
+        if (got == 1) {
+            if (now - remote.issued > COOKIE_TTL) { ch_expired++; return -1; }
+            if (remote.spent) { ch_replayed++; return -2; }
+            remote.spent = 1;
+            long long ttl = (long long)COOKIE_TTL - (long long)(now - remote.issued);
+            if (ttl > 0) vk_put_challenge(&remote, ttl);
+            ch_cache_put(&remote);
+            snprintf(rd_out, rd_cap, "%s", remote.rd);
+            if (difficulty_out) *difficulty_out = remote.difficulty;
+            if (algo_out) snprintf(algo_out, algo_cap, "%s", remote.algorithm);
+            ch_accepted++;
+            return 1;
+        }
+        /* got == 0: a challenge issued before this store was configured, or a
+         * remote error; the local table is still worth checking. */
+    }
     uint32_t h = 2166136261u;
     for (const char *q = id; *q; q++) h = (h ^ (uint8_t)*q) * 16777619u;
     int rc = 0;
+    ch_entry snap;
+    memset(&snap, 0, sizeof snap);
     pthread_mutex_lock(&ch_lock);
     for (int probe = 0; probe < 32; probe++) {
         ch_entry *e = &ch_table[(h + (uint32_t)probe) % CH_BUCKETS];
@@ -700,11 +742,16 @@ static int ch_take(const char *id, char *rd_out, size_t rd_cap, int *difficulty_
         snprintf(rd_out, rd_cap, "%s", e->rd);
         if (difficulty_out) *difficulty_out = e->difficulty;
         if (algo_out) snprintf(algo_out, algo_cap, "%s", e->algorithm);
+        snap = *e;
         ch_accepted++;
         rc = 1;
         break;
     }
     pthread_mutex_unlock(&ch_lock);
+    if (rc == 1 && store_valkey) {
+        long long ttl = (long long)COOKIE_TTL - (long long)(now - snap.issued);
+        if (ttl > 0) vk_put_challenge(&snap, ttl);
+    }
     return rc;
 }
 
@@ -725,6 +772,14 @@ static int ch_peek_algorithm(const char *id, char *out, size_t cap) {
         break;
     }
     pthread_mutex_unlock(&ch_lock);
+    if (!found && store_valkey) {
+        ch_entry remote;
+        if (vk_get_challenge(id, &remote) == 1) {
+            ch_cache_put(&remote);
+            snprintf(out, cap, "%s", remote.algorithm);
+            found = 1;
+        }
+    }
     return found;
 }
 
@@ -733,6 +788,17 @@ static int ch_peek_algorithm(const char *id, char *out, size_t cap) {
  * only accepted if that fetch happened (lib/challenge/extension/css-load). */
 static int ch_mark_css(const char *id) {
     if (!cfg.stateful || !id) return 0;
+    if (store_valkey) {
+        ch_entry remote;
+        if (vk_get_challenge(id, &remote) == 1) {
+            remote.css_seen = 1;
+            long long ttl = (long long)COOKIE_TTL -
+                            ((long long)time(NULL) - (long long)remote.issued);
+            if (ttl > 0) vk_put_challenge(&remote, ttl);
+            ch_cache_put(&remote);
+            return 1;
+        }
+    }
     uint32_t h = 2166136261u;
     for (const char *q = id; *q; q++) h = (h ^ (uint8_t)*q) * 16777619u;
     int found = 0;
@@ -766,6 +832,13 @@ static int ch_css_seen(const char *id) {
         break;
     }
     pthread_mutex_unlock(&ch_lock);
+    if (seen < 0 && store_valkey) {
+        ch_entry remote;
+        if (vk_get_challenge(id, &remote) == 1) {
+            ch_cache_put(&remote);
+            seen = remote.css_seen ? 1 : 0;
+        }
+    }
     return seen;
 }
 
@@ -786,6 +859,14 @@ static int ch_peek_issued_ms(const char *id, long long *out) {
         break;
     }
     pthread_mutex_unlock(&ch_lock);
+    if (!found && store_valkey) {
+        ch_entry remote;
+        if (vk_get_challenge(id, &remote) == 1) {
+            ch_cache_put(&remote);
+            *out = remote.issued_ms;
+            found = 1;
+        }
+    }
     return found;
 }
 
@@ -806,6 +887,14 @@ static int ch_peek_referer(const char *id, char *out, size_t cap) {
         break;
     }
     pthread_mutex_unlock(&ch_lock);
+    if (!found && store_valkey) {
+        ch_entry remote;
+        if (vk_get_challenge(id, &remote) == 1) {
+            ch_cache_put(&remote);
+            snprintf(out, cap, "%s", remote.referer);
+            found = 1;
+        }
+    }
     return found;
 }
 
@@ -921,6 +1010,8 @@ static void hp_record(const char *ip) {
     uint64_t key = network_key(ip);
     if (!key) return;
     time_t now = time(NULL);
+    int hcount = 0;
+    time_t hlast = 0;
     pthread_mutex_lock(&hp_lock);
     uint64_t slot = key % HP_BUCKETS;
     for (int probe = 0; probe < 32; probe++) {
@@ -929,6 +1020,8 @@ static void hp_record(const char *ip) {
             if (now - e->last > HP_WINDOW) e->count = 0;
             e->count++;
             e->last = now;
+            hcount = e->count;
+            hlast = e->last;
             hp_hits_total++;
             pthread_mutex_unlock(&hp_lock);
             goto report;
@@ -938,6 +1031,8 @@ static void hp_record(const char *ip) {
             e->key = key;
             e->count = 1;
             e->last = now;
+            hcount = e->count;
+            hlast = e->last;
             hp_hits_total++;
             pthread_mutex_unlock(&hp_lock);
             goto report;
@@ -947,6 +1042,7 @@ static void hp_record(const char *ip) {
     return;
 
 report:
+    if (store_valkey) vk_put_honeypot(key, hcount, hlast);
     if (cfg.honeypot_log) {
         FILE *f = fopen(cfg.honeypot_log, "a");
         if (f) {
@@ -975,6 +1071,17 @@ static int hp_count(const char *ip) {
         }
     }
     pthread_mutex_unlock(&hp_lock);
+    if (count == 0 && vk_available() && !vk_miss_seen(key)) {
+        int c2 = 0;
+        time_t l2 = 0;
+        int got = vk_get_honeypot(key, &c2, &l2);
+        if (got == 1 && c2 > 0 && now - l2 <= HP_WINDOW) {
+            count = c2;
+            hp_cache_put(key, c2, l2);
+        } else if (got == 0) {
+            vk_miss_mark(key);
+        }
+    }
     if (count >= cfg.flag_threshold) {
         pthread_mutex_lock(&hp_lock);
         hp_networks_flagged++;
@@ -1952,7 +2059,7 @@ static int geoip_asn(const char *ip, uint32_t *out) {
 }
 
 /* the store backend is selected before the codec is defined, so these live here */
-static char store_path[512];
+static char store_path[1024];
 static volatile int store_dirty;
 
 /*
@@ -4059,7 +4166,7 @@ static void bbolt_load_state(void) {
 /* A path with no writable parent would only fail five seconds later, once per
  * flush, in the log. Upstream's factory checks the directory at startup too. */
 static int bbolt_check_writable(void) {
-    char dir[512];
+    char dir[1024];
     snprintf(dir, sizeof dir, "%s", store_path);
     char *slash = strrchr(dir, '/');
     if (slash) {
@@ -4136,7 +4243,7 @@ static int bbolt_store_write(void) {
         if (!e->used) continue;
         long long expires = e->issued_ms + (long long)COOKIE_TTL * 1000;
         if (expires < now_ms) continue;
-        char name[128], json[4096], esc_ref[1024], esc_rd[256], esc_algo[128];
+        char name[128], json[4096], esc_ref[2048], esc_rd[256], esc_algo[128];
         snprintf(name, sizeof name, "betteranusbis:challenge:%s", e->id);
         json_escape_into(e->referer, esc_ref, sizeof esc_ref);
         json_escape_into(e->rd, esc_rd, sizeof esc_rd);
@@ -4194,6 +4301,2331 @@ static int bbolt_store_write(void) {
     return 0;
 }
 
+/*
+ * valkey_io.h - small standalone RESP2 client for Redis / Valkey.
+ *
+ * C17, libc + pthread + OpenSSL only.  One client owns one connection;
+ * the connection is shared safely between threads by an internal mutex.
+ *
+ * Every function that can fail takes (char *err, size_t errcap) and writes
+ * a human readable message there.  Return values: 0 success / -1 error,
+ * except vk_get which returns 1 (found), 0 (nil) or -1 (error) and
+ * vk_scan which returns 0 / -1.
+ */
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Supported URLs:
+ *   redis://[user][:pass@]host:port[/db][?db=N]
+ *   rediss://[user][:pass@]host:port[/db][?db=N][&insecure=1]
+ *   unix:///absolute/path/to.sock[?db=N]
+ *   host:port            (bare, plain TCP)
+ * Default port 6379, default db 0.  rediss: system CA store, hostname/IP
+ * verification and SNI for names; ?insecure=1 disables verification.
+ */
+vk_client *vk_connect(const char *url, char *err, size_t errcap);
+void vk_close(vk_client *c);
+
+int vk_ping(vk_client *c, char *err, size_t errcap);
+
+/* 1 = found (*val malloc'd, NUL terminated, non-NULL even for an empty
+ * value), 0 = key does not exist (val untouched), -1 = error. */
+int vk_get(vk_client *c, const char *key, unsigned char **val, size_t *vallen,
+           char *err, size_t errcap);
+
+/* SET key val EX ttl; ttl_sec <= 0 performs a plain SET. */
+int vk_set_ex(vk_client *c, const char *key, const unsigned char *val,
+              size_t vallen, long long ttl_sec, char *err, size_t errcap);
+
+int vk_del(vk_client *c, const char *key, char *err, size_t errcap);
+
+/* One SCAN call: SCAN cursor [MATCH match] [COUNT count].
+ * cursor_out is malloc'd; keys is a malloc'd array of malloc'd NUL
+ * terminated strings, release with vk_free_keys(keys, nkeys). */
+int vk_scan(vk_client *c, const char *cursor_in, const char *match, long count,
+            char **cursor_out, char ***keys, size_t *nkeys, char *err,
+            size_t errcap);
+
+void vk_free_keys(char **keys, size_t nkeys);
+
+
+/*
+ * valkey_io.c - small standalone RESP2 client for Redis / Valkey.
+ *
+ * Scope: one connection per client, mutex protected, AUTH/SELECT/PING on
+ * connect, reconnect + one retry on I/O errors, RESP2 parser with bounds
+ * checks, optional TLS (OpenSSL) and unix sockets.
+ */
+#define _POSIX_C_SOURCE 200809L
+
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+
+#define VK_LINE_MAX 65536
+#define VK_BULK_MAX (512ULL * 1024ULL * 1024ULL)
+#define VK_ARRAY_MAX (8ULL * 1024ULL * 1024ULL)
+#define VK_MAX_DEPTH 16
+#define VK_CONNECT_TIMEOUT_MS 3000
+#define VK_IO_TIMEOUT_MS 5000
+#define VK_RBUF_SIZE 65536
+
+struct vk_client {
+    pthread_mutex_t lock;
+    int fd;
+    int tls;
+    int insecure;
+    int alive;
+    int use_unix;
+    int port;
+    int db;
+    int connect_timeout_ms;
+    int io_timeout_ms;
+    char *host; /* hostname or unix socket path */
+    char *user; /* NULL when no userinfo was supplied */
+    char *pass; /* NULL when no userinfo was supplied */
+    SSL_CTX *ctx;
+    SSL *ssl;
+    unsigned char *rbuf;
+    size_t rcap;
+    size_t rlen;
+    size_t rpos;
+    int io_err;
+    char io_msg[256];
+};
+
+static int vk__connect_internal(vk_client *c, char *err, size_t errcap);
+
+/* ------------------------------------------------------------------ */
+/* small helpers                                                      */
+/* ------------------------------------------------------------------ */
+
+static void set_err(char *err, size_t errcap, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (err == NULL || errcap == 0) {
+        return;
+    }
+    va_start(ap, fmt);
+    vsnprintf(err, errcap, fmt, ap);
+    va_end(ap);
+}
+
+static long long now_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000L);
+}
+
+static int hex_value(int ch)
+{
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return ch - 'a' + 10;
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return ch - 'A' + 10;
+    }
+    return -1;
+}
+
+/* Percent-decode a substring; unknown escapes are kept literally. */
+static char *pct_decode(const char *s, size_t n)
+{
+    char *out;
+    size_t i;
+    size_t o = 0;
+
+    out = (char *)malloc(n + 1);
+    if (out == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < n; i++) {
+        if (s[i] == '%' && i + 2 < n) {
+            int hi = hex_value((unsigned char)s[i + 1]);
+            int lo = hex_value((unsigned char)s[i + 2]);
+
+            if (hi >= 0 && lo >= 0) {
+                out[o++] = (char)(hi * 16 + lo);
+                i += 2;
+                continue;
+            }
+        }
+        out[o++] = s[i];
+    }
+    out[o] = '\0';
+    return out;
+}
+
+static char *dup_range(const char *s, size_t n)
+{
+    char *out = (char *)malloc(n + 1);
+
+    if (out == NULL) {
+        return NULL;
+    }
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return out;
+}
+
+static int parse_u64(const char *s, size_t n, unsigned long long maxv,
+                     unsigned long long *out)
+{
+    unsigned long long v = 0;
+    size_t i;
+
+    if (n == 0) {
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        unsigned int d;
+
+        if (s[i] < '0' || s[i] > '9') {
+            return -1;
+        }
+        d = (unsigned int)(s[i] - '0');
+        if (v > (maxv - d) / 10ULL) {
+            return -1;
+        }
+        v = v * 10ULL + d;
+    }
+    *out = v;
+    return 0;
+}
+
+static int parse_i64(const char *s, size_t n, long long *out)
+{
+    int neg = 0;
+    size_t i = 0;
+    unsigned long long v = 0;
+    unsigned long long limit;
+
+    if (n == 0) {
+        return -1;
+    }
+    if (s[0] == '-') {
+        neg = 1;
+        i = 1;
+        if (n == 1) {
+            return -1;
+        }
+    }
+    limit = neg ? (unsigned long long)LLONG_MAX + 1ULL
+                : (unsigned long long)LLONG_MAX;
+    for (; i < n; i++) {
+        unsigned int d;
+
+        if (s[i] < '0' || s[i] > '9') {
+            return -1;
+        }
+        d = (unsigned int)(s[i] - '0');
+        if (v > (limit - d) / 10ULL) {
+            return -1;
+        }
+        v = v * 10ULL + d;
+    }
+    if (neg) {
+        *out = (v == (unsigned long long)LLONG_MAX + 1ULL)
+                   ? LLONG_MIN
+                   : -(long long)v;
+    } else {
+        *out = (long long)v;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* URL parsing                                                        */
+/* ------------------------------------------------------------------ */
+
+struct url_parts {
+    int use_unix;
+    int tls;
+    int insecure;
+    int port;
+    int db;
+    char *host;
+    char *user;
+    char *pass;
+};
+
+static void url_parts_free(struct url_parts *u)
+{
+    free(u->host);
+    free(u->user);
+    free(u->pass);
+    u->host = NULL;
+    u->user = NULL;
+    u->pass = NULL;
+}
+
+static int query_lookup_db(const char *q, size_t qn, int *db)
+{
+    size_t i = 0;
+
+    while (i < qn) {
+        size_t start = i;
+        size_t eq;
+        size_t end;
+
+        while (i < qn && q[i] != '&') {
+            i++;
+        }
+        end = i;
+        if (i < qn) {
+            i++; /* skip '&' */
+        }
+        eq = start;
+        while (eq < end && q[eq] != '=') {
+            eq++;
+        }
+        if (eq == end) {
+            continue;
+        }
+        if ((eq - start) == 2 && strncmp(q + start, "db", 2) == 0) {
+            unsigned long long v;
+
+            if (parse_u64(q + eq + 1, end - (eq + 1), 1000000ULL, &v) != 0) {
+                return -1;
+            }
+            *db = (int)v;
+        }
+    }
+    return 0;
+}
+
+static int query_insecure(const char *q, size_t qn)
+{
+    size_t i = 0;
+
+    while (i < qn) {
+        size_t start = i;
+        size_t eq;
+        size_t end;
+
+        while (i < qn && q[i] != '&') {
+            i++;
+        }
+        end = i;
+        if (i < qn) {
+            i++;
+        }
+        eq = start;
+        while (eq < end && q[eq] != '=') {
+            eq++;
+        }
+        if (eq == end || (eq - start) != 8) {
+            continue;
+        }
+        if (strncasecmp(q + start, "insecure", 8) != 0) {
+            continue;
+        }
+        if ((end - (eq + 1)) == 1 && q[eq + 1] == '1') {
+            return 1;
+        }
+        if ((end - (eq + 1)) == 4 &&
+            strncasecmp(q + eq + 1, "true", 4) == 0) {
+            return 1;
+        }
+        if ((end - (eq + 1)) == 3 &&
+            strncasecmp(q + eq + 1, "yes", 3) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int url_parse(const char *url, struct url_parts *u, char *err,
+                     size_t errcap)
+{
+    const char *p = url;
+    const char *qmark;
+    const char *query = NULL;
+    size_t query_len = 0;
+    const char *authority;
+    size_t authority_len;
+    const char *path = NULL;
+    size_t path_len = 0;
+    const char *at;
+    const char *hostport;
+    size_t hostport_len;
+
+    memset(u, 0, sizeof(*u));
+    u->port = 6379;
+
+    if (url == NULL || url[0] == '\0') {
+        set_err(err, errcap, "empty URL");
+        return -1;
+    }
+
+    if (strncasecmp(p, "unix://", 7) == 0) {
+        u->use_unix = 1;
+        p += 7;
+    } else if (strncasecmp(p, "redis://", 8) == 0) {
+        p += 8;
+    } else if (strncasecmp(p, "rediss://", 9) == 0) {
+        u->tls = 1;
+        p += 9;
+    } else if (strstr(p, "://") != NULL) {
+        set_err(err, errcap, "unsupported URL scheme in \"%s\"", url);
+        return -1;
+    }
+
+    qmark = strchr(p, '?');
+    if (qmark != NULL) {
+        query = qmark + 1;
+        query_len = strlen(query);
+    }
+
+    if (u->use_unix) {
+        size_t path_end = (qmark != NULL) ? (size_t)(qmark - p) : strlen(p);
+
+        if (path_end == 0 || p[0] != '/') {
+            set_err(err, errcap,
+                    "unix URL needs an absolute socket path: %s", url);
+            return -1;
+        }
+        u->host = dup_range(p, path_end);
+        if (u->host == NULL) {
+            set_err(err, errcap, "out of memory");
+            return -1;
+        }
+        if (query != NULL && query_lookup_db(query, query_len, &u->db) != 0) {
+            set_err(err, errcap, "invalid db in URL query: %s", url);
+            url_parts_free(u);
+            return -1;
+        }
+        return 0;
+    }
+
+    /* authority ends at the first '/' or at the query. */
+    authority = p;
+    {
+        const char *slash = strchr(p, '/');
+
+        if (slash != NULL && (qmark == NULL || slash < qmark)) {
+            authority_len = (size_t)(slash - p);
+            path = slash;
+            path_len = (qmark != NULL) ? (size_t)(qmark - slash)
+                                       : strlen(slash);
+        } else if (qmark != NULL) {
+            authority_len = (size_t)(qmark - p);
+        } else {
+            authority_len = strlen(p);
+        }
+    }
+
+    at = NULL;
+    {
+        size_t i;
+
+        for (i = 0; i < authority_len; i++) {
+            if (authority[i] == '@') {
+                at = authority + i;
+            }
+        }
+    }
+    if (at != NULL) {
+        const char *ui = authority;
+        size_t ui_len = (size_t)(at - authority);
+        const char *colon = memchr(ui, ':', ui_len);
+
+        if (colon != NULL) {
+            u->user = pct_decode(ui, (size_t)(colon - ui));
+            u->pass = pct_decode(colon + 1, ui_len - (size_t)(colon - ui) - 1);
+        } else {
+            u->pass = pct_decode(ui, ui_len);
+        }
+        if ((u->user != NULL && u->user[0] == '\0')) {
+            free(u->user);
+            u->user = NULL;
+        }
+        if (u->pass == NULL) {
+            set_err(err, errcap, "out of memory");
+            url_parts_free(u);
+            return -1;
+        }
+        hostport = at + 1;
+        hostport_len = authority_len - ui_len - 1;
+    } else {
+        hostport = authority;
+        hostport_len = authority_len;
+    }
+
+    if (hostport_len == 0) {
+        set_err(err, errcap, "missing host in URL: %s", url);
+        url_parts_free(u);
+        return -1;
+    }
+
+    if (hostport[0] == '[') {
+        const char *close = memchr(hostport, ']', hostport_len);
+
+        if (close == NULL) {
+            set_err(err, errcap, "malformed IPv6 host in URL: %s", url);
+            url_parts_free(u);
+            return -1;
+        }
+        u->host = dup_range(hostport + 1, (size_t)(close - hostport) - 1);
+        if (u->host == NULL) {
+            set_err(err, errcap, "out of memory");
+            url_parts_free(u);
+            return -1;
+        }
+        if ((size_t)(close - hostport) + 1 < hostport_len) {
+            const char *cport = close + 1;
+            size_t clen = hostport_len - (size_t)(close - hostport) - 1;
+            unsigned long long v;
+
+            if (cport[0] != ':' ||
+                parse_u64(cport + 1, clen - 1, 65535ULL, &v) != 0 ||
+                v == 0) {
+                set_err(err, errcap, "invalid port in URL: %s", url);
+                url_parts_free(u);
+                return -1;
+            }
+            u->port = (int)v;
+        }
+    } else {
+        const char *colon = NULL;
+        size_t i;
+
+        for (i = 0; i < hostport_len; i++) {
+            if (hostport[i] == ':') {
+                colon = hostport + i;
+            }
+        }
+        if (colon != NULL) {
+            unsigned long long v;
+
+            if (parse_u64(colon + 1,
+                          hostport_len - (size_t)(colon - hostport) - 1,
+                          65535ULL, &v) != 0 ||
+                v == 0) {
+                set_err(err, errcap, "invalid port in URL: %s", url);
+                url_parts_free(u);
+                return -1;
+            }
+            u->port = (int)v;
+            u->host = dup_range(hostport, (size_t)(colon - hostport));
+        } else {
+            u->host = dup_range(hostport, hostport_len);
+        }
+        if (u->host == NULL) {
+            set_err(err, errcap, "out of memory");
+            url_parts_free(u);
+            return -1;
+        }
+        if (u->host[0] == '\0') {
+            set_err(err, errcap, "missing host in URL: %s", url);
+            url_parts_free(u);
+            return -1;
+        }
+    }
+
+    /* path may be "/3" (db) and the query may override it. */
+    if (path != NULL && path_len > 1) {
+        unsigned long long v;
+
+        if (parse_u64(path + 1, path_len - 1, 1000000ULL, &v) == 0) {
+            u->db = (int)v;
+        } else {
+            set_err(err, errcap, "invalid db in URL path: %s", url);
+            url_parts_free(u);
+            return -1;
+        }
+    }
+    if (query != NULL) {
+        if (query_lookup_db(query, query_len, &u->db) != 0) {
+            set_err(err, errcap, "invalid db in URL query: %s", url);
+            url_parts_free(u);
+            return -1;
+        }
+        if (query_insecure(query, query_len) != 0) {
+            u->insecure = 1;
+        }
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* growable command buffer                                            */
+/* ------------------------------------------------------------------ */
+
+struct sbuf {
+    char *data;
+    size_t len;
+    size_t cap;
+};
+
+static void sbuf_free(struct sbuf *sb)
+{
+    free(sb->data);
+    sb->data = NULL;
+    sb->len = 0;
+    sb->cap = 0;
+}
+
+static int sbuf_reserve(struct sbuf *sb, size_t extra)
+{
+    size_t need;
+    size_t cap;
+    char *p;
+
+    if (extra > SIZE_MAX - sb->len) {
+        return -1;
+    }
+    need = sb->len + extra;
+    if (need <= sb->cap) {
+        return 0;
+    }
+    cap = (sb->cap == 0) ? 256 : sb->cap;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) {
+            cap = need;
+            break;
+        }
+        cap *= 2;
+    }
+    p = (char *)realloc(sb->data, cap);
+    if (p == NULL) {
+        return -1;
+    }
+    sb->data = p;
+    sb->cap = cap;
+    return 0;
+}
+
+static int sbuf_append(struct sbuf *sb, const void *p, size_t n)
+{
+    if (n == 0) {
+        return 0;
+    }
+    if (sbuf_reserve(sb, n) != 0) {
+        return -1;
+    }
+    memcpy(sb->data + sb->len, p, n);
+    sb->len += n;
+    return 0;
+}
+
+typedef struct {
+    const void *p;
+    size_t len;
+} vk_arg;
+
+static int sbuf_bulk(struct sbuf *sb, const void *p, size_t n)
+{
+    char hdr[64];
+    int hl;
+
+    hl = snprintf(hdr, sizeof(hdr), "$%zu\r\n", n);
+    if (hl < 0 || (size_t)hl >= sizeof(hdr)) {
+        return -1;
+    }
+    if (sbuf_append(sb, hdr, (size_t)hl) != 0) {
+        return -1;
+    }
+    if (sbuf_append(sb, p, n) != 0) {
+        return -1;
+    }
+    return sbuf_append(sb, "\r\n", 2);
+}
+
+static int build_command(struct sbuf *sb, const vk_arg *args, size_t nargs,
+                         char *err, size_t errcap)
+{
+    char hdr[64];
+    int hl;
+    size_t i;
+
+    sb->data = NULL;
+    sb->len = 0;
+    sb->cap = 0;
+
+    hl = snprintf(hdr, sizeof(hdr), "*%zu\r\n", nargs);
+    if (hl < 0 || (size_t)hl >= sizeof(hdr) ||
+        sbuf_append(sb, hdr, (size_t)hl) != 0) {
+        set_err(err, errcap, "out of memory building command");
+        sbuf_free(sb);
+        return -1;
+    }
+    for (i = 0; i < nargs; i++) {
+        if (sbuf_bulk(sb, args[i].p, args[i].len) != 0) {
+            set_err(err, errcap, "out of memory building command");
+            sbuf_free(sb);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* reply representation and parser                                    */
+/* ------------------------------------------------------------------ */
+
+enum vk_rkind {
+    VK_R_STRING = 1,
+    VK_R_ERROR,
+    VK_R_INT,
+    VK_R_NIL,
+    VK_R_ARRAY
+};
+
+typedef struct vk_reply {
+    int kind;
+    char *str; /* STRING / ERROR payload */
+    size_t len;
+    long long ival;
+    struct vk_reply **elems;
+    size_t nelems;
+} vk_reply;
+
+static void reply_free(vk_reply *r)
+{
+    size_t i;
+
+    if (r == NULL) {
+        return;
+    }
+    if (r->elems != NULL) {
+        for (i = 0; i < r->nelems; i++) {
+            reply_free(r->elems[i]);
+        }
+        free(r->elems);
+    }
+    free(r->str);
+    free(r);
+}
+
+/* ------------------------------------------------------------------ */
+/* socket setup / TLS                                                 */
+/* ------------------------------------------------------------------ */
+
+static void close_socket(vk_client *c)
+{
+    if (c->ssl != NULL) {
+        SSL_free(c->ssl);
+        c->ssl = NULL;
+    }
+    if (c->fd >= 0) {
+        close(c->fd);
+        c->fd = -1;
+    }
+    c->alive = 0;
+    c->rlen = 0;
+    c->rpos = 0;
+    c->io_err = 0;
+}
+
+static void set_fd_timeouts(int fd, int ms)
+{
+    struct timeval tv;
+
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+/* 0 ok, -1 timeout (err set), -2 other failure (errno set, err set) */
+static int wait_connect(int fd, int timeout_ms, const char *what, char *err,
+                        size_t errcap)
+{
+    struct pollfd pfd;
+    int soerr = 0;
+    socklen_t slen = sizeof(soerr);
+
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+    for (;;) {
+        int pr = poll(&pfd, 1, timeout_ms);
+
+        if (pr > 0) {
+            break;
+        }
+        if (pr == 0) {
+            set_err(err, errcap, "%s timed out after %d ms", what, timeout_ms);
+            return -1;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        set_err(err, errcap, "%s: poll failed: %s", what, strerror(errno));
+        return -2;
+    }
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) != 0) {
+        set_err(err, errcap, "%s: getsockopt(SO_ERROR) failed: %s", what,
+                strerror(errno));
+        return -2;
+    }
+    if (soerr != 0) {
+        errno = soerr;
+        set_err(err, errcap, "%s failed: %s", what, strerror(soerr));
+        return -2;
+    }
+    return 0;
+}
+
+static int tcp_open(vk_client *c, char *err, size_t errcap)
+{
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    struct addrinfo *ai;
+    char portstr[16];
+    int fd = -1;
+    int last_errno = 0;
+    int rc;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (snprintf(portstr, sizeof(portstr), "%d", c->port) >=
+        (int)sizeof(portstr)) {
+        set_err(err, errcap, "invalid port");
+        return -1;
+    }
+    rc = getaddrinfo(c->host, portstr, &hints, &res);
+    if (rc != 0) {
+        set_err(err, errcap, "cannot resolve \"%s\": %s", c->host,
+                gai_strerror(rc));
+        return -1;
+    }
+
+    for (ai = res; ai != NULL; ai = ai->ai_next) {
+        int flags;
+        int r;
+
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            last_errno = errno;
+            continue;
+        }
+        flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            last_errno = errno;
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        r = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (r != 0 && errno != EINPROGRESS) {
+            last_errno = errno;
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        if (r != 0) {
+            int wr = wait_connect(fd, c->connect_timeout_ms, "connect", err,
+                                  errcap);
+
+            if (wr == -1) {
+                close(fd);
+                freeaddrinfo(res);
+                return -1;
+            }
+            if (wr == -2) {
+                last_errno = errno;
+                close(fd);
+                fd = -1;
+                continue;
+            }
+        }
+        break;
+    }
+    freeaddrinfo(res);
+
+    if (fd < 0) {
+        if (last_errno == 0) {
+            last_errno = EIO;
+        }
+        set_err(err, errcap, "cannot connect to %s:%d: %s", c->host, c->port,
+                strerror(last_errno));
+        return -1;
+    }
+
+    {
+        int flags = fcntl(fd, F_GETFL, 0);
+
+        if (flags >= 0) {
+            (void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+        }
+    }
+    set_fd_timeouts(fd, c->io_timeout_ms);
+    {
+        int one = 1;
+
+        (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    }
+    c->fd = fd;
+    return 0;
+}
+
+static int unix_open(vk_client *c, char *err, size_t errcap)
+{
+    struct sockaddr_un sa;
+    size_t plen;
+    int fd;
+    int flags;
+    int r;
+
+    plen = strlen(c->host);
+    if (plen >= sizeof(sa.sun_path)) {
+        set_err(err, errcap, "unix socket path is too long (%zu bytes)", plen);
+        return -1;
+    }
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    memcpy(sa.sun_path, c->host, plen + 1);
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        set_err(err, errcap, "socket(AF_UNIX) failed: %s", strerror(errno));
+        return -1;
+    }
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        set_err(err, errcap, "fcntl failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    r = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (r != 0 && errno != EINPROGRESS) {
+        set_err(err, errcap, "cannot connect to unix socket %s: %s", c->host,
+                strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (r != 0) {
+        int wr = wait_connect(fd, c->connect_timeout_ms, "unix connect", err,
+                              errcap);
+
+        if (wr != 0) {
+            close(fd);
+            return -1;
+        }
+    }
+    {
+        int fl = fcntl(fd, F_GETFL, 0);
+
+        if (fl >= 0) {
+            (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+        }
+    }
+    set_fd_timeouts(fd, c->io_timeout_ms);
+    c->fd = fd;
+    return 0;
+}
+
+static void tls_last_error(vk_client *c, const char *what, char *err,
+                           size_t errcap)
+{
+    unsigned long e = ERR_get_error();
+    char ebuf[256];
+    long vr;
+
+    if (e != 0) {
+        ERR_error_string_n(e, ebuf, sizeof(ebuf));
+    } else {
+        snprintf(ebuf, sizeof(ebuf), "no OpenSSL error queued");
+    }
+    while (ERR_get_error() != 0) {
+        /* drain the rest of the queue */
+    }
+    vr = SSL_get_verify_result(c->ssl);
+    if (vr != X509_V_OK) {
+        set_err(err, errcap, "%s: %s (certificate verify: %s)", what, ebuf,
+                X509_verify_cert_error_string(vr));
+        snprintf(c->io_msg, sizeof(c->io_msg),
+                 "TLS certificate verification failed: %s",
+                 X509_verify_cert_error_string(vr));
+    } else {
+        set_err(err, errcap, "%s: %s", what, ebuf);
+        snprintf(c->io_msg, sizeof(c->io_msg), "%.96s: %.120s", what,
+                 ebuf);
+    }
+}
+
+static int tls_start(vk_client *c, char *err, size_t errcap)
+{
+    int is_ip;
+    unsigned char addr[16];
+    long long deadline;
+
+    if (c->ctx == NULL) {
+        c->ctx = SSL_CTX_new(TLS_client_method());
+        if (c->ctx == NULL) {
+            set_err(err, errcap, "SSL_CTX_new failed");
+            return -1;
+        }
+        if (SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION) != 1) {
+            set_err(err, errcap, "cannot require TLS >= 1.2");
+            return -1;
+        }
+        if (c->insecure) {
+            SSL_CTX_set_verify(c->ctx, SSL_VERIFY_NONE, NULL);
+        } else {
+            SSL_CTX_set_verify(c->ctx, SSL_VERIFY_PEER, NULL);
+            if (SSL_CTX_set_default_verify_paths(c->ctx) != 1) {
+                set_err(err, errcap, "cannot load system CA store");
+                return -1;
+            }
+        }
+    }
+
+    c->ssl = SSL_new(c->ctx);
+    if (c->ssl == NULL) {
+        set_err(err, errcap, "SSL_new failed");
+        return -1;
+    }
+    if (SSL_set_fd(c->ssl, c->fd) != 1) {
+        tls_last_error(c, "SSL_set_fd failed", err, errcap);
+        SSL_free(c->ssl);
+        c->ssl = NULL;
+        return -1;
+    }
+
+    is_ip = (inet_pton(AF_INET, c->host, addr) == 1) ||
+            (inet_pton(AF_INET6, c->host, addr) == 1);
+    if (!is_ip) {
+        if (SSL_set_tlsext_host_name(c->ssl, c->host) != 1) {
+            tls_last_error(c, "cannot set TLS SNI", err, errcap);
+            SSL_free(c->ssl);
+            c->ssl = NULL;
+            return -1;
+        }
+        if (SSL_set1_host(c->ssl, c->host) != 1) {
+            tls_last_error(c, "cannot set TLS hostname check", err, errcap);
+            SSL_free(c->ssl);
+            c->ssl = NULL;
+            return -1;
+        }
+    } else {
+        X509_VERIFY_PARAM *param = SSL_get0_param(c->ssl);
+
+        if (param == NULL ||
+            X509_VERIFY_PARAM_set1_ip_asc(param, c->host) != 1) {
+            set_err(err, errcap, "cannot set TLS IP check for %s", c->host);
+            SSL_free(c->ssl);
+            c->ssl = NULL;
+            return -1;
+        }
+    }
+
+    SSL_set_connect_state(c->ssl);
+    deadline = now_ms() + VK_IO_TIMEOUT_MS;
+    for (;;) {
+        int r;
+
+        ERR_clear_error();
+        r = SSL_connect(c->ssl);
+        if (r == 1) {
+            return 0;
+        }
+        {
+            int e = SSL_get_error(c->ssl, r);
+
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+                if (now_ms() >= deadline) {
+                    set_err(err, errcap,
+                            "TLS handshake with %s timed out after %d ms",
+                            c->host, VK_IO_TIMEOUT_MS);
+                    SSL_free(c->ssl);
+                    c->ssl = NULL;
+                    return -1;
+                }
+                continue;
+            }
+            if (e == SSL_ERROR_SYSCALL && errno == EINTR) {
+                continue;
+            }
+            if (e == SSL_ERROR_SYSCALL &&
+                (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                set_err(err, errcap, "TLS handshake timed out");
+                SSL_free(c->ssl);
+                c->ssl = NULL;
+                return -1;
+            }
+        }
+        tls_last_error(c, "TLS handshake failed", err, errcap);
+        SSL_free(c->ssl);
+        c->ssl = NULL;
+        return -1;
+    }
+}
+
+static ssize_t tls_read_some(vk_client *c, char *err, size_t errcap)
+{
+    long long deadline = now_ms() + c->io_timeout_ms;
+
+    for (;;) {
+        int cap;
+        int n;
+        int e;
+
+        ERR_clear_error();
+        cap = (c->rcap > (size_t)INT_MAX) ? INT_MAX : (int)c->rcap;
+        n = SSL_read(c->ssl, c->rbuf, cap);
+        if (n > 0) {
+            return (ssize_t)n;
+        }
+        e = SSL_get_error(c->ssl, n);
+        if (e == SSL_ERROR_ZERO_RETURN) {
+            return 0;
+        }
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+            if (now_ms() >= deadline) {
+                set_err(err, errcap, "TLS read timed out after %d ms",
+                        c->io_timeout_ms);
+                snprintf(c->io_msg, sizeof(c->io_msg),
+                         "TLS read timed out after %d ms", c->io_timeout_ms);
+                return -1;
+            }
+            continue;
+        }
+        if (e == SSL_ERROR_SYSCALL && errno == EINTR) {
+            continue;
+        }
+        if (e == SSL_ERROR_SYSCALL &&
+            (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            set_err(err, errcap, "TLS read timed out after %d ms",
+                    c->io_timeout_ms);
+            snprintf(c->io_msg, sizeof(c->io_msg),
+                     "TLS read timed out after %d ms", c->io_timeout_ms);
+            return -1;
+        }
+        tls_last_error(c, "TLS read failed", err, errcap);
+        return -1;
+    }
+}
+
+static int io_send_all(vk_client *c, const void *buf, size_t len, char *err,
+                       size_t errcap)
+{
+    const unsigned char *p = (const unsigned char *)buf;
+    size_t off = 0;
+    long long deadline = now_ms() + c->io_timeout_ms;
+
+    if (c->ssl != NULL) {
+        while (off < len) {
+            int chunk = (len - off > (size_t)INT_MAX)
+                            ? INT_MAX
+                            : (int)(len - off);
+            int n;
+            int e;
+
+            ERR_clear_error();
+            n = SSL_write(c->ssl, p + off, chunk);
+            if (n > 0) {
+                off += (size_t)n;
+                continue;
+            }
+            e = SSL_get_error(c->ssl, n);
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+                if (now_ms() >= deadline) {
+                    set_err(err, errcap, "TLS write timed out after %d ms",
+                            c->io_timeout_ms);
+                    snprintf(c->io_msg, sizeof(c->io_msg),
+                             "TLS write timed out after %d ms",
+                             c->io_timeout_ms);
+                    return -1;
+                }
+                continue;
+            }
+            if (e == SSL_ERROR_SYSCALL && errno == EINTR) {
+                continue;
+            }
+            tls_last_error(c, "TLS write failed", err, errcap);
+            return -1;
+        }
+        return 0;
+    }
+
+    while (off < len) {
+        ssize_t n = send(c->fd, p + off, len - off, MSG_NOSIGNAL);
+
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        set_err(err, errcap, "write failed: %s", strerror(errno));
+        snprintf(c->io_msg, sizeof(c->io_msg), "write failed: %s",
+                 strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int rb_fill(vk_client *c, char *err, size_t errcap)
+{
+    if (c->rpos < c->rlen) {
+        return 0;
+    }
+    for (;;) {
+        ssize_t n;
+
+        if (c->ssl != NULL) {
+            n = tls_read_some(c, err, errcap);
+            if (n < 0) {
+                c->io_err = 1;
+                return -1;
+            }
+        } else {
+            n = recv(c->fd, c->rbuf, c->rcap, 0);
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n < 0) {
+                set_err(err, errcap,
+                        "read failed: %s (timeout %d ms)", strerror(errno),
+                        c->io_timeout_ms);
+                snprintf(c->io_msg, sizeof(c->io_msg), "read failed: %s",
+                         strerror(errno));
+                c->io_err = 1;
+                return -1;
+            }
+        }
+        if (n == 0) {
+            set_err(err, errcap, "connection closed by server");
+            snprintf(c->io_msg, sizeof(c->io_msg),
+                     "connection closed by server");
+            c->io_err = 1;
+            return -1;
+        }
+        c->rlen = (size_t)n;
+        c->rpos = 0;
+        return 0;
+    }
+}
+
+static int rb_read_line(vk_client *c, char *out, size_t outcap, size_t *outlen,
+                        char *err, size_t errcap)
+{
+    size_t n = 0;
+
+    for (;;) {
+        unsigned char ch;
+
+        if (c->rpos >= c->rlen) {
+            if (rb_fill(c, err, errcap) != 0) {
+                return -1;
+            }
+        }
+        ch = c->rbuf[c->rpos++];
+        if (ch == '\r') {
+            unsigned char ch2;
+
+            if (c->rpos >= c->rlen) {
+                if (rb_fill(c, err, errcap) != 0) {
+                    return -1;
+                }
+            }
+            ch2 = c->rbuf[c->rpos++];
+            if (ch2 != '\n') {
+                set_err(err, errcap, "protocol error: expected LF after CR");
+                return -1;
+            }
+            if (n >= outcap) {
+                set_err(err, errcap, "protocol error: reply line too long");
+                return -1;
+            }
+            out[n] = '\0';
+            *outlen = n;
+            return 0;
+        }
+        if (ch == '\n') {
+            set_err(err, errcap, "protocol error: unexpected LF in reply");
+            return -1;
+        }
+        if (n + 1 >= outcap) {
+            set_err(err, errcap,
+                    "protocol error: reply line exceeds %zu bytes", outcap);
+            return -1;
+        }
+        out[n++] = (char)ch;
+    }
+}
+
+static int rb_read_exact(vk_client *c, unsigned char *dst, size_t len,
+                         char *err, size_t errcap)
+{
+    while (len > 0) {
+        size_t avail;
+        size_t take;
+
+        if (c->rpos >= c->rlen) {
+            if (rb_fill(c, err, errcap) != 0) {
+                return -1;
+            }
+        }
+        avail = c->rlen - c->rpos;
+        take = (avail < len) ? avail : len;
+        memcpy(dst, c->rbuf + c->rpos, take);
+        c->rpos += take;
+        dst += take;
+        len -= take;
+    }
+    return 0;
+}
+
+static vk_reply *read_reply(vk_client *c, int depth, char *err, size_t errcap)
+{
+    char line[VK_LINE_MAX];
+    size_t n = 0;
+    vk_reply *r;
+
+    if (depth > VK_MAX_DEPTH) {
+        set_err(err, errcap,
+                "protocol error: reply nesting deeper than %d levels",
+                VK_MAX_DEPTH);
+        return NULL;
+    }
+    if (rb_read_line(c, line, sizeof(line), &n, err, errcap) != 0) {
+        return NULL;
+    }
+    if (n == 0) {
+        set_err(err, errcap, "protocol error: empty reply line");
+        return NULL;
+    }
+
+    r = (vk_reply *)calloc(1, sizeof(*r));
+    if (r == NULL) {
+        set_err(err, errcap, "out of memory");
+        return NULL;
+    }
+
+    switch (line[0]) {
+    case '+':
+        r->kind = VK_R_STRING;
+        r->str = dup_range(line + 1, n - 1);
+        if (r->str == NULL) {
+            set_err(err, errcap, "out of memory");
+            reply_free(r);
+            return NULL;
+        }
+        r->len = n - 1;
+        break;
+    case '-':
+        r->kind = VK_R_ERROR;
+        r->str = dup_range(line + 1, n - 1);
+        if (r->str == NULL) {
+            set_err(err, errcap, "out of memory");
+            reply_free(r);
+            return NULL;
+        }
+        r->len = n - 1;
+        break;
+    case ':':
+        if (parse_i64(line + 1, n - 1, &r->ival) != 0) {
+            set_err(err, errcap, "protocol error: invalid integer reply");
+            reply_free(r);
+            return NULL;
+        }
+        r->kind = VK_R_INT;
+        break;
+    case '$': {
+        long long blen;
+
+        if (parse_i64(line + 1, n - 1, &blen) != 0) {
+            set_err(err, errcap, "protocol error: invalid bulk length");
+            reply_free(r);
+            return NULL;
+        }
+        if (blen == -1) {
+            r->kind = VK_R_NIL;
+            break;
+        }
+        if (blen < 0 || (unsigned long long)blen > VK_BULK_MAX) {
+            set_err(err, errcap,
+                    "protocol error: bulk length %lld out of range", blen);
+            reply_free(r);
+            return NULL;
+        }
+        r->str = (char *)malloc((size_t)blen + 1);
+        if (r->str == NULL) {
+            set_err(err, errcap, "out of memory for %lld byte bulk", blen);
+            reply_free(r);
+            return NULL;
+        }
+        if (rb_read_exact(c, (unsigned char *)r->str, (size_t)blen, err,
+                          errcap) != 0) {
+            reply_free(r);
+            return NULL;
+        }
+        {
+            unsigned char crlf[2];
+
+            if (rb_read_exact(c, crlf, 2, err, errcap) != 0) {
+                reply_free(r);
+                return NULL;
+            }
+            if (crlf[0] != '\r' || crlf[1] != '\n') {
+                set_err(err, errcap,
+                        "protocol error: bulk payload not terminated by CRLF");
+                reply_free(r);
+                return NULL;
+            }
+        }
+        r->str[blen] = '\0';
+        r->len = (size_t)blen;
+        r->kind = VK_R_STRING;
+        break;
+    }
+    case '*': {
+        long long count;
+        size_t i;
+
+        if (parse_i64(line + 1, n - 1, &count) != 0) {
+            set_err(err, errcap, "protocol error: invalid array length");
+            reply_free(r);
+            return NULL;
+        }
+        if (count == -1) {
+            r->kind = VK_R_NIL;
+            break;
+        }
+        if (count < 0 || (unsigned long long)count > VK_ARRAY_MAX) {
+            set_err(err, errcap,
+                    "protocol error: array length %lld out of range", count);
+            reply_free(r);
+            return NULL;
+        }
+        if ((size_t)count > SIZE_MAX / sizeof(vk_reply *)) {
+            set_err(err, errcap, "protocol error: array too large");
+            reply_free(r);
+            return NULL;
+        }
+        r->kind = VK_R_ARRAY;
+        r->elems = (vk_reply **)calloc((size_t)count, sizeof(vk_reply *));
+        if (r->elems == NULL) {
+            set_err(err, errcap, "out of memory for array of %lld", count);
+            reply_free(r);
+            return NULL;
+        }
+        r->nelems = (size_t)count;
+        for (i = 0; i < (size_t)count; i++) {
+            r->elems[i] = read_reply(c, depth + 1, err, errcap);
+            if (r->elems[i] == NULL) {
+                reply_free(r);
+                return NULL;
+            }
+        }
+        break;
+    }
+    default:
+        set_err(err, errcap,
+                "protocol error: unexpected reply type byte 0x%02x",
+                (unsigned)(unsigned char)line[0]);
+        reply_free(r);
+        return NULL;
+    }
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
+/* execution                                                          */
+/* ------------------------------------------------------------------ */
+
+static vk_reply *exec_once(vk_client *c, const struct sbuf *sb, char *err,
+                           size_t errcap)
+{
+    c->io_err = 0;
+    if (io_send_all(c, sb->data, sb->len, err, errcap) != 0) {
+        c->io_err = 1;
+        return NULL;
+    }
+    return read_reply(c, 0, err, errcap);
+}
+
+static vk_reply *exec_locked(vk_client *c, const struct sbuf *sb, char *err,
+                             size_t errcap)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 2; attempt++) {
+        vk_reply *r;
+        int was_io;
+
+        if (!c->alive) {
+            /* reconnect using the stored credentials (lock already held) */
+            if (vk__connect_internal(c, err, errcap) != 0) {
+                return NULL;
+            }
+        }
+        r = exec_once(c, sb, err, errcap);
+        if (r != NULL) {
+            return r;
+        }
+        was_io = c->io_err;
+        close_socket(c);
+        if (!was_io) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static vk_reply *vk_command(vk_client *c, const vk_arg *args, size_t nargs,
+                            char *err, size_t errcap)
+{
+    struct sbuf sb;
+    vk_reply *r;
+
+    if (c == NULL) {
+        set_err(err, errcap, "valkey client is NULL");
+        return NULL;
+    }
+    if (build_command(&sb, args, nargs, err, errcap) != 0) {
+        return NULL;
+    }
+    pthread_mutex_lock(&c->lock);
+    r = exec_locked(c, &sb, err, errcap);
+    pthread_mutex_unlock(&c->lock);
+    sbuf_free(&sb);
+    return r;
+}
+
+/* Check a handshake reply; returns 0 if the expected +string arrived. */
+static int handshake_expect(vk_client *c, vk_reply *r, const char *what,
+                            char *err, size_t errcap)
+{
+    int rc = 0;
+
+    (void)c;
+    if (r == NULL) {
+        return -1;
+    }
+    if (r->kind == VK_R_ERROR) {
+        set_err(err, errcap, "%s failed: %s", what, r->str);
+        rc = -1;
+    } else if (r->kind != VK_R_STRING) {
+        set_err(err, errcap, "%s failed: unexpected reply type", what);
+        rc = -1;
+    }
+    reply_free(r);
+    return rc;
+}
+
+/* Connect + TLS + AUTH + SELECT + PING.  Must be called with the lock held
+ * (or before the client is shared between threads). */
+static int vk__connect_internal(vk_client *c, char *err, size_t errcap)
+{
+    struct sbuf sb;
+    vk_reply *r;
+    char dbstr[32];
+    int rc = -1;
+
+    close_socket(c);
+    c->io_err = 0;
+
+    if (c->use_unix) {
+        if (unix_open(c, err, errcap) != 0) {
+            return -1;
+        }
+    } else if (tcp_open(c, err, errcap) != 0) {
+        return -1;
+    }
+    if (c->tls) {
+        if (tls_start(c, err, errcap) != 0) {
+            close_socket(c);
+            return -1;
+        }
+    }
+
+    if (c->pass != NULL) {
+        vk_arg args[3];
+        size_t nargs;
+
+        args[0].p = "AUTH";
+        args[0].len = 4;
+        if (c->user != NULL) {
+            args[1].p = c->user;
+            args[1].len = strlen(c->user);
+            args[2].p = c->pass;
+            args[2].len = strlen(c->pass);
+            nargs = 3;
+        } else {
+            args[1].p = c->pass;
+            args[1].len = strlen(c->pass);
+            nargs = 2;
+        }
+        if (build_command(&sb, args, nargs, err, errcap) != 0) {
+            close_socket(c);
+            return -1;
+        }
+        r = exec_once(c, &sb, err, errcap);
+        sbuf_free(&sb);
+        if (handshake_expect(c, r, "AUTH", err, errcap) != 0) {
+            close_socket(c);
+            return -1;
+        }
+    }
+
+    if (c->db > 0) {
+        vk_arg args[2];
+
+        snprintf(dbstr, sizeof(dbstr), "%d", c->db);
+        args[0].p = "SELECT";
+        args[0].len = 6;
+        args[1].p = dbstr;
+        args[1].len = strlen(dbstr);
+        if (build_command(&sb, args, 2, err, errcap) != 0) {
+            close_socket(c);
+            return -1;
+        }
+        r = exec_once(c, &sb, err, errcap);
+        sbuf_free(&sb);
+        if (handshake_expect(c, r, "SELECT", err, errcap) != 0) {
+            close_socket(c);
+            return -1;
+        }
+    }
+
+    {
+        vk_arg args[1];
+
+        args[0].p = "PING";
+        args[0].len = 4;
+        if (build_command(&sb, args, 1, err, errcap) != 0) {
+            close_socket(c);
+            return -1;
+        }
+        r = exec_once(c, &sb, err, errcap);
+        sbuf_free(&sb);
+        if (r == NULL) {
+            close_socket(c);
+            return -1;
+        }
+        if (r->kind == VK_R_ERROR) {
+            set_err(err, errcap, "PING failed: %s", r->str);
+            reply_free(r);
+            close_socket(c);
+            return -1;
+        }
+        if (r->kind != VK_R_STRING) {
+            set_err(err, errcap, "PING failed: unexpected reply type");
+            reply_free(r);
+            close_socket(c);
+            return -1;
+        }
+        reply_free(r);
+    }
+
+    c->alive = 1;
+    rc = 0;
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* public API                                                         */
+/* ------------------------------------------------------------------ */
+
+vk_client *vk_connect(const char *url, char *err, size_t errcap)
+{
+    struct url_parts up;
+    vk_client *c;
+
+    if (err != NULL && errcap > 0) {
+        err[0] = '\0';
+    }
+    if (url == NULL || url[0] == '\0') {
+        set_err(err, errcap, "vk_connect: empty URL");
+        return NULL;
+    }
+    if (url_parse(url, &up, err, errcap) != 0) {
+        return NULL;
+    }
+
+    c = (vk_client *)calloc(1, sizeof(*c));
+    if (c == NULL) {
+        url_parts_free(&up);
+        set_err(err, errcap, "out of memory");
+        return NULL;
+    }
+    c->fd = -1;
+    c->tls = up.tls;
+    c->insecure = up.insecure;
+    c->use_unix = up.use_unix;
+    c->port = up.port;
+    c->db = up.db;
+    c->host = up.host;
+    c->user = up.user;
+    c->pass = up.pass;
+    c->connect_timeout_ms = VK_CONNECT_TIMEOUT_MS;
+    c->io_timeout_ms = VK_IO_TIMEOUT_MS;
+
+    if (pthread_mutex_init(&c->lock, NULL) != 0) {
+        free(c->host);
+        free(c->user);
+        free(c->pass);
+        free(c);
+        set_err(err, errcap, "cannot initialise client mutex");
+        return NULL;
+    }
+    c->rbuf = (unsigned char *)malloc(VK_RBUF_SIZE);
+    if (c->rbuf == NULL) {
+        pthread_mutex_destroy(&c->lock);
+        free(c->host);
+        free(c->user);
+        free(c->pass);
+        free(c);
+        set_err(err, errcap, "out of memory");
+        return NULL;
+    }
+    c->rcap = VK_RBUF_SIZE;
+
+    if (vk__connect_internal(c, err, errcap) != 0) {
+        vk_close(c);
+        return NULL;
+    }
+    return c;
+}
+
+void vk_close(vk_client *c)
+{
+    if (c == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&c->lock);
+    close_socket(c);
+    if (c->ctx != NULL) {
+        SSL_CTX_free(c->ctx);
+        c->ctx = NULL;
+    }
+    free(c->rbuf);
+    c->rbuf = NULL;
+    free(c->host);
+    free(c->user);
+    free(c->pass);
+    pthread_mutex_unlock(&c->lock);
+    pthread_mutex_destroy(&c->lock);
+    free(c);
+}
+
+int vk_ping(vk_client *c, char *err, size_t errcap)
+{
+    vk_arg args[1];
+    vk_reply *r;
+    int rc = 0;
+
+    if (c == NULL) {
+        set_err(err, errcap, "vk_ping: NULL client");
+        return -1;
+    }
+    args[0].p = "PING";
+    args[0].len = 4;
+    r = vk_command(c, args, 1, err, errcap);
+    if (r == NULL) {
+        return -1;
+    }
+    if (r->kind == VK_R_ERROR) {
+        set_err(err, errcap, "%s", r->str);
+        rc = -1;
+    } else if (r->kind != VK_R_STRING) {
+        set_err(err, errcap, "PING: unexpected reply type");
+        rc = -1;
+    }
+    reply_free(r);
+    return rc;
+}
+
+int vk_get(vk_client *c, const char *key, unsigned char **val, size_t *vallen,
+           char *err, size_t errcap)
+{
+    vk_arg args[2];
+    vk_reply *r;
+    int rc = -1;
+
+    if (c == NULL || key == NULL || val == NULL || vallen == NULL) {
+        set_err(err, errcap, "vk_get: invalid argument");
+        return -1;
+    }
+    args[0].p = "GET";
+    args[0].len = 3;
+    args[1].p = key;
+    args[1].len = strlen(key);
+
+    r = vk_command(c, args, 2, err, errcap);
+    if (r == NULL) {
+        return -1;
+    }
+    if (r->kind == VK_R_ERROR) {
+        set_err(err, errcap, "%s", r->str);
+    } else if (r->kind == VK_R_NIL) {
+        rc = 0;
+    } else if (r->kind == VK_R_STRING) {
+        unsigned char *copy = (unsigned char *)malloc(r->len + 1);
+
+        if (copy == NULL) {
+            set_err(err, errcap, "out of memory");
+        } else {
+            memcpy(copy, r->str, r->len);
+            copy[r->len] = '\0';
+            *val = copy;
+            *vallen = r->len;
+            rc = 1;
+        }
+    } else {
+        set_err(err, errcap, "GET: unexpected reply type");
+    }
+    reply_free(r);
+    return rc;
+}
+
+int vk_set_ex(vk_client *c, const char *key, const unsigned char *val,
+              size_t vallen, long long ttl_sec, char *err, size_t errcap)
+{
+    vk_arg args[5];
+    vk_reply *r;
+    char ttlstr[32];
+    size_t nargs;
+    int rc = 0;
+
+    if (c == NULL || key == NULL || (val == NULL && vallen > 0)) {
+        set_err(err, errcap, "vk_set_ex: invalid argument");
+        return -1;
+    }
+    args[0].p = "SET";
+    args[0].len = 3;
+    args[1].p = key;
+    args[1].len = strlen(key);
+    args[2].p = (val != NULL) ? val : (const unsigned char *)"";
+    args[2].len = vallen;
+    nargs = 3;
+    if (ttl_sec > 0) {
+        int l = snprintf(ttlstr, sizeof(ttlstr), "%lld", ttl_sec);
+
+        if (l < 0 || (size_t)l >= sizeof(ttlstr)) {
+            set_err(err, errcap, "vk_set_ex: TTL out of range");
+            return -1;
+        }
+        args[3].p = "EX";
+        args[3].len = 2;
+        args[4].p = ttlstr;
+        args[4].len = strlen(ttlstr);
+        nargs = 5;
+    }
+
+    r = vk_command(c, args, nargs, err, errcap);
+    if (r == NULL) {
+        return -1;
+    }
+    if (r->kind == VK_R_ERROR) {
+        set_err(err, errcap, "%s", r->str);
+        rc = -1;
+    } else if (r->kind != VK_R_STRING) {
+        set_err(err, errcap, "SET: unexpected reply type");
+        rc = -1;
+    }
+    reply_free(r);
+    return rc;
+}
+
+int vk_del(vk_client *c, const char *key, char *err, size_t errcap)
+{
+    vk_arg args[2];
+    vk_reply *r;
+    int rc = 0;
+
+    if (c == NULL || key == NULL) {
+        set_err(err, errcap, "vk_del: invalid argument");
+        return -1;
+    }
+    args[0].p = "DEL";
+    args[0].len = 3;
+    args[1].p = key;
+    args[1].len = strlen(key);
+
+    r = vk_command(c, args, 2, err, errcap);
+    if (r == NULL) {
+        return -1;
+    }
+    if (r->kind == VK_R_ERROR) {
+        set_err(err, errcap, "%s", r->str);
+        rc = -1;
+    } else if (r->kind != VK_R_INT) {
+        set_err(err, errcap, "DEL: unexpected reply type");
+        rc = -1;
+    }
+    reply_free(r);
+    return rc;
+}
+
+void vk_free_keys(char **keys, size_t nkeys)
+{
+    size_t i;
+
+    if (keys == NULL) {
+        return;
+    }
+    for (i = 0; i < nkeys; i++) {
+        free(keys[i]);
+    }
+    free(keys);
+}
+
+int vk_scan(vk_client *c, const char *cursor_in, const char *match, long count,
+            char **cursor_out, char ***keys, size_t *nkeys, char *err,
+            size_t errcap)
+{
+    vk_arg args[6];
+    vk_reply *r;
+    char countstr[32];
+    size_t nargs = 2;
+    size_t i;
+    char **out_keys = NULL;
+    char *out_cursor = NULL;
+    size_t produced = 0;
+    int rc = -1;
+
+    if (c == NULL || cursor_in == NULL || cursor_out == NULL || keys == NULL ||
+        nkeys == NULL) {
+        set_err(err, errcap, "vk_scan: invalid argument");
+        return -1;
+    }
+    *cursor_out = NULL;
+    *keys = NULL;
+    *nkeys = 0;
+
+    args[0].p = "SCAN";
+    args[0].len = 4;
+    args[1].p = cursor_in;
+    args[1].len = strlen(cursor_in);
+    if (match != NULL) {
+        args[nargs].p = "MATCH";
+        args[nargs].len = 5;
+        nargs++;
+        args[nargs].p = match;
+        args[nargs].len = strlen(match);
+        nargs++;
+    }
+    if (count > 0) {
+        int l = snprintf(countstr, sizeof(countstr), "%ld", count);
+
+        if (l < 0 || (size_t)l >= sizeof(countstr)) {
+            set_err(err, errcap, "vk_scan: COUNT out of range");
+            return -1;
+        }
+        args[nargs].p = "COUNT";
+        args[nargs].len = 5;
+        nargs++;
+        args[nargs].p = countstr;
+        args[nargs].len = strlen(countstr);
+        nargs++;
+    }
+
+    r = vk_command(c, args, nargs, err, errcap);
+    if (r == NULL) {
+        return -1;
+    }
+    if (r->kind == VK_R_ERROR) {
+        set_err(err, errcap, "%s", r->str);
+        goto done;
+    }
+    if (r->kind != VK_R_ARRAY || r->nelems != 2 ||
+        r->elems[0]->kind != VK_R_STRING ||
+        r->elems[1]->kind != VK_R_ARRAY) {
+        set_err(err, errcap, "SCAN: malformed reply");
+        goto done;
+    }
+    out_cursor = dup_range(r->elems[0]->str, r->elems[0]->len);
+    if (out_cursor == NULL) {
+        set_err(err, errcap, "out of memory");
+        goto done;
+    }
+    if (r->elems[1]->nelems > 0) {
+        out_keys = (char **)calloc(r->elems[1]->nelems, sizeof(char *));
+        if (out_keys == NULL) {
+            set_err(err, errcap, "out of memory");
+            goto done;
+        }
+        for (i = 0; i < r->elems[1]->nelems; i++) {
+            vk_reply *e = r->elems[1]->elems[i];
+
+            if (e->kind != VK_R_STRING) {
+                set_err(err, errcap, "SCAN: non-string key in reply");
+                goto done;
+            }
+            out_keys[i] = dup_range(e->str, e->len);
+            if (out_keys[i] == NULL) {
+                set_err(err, errcap, "out of memory");
+                goto done;
+            }
+            produced++;
+        }
+    }
+    *cursor_out = out_cursor;
+    *keys = out_keys;
+    *nkeys = r->elems[1]->nelems;
+    out_cursor = NULL;
+    out_keys = NULL;
+    rc = 0;
+
+done:
+    if (out_keys != NULL) {
+        vk_free_keys(out_keys, produced);
+    }
+    free(out_cursor);
+    reply_free(r);
+    return rc;
+}
+
+
+/* ------------------------------------------------------------- valkey store
+ *
+ * --store valkey:redis://... is the shared backend: challenges and honeypot
+ * counters live in Valkey (or any RESP-compatible server), not in this
+ * process. Records use the same JSON as the bbolt store and native TTLs:
+ *
+ *   betteranusbis:challenge:<id>  {"id":...,"randomData":...,...}  EX 604800
+ *   betteranusbis:honeypot:<key>  {"count":N,"last":unix}          EX 3600
+ *
+ * Reads are remote-first for the mutable state (spent, cssSeen) and local-first
+ * for the immutable peeks (algorithm, referer, issued time), so a challenge
+ * issued by one instance verifies on another. Startup walks SCAN over our two
+ * prefixes and fills the in-memory tables, which keeps the normal path fast.
+ *
+ * If Valkey goes away the gate keeps serving from memory: remote failures log
+ * once and back off, and the local table is the fallback. That is deliberate —
+ * a cache outage should not take the site down — but it also means two
+ * instances can disagree until the store returns.
+ */
+#define VK_CH_PREFIX "betteranusbis:challenge:"
+#define VK_HP_PREFIX "betteranusbis:honeypot:"
+#define VK_MISS_SLOTS 256
+
+static time_t vk_backoff_until;
+
+typedef struct {
+    uint64_t key;
+    time_t when;
+    int used;
+} vk_miss_entry;
+
+static vk_miss_entry vk_misses[VK_MISS_SLOTS];
+
+static void vk_warn(const char *what, const char *err) {
+    static time_t last;
+    time_t now = time(NULL);
+    if (now - last >= 5) {
+        logmsg("store: valkey %s: %s", what, err && *err ? err : "error");
+        last = now;
+    }
+    vk_backoff_until = now + 5;
+}
+
+static int vk_available(void) {
+    return store_valkey && vk != NULL && time(NULL) >= vk_backoff_until;
+}
+
+static void challenge_json(const ch_entry *e, char *buf, size_t cap) {
+    char esc_ref[2048], esc_rd[256], esc_algo[128];
+    json_escape_into(e->referer, esc_ref, sizeof esc_ref);
+    json_escape_into(e->rd, esc_rd, sizeof esc_rd);
+    json_escape_into(e->algorithm, esc_algo, sizeof esc_algo);
+    snprintf(buf, cap,
+             "{\"id\":\"%s\",\"randomData\":\"%s\",\"algorithm\":\"%s\","
+             "\"difficulty\":%d,\"spent\":%s,\"issuedMs\":%lld,"
+             "\"cssSeen\":%s,\"referer\":\"%s\"}",
+             e->id, esc_rd, esc_algo, e->difficulty, e->spent ? "true" : "false",
+             e->issued_ms, e->css_seen ? "true" : "false", esc_ref);
+}
+
+static int challenge_from_json(const char *json, ch_entry *e) {
+    memset(e, 0, sizeof *e);
+    if (!json_get_str(json, "randomData", e->rd, sizeof e->rd)) return 0;
+    if (!json_get_str(json, "id", e->id, sizeof e->id) || !e->id[0]) {
+        /* the bucket/key name carries one; the caller fills it if absent */
+    }
+    if (!json_get_str(json, "algorithm", e->algorithm, sizeof e->algorithm) ||
+        !e->algorithm[0])
+        snprintf(e->algorithm, sizeof e->algorithm, "%s", cfg.algorithm);
+    json_get_str(json, "referer", e->referer, sizeof e->referer);
+    e->difficulty = (int)json_get_ll(json, "difficulty", cfg.difficulty);
+    e->spent = json_get_bool(json, "spent", 0);
+    e->css_seen = json_get_bool(json, "cssSeen", 0);
+    e->issued_ms = json_get_ll(json, "issuedMs", (long long)time(NULL) * 1000);
+    e->issued = (time_t)(e->issued_ms / 1000);
+    e->used = 1;
+    return 1;
+}
+
+/* Insert or refresh the local cache without creating a second copy. */
+static void ch_cache_put(const ch_entry *src) {
+    uint32_t h = 2166136261u;
+    for (const char *q = src->id; *q; q++) h = (h ^ (uint8_t)*q) * 16777619u;
+    pthread_mutex_lock(&ch_lock);
+    for (int probe = 0; probe < 32; probe++) {
+        ch_entry *e = &ch_table[(h + (uint32_t)probe) % CH_BUCKETS];
+        if (!e->used || !strcmp(e->id, src->id)) {
+            *e = *src;
+            e->used = 1;
+            pthread_mutex_unlock(&ch_lock);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&ch_lock);
+}
+
+static int vk_get_challenge(const char *id, ch_entry *out) {
+    if (!vk_available() || !id || !*id) return 0;
+    char key[160], err[256] = "";
+    unsigned char *val = NULL;
+    size_t len = 0;
+    snprintf(key, sizeof key, VK_CH_PREFIX "%s", id);
+    int rc = vk_get(vk, key, &val, &len, err, sizeof err);
+    if (rc < 0) { vk_warn("GET challenge", err); return -1; }
+    if (rc == 0) return 0;
+    char *json = malloc(len + 1);
+    if (!json) { free(val); return -1; }
+    memcpy(json, val, len);
+    json[len] = 0;
+    free(val);
+    int ok = challenge_from_json(json, out);
+    free(json);
+    if (!ok) return 0;
+    if (!out->id[0]) snprintf(out->id, sizeof out->id, "%s", id);
+    return 1;
+}
+
+static void vk_put_challenge(const ch_entry *e, long long ttl) {
+    if (!vk_available() || !e || !e->id[0]) return;
+    char key[160], json[4096], err[256] = "";
+    challenge_json(e, json, sizeof json);
+    snprintf(key, sizeof key, VK_CH_PREFIX "%s", e->id);
+    if (vk_set_ex(vk, key, (const unsigned char *)json, strlen(json), ttl, err,
+                  sizeof err) != 0)
+        vk_warn("SET challenge", err);
+}
+
+static int vk_get_honeypot(uint64_t key, int *count, time_t *last) {
+    if (!vk_available()) return 0;
+    char name[96], err[256] = "";
+    unsigned char *val = NULL;
+    size_t len = 0;
+    snprintf(name, sizeof name, VK_HP_PREFIX "%llu", (unsigned long long)key);
+    int rc = vk_get(vk, name, &val, &len, err, sizeof err);
+    if (rc < 0) { vk_warn("GET honeypot", err); return -1; }
+    if (rc == 0) return 0;
+    char json[512];
+    size_t n = len < sizeof json - 1 ? len : sizeof json - 1;
+    memcpy(json, val, n);
+    json[n] = 0;
+    free(val);
+    int c = (int)json_get_ll(json, "count", 0);
+    long long l = json_get_ll(json, "last", 0);
+    if (c <= 0 || l <= 0) return 0;
+    *count = c;
+    *last = (time_t)l;
+    return 1;
+}
+
+static void vk_put_honeypot(uint64_t key, int count, time_t last) {
+    if (!vk_available()) return;
+    char name[96], json[160], err[256] = "";
+    snprintf(name, sizeof name, VK_HP_PREFIX "%llu", (unsigned long long)key);
+    snprintf(json, sizeof json, "{\"count\":%d,\"last\":%lld}", count, (long long)last);
+    if (vk_set_ex(vk, name, (const unsigned char *)json, strlen(json), HP_WINDOW,
+                  err, sizeof err) != 0)
+        vk_warn("SET honeypot", err);
+}
+
+/* A negative cache: a network with no honeypot hits would otherwise cost a
+ * Valkey round trip on every single request. */
+static int vk_miss_seen(uint64_t key) {
+    time_t now = time(NULL);
+    int seen = 0;
+    pthread_mutex_lock(&hp_lock);
+    for (int probe = 0; probe < 16; probe++) {
+        vk_miss_entry *m = &vk_misses[(key + (uint64_t)probe) % VK_MISS_SLOTS];
+        if (!m->used) break;
+        if (m->key != key) continue;
+        seen = now - m->when < 5;
+        if (!seen) m->when = now;
+        break;
+    }
+    pthread_mutex_unlock(&hp_lock);
+    return seen;
+}
+
+static void vk_miss_mark(uint64_t key) {
+    pthread_mutex_lock(&hp_lock);
+    for (int probe = 0; probe < 16; probe++) {
+        vk_miss_entry *m = &vk_misses[(key + (uint64_t)probe) % VK_MISS_SLOTS];
+        if (!m->used || m->key == key) {
+            m->used = 1;
+            m->key = key;
+            m->when = time(NULL);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&hp_lock);
+}
+
+static void hp_cache_put(uint64_t key, int count, time_t last) {
+    pthread_mutex_lock(&hp_lock);
+    for (int probe = 0; probe < 32; probe++) {
+        hp_entry *e = &hp_table[(key + (uint64_t)probe) % HP_BUCKETS];
+        if (!e->used || e->key == key) {
+            e->used = 1;
+            e->key = key;
+            e->count = count;
+            e->last = last;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&hp_lock);
+}
+
+static void valkey_load_state(void) {
+    char *cursor = strdup("0");
+    long long nch = 0, nhp = 0;
+    if (!cursor) return;
+    for (;;) {
+        char *next = NULL, err[256] = "";
+        char **keys = NULL;
+        size_t nkeys = 0;
+        if (vk_scan(vk, cursor, "betteranusbis:*", 500, &next, &keys, &nkeys,
+                    err, sizeof err) != 0) {
+            vk_warn("SCAN", err);
+            free(cursor);
+            return;
+        }
+        for (size_t i = 0; i < nkeys; i++) {
+            unsigned char *val = NULL;
+            size_t len = 0;
+            char gerr[256] = "";
+            if (vk_get(vk, keys[i], &val, &len, gerr, sizeof gerr) != 1) continue;
+            char *json = malloc(len + 1);
+            if (!json) { free(val); continue; }
+            memcpy(json, val, len);
+            json[len] = 0;
+            free(val);
+            if (!strncmp(keys[i], VK_CH_PREFIX, strlen(VK_CH_PREFIX))) {
+                ch_entry e;
+                if (challenge_from_json(json, &e)) {
+                    const char *id = keys[i] + strlen(VK_CH_PREFIX);
+                    snprintf(e.id, sizeof e.id, "%s", id);
+                    if ((long long)time(NULL) - (long long)e.issued <= COOKIE_TTL) {
+                        ch_cache_put(&e);
+                        nch++;
+                    }
+                }
+            } else if (!strncmp(keys[i], VK_HP_PREFIX, strlen(VK_HP_PREFIX))) {
+                unsigned long long key = strtoull(keys[i] + strlen(VK_HP_PREFIX), NULL, 10);
+                int c = (int)json_get_ll(json, "count", 0);
+                long long l = json_get_ll(json, "last", 0);
+                if (c > 0 && key && (long long)time(NULL) - l <= HP_WINDOW) {
+                    pthread_mutex_lock(&hp_lock);
+                    for (int k = 0; k < HP_BUCKETS; k++) {
+                        hp_entry *e = &hp_table[k];
+                        if (!e->used || e->key == key) {
+                            e->used = 1;
+                            e->key = key;
+                            e->count = c;
+                            e->last = (time_t)l;
+                            nhp++;
+                            break;
+                        }
+                    }
+                    pthread_mutex_unlock(&hp_lock);
+                }
+            }
+            free(json);
+        }
+        if (keys) vk_free_keys(keys, nkeys);
+        int stuck = next && cursor && !strcmp(next, cursor);
+        free(cursor);
+        if (stuck) {
+            /* a server that does not advance the cursor must not hang us */
+            free(next);
+            next = strdup("0");
+        }
+        cursor = next;
+        if (!cursor || !strcmp(cursor, "0")) {
+            free(cursor);
+            cursor = NULL;
+            break;
+        }
+    }
+    free(cursor);
+    logmsg("store: valkey %s, loaded %lld challenge(s) and %lld network(s)",
+           store_path, nch, nhp);
+}
+
+/* Never put the password from redis://user:pass@host into a log or an error. */
+static void vk_redact_url(const char *url, char *out, size_t cap) {
+    const char *scheme = strstr(url, "://");
+    const char *at = strrchr(url, '@');
+    if (scheme && at && at > scheme + 3) {
+        size_t keep = (size_t)(scheme - url) + 3;
+        snprintf(out, cap, "%.*s***%s", (int)keep, url, at);
+    } else {
+        snprintf(out, cap, "%s", url);
+    }
+}
+
+static int valkey_store_start(const char *url) {
+    char err[512] = "";
+    char safe[1024];
+    vk_redact_url(url, safe, sizeof safe);
+    vk = vk_connect(url, err, sizeof err);
+    if (!vk) {
+        fprintf(stderr, "betterAnusbis: cannot connect to valkey (%s): %s\n", safe,
+                err[0] ? err : "connection failed");
+        return -1;
+    }
+    if (vk_ping(vk, err, sizeof err) != 0) {
+        fprintf(stderr, "betterAnusbis: valkey PING failed: %s\n",
+                err[0] ? err : "no response");
+        vk_close(vk);
+        vk = NULL;
+        return -1;
+    }
+    store_valkey = 1;
+    logmsg("store: valkey %s, TTLs carry the expiry", safe);
+    valkey_load_state();
+    return 0;
+}
+
 /* ---------------------------------------------------------------- the store
  *
  * The challenge ledger and the honeypot counters live in memory, so a restart
@@ -4218,12 +6650,13 @@ static void on_shutdown(int sig) {
 static void store_mark_dirty(void) { store_dirty = 1; }
 
 static void store_write(void) {
+    if (store_valkey) return;       /* writes happen with the event, not on a timer */
     if (store_bbolt) {
         if (bbolt_store_write() == 0) store_dirty = 0;
         return;
     }
     if (!store_path[0]) return;
-    char tmp[560];
+    char tmp[1040];
     snprintf(tmp, sizeof tmp, "%s.tmp", store_path);
     FILE *f = fopen(tmp, "w");
     if (!f) {
@@ -4266,6 +6699,7 @@ static void store_write(void) {
 }
 
 static int store_load(void) {
+    if (store_valkey) return valkey_store_start(store_path);
     if (store_bbolt) return bbolt_load_or_create();
     FILE *f = fopen(store_path, "r");
     if (!f) {
@@ -8292,6 +10726,7 @@ static void policy_apply_blocks(const y_node *root) {
         const char *backend = y_str(y_get(store, "backend"), "memory");
         const y_node *params = y_get(store, "parameters");
         const char *path = y_str(y_get(params, "path"), NULL);
+        const char *url = y_str(y_get(params, "url"), NULL);
         if (!strcasecmp(backend, "memory")) {
             logmsg("policy: store backend memory");
         } else if (!strcasecmp(backend, "file") && path && *path) {
@@ -8308,10 +10743,19 @@ static void policy_apply_blocks(const y_node *root) {
                 cfg.store = y_dup(spec);
             }
             logmsg("policy: store backend bbolt, %s", path);
-        } else if (!strcasecmp(backend, "valkey") || !strcasecmp(backend, "s3api")) {
-            logmsg("policy: store backend %s is not implemented by betterAnusbis; the "
-                   "challenge ledger stays in memory (--store file:PATH or "
-                   "--store bbolt:PATH survives a restart)", backend);
+        } else if (!strcasecmp(backend, "valkey") && url && *url) {
+            if (!cfg.store) {
+                char spec[1024];
+                snprintf(spec, sizeof spec, "valkey:%s", url);
+                cfg.store = y_dup(spec);
+            }
+            logmsg("policy: store backend valkey configured");
+        } else if (!strcasecmp(backend, "valkey")) {
+            logmsg("policy: store backend valkey needs parameters.url; using memory");
+        } else if (!strcasecmp(backend, "s3api")) {
+            logmsg("policy: store backend s3api is not implemented by betterAnusbis; the "
+                   "challenge ledger stays in memory (file, bbolt and valkey stores are "
+                   "implemented)");
         } else {
             logmsg("policy: store backend %s is unknown here, using memory", backend);
         }
@@ -12062,11 +14506,11 @@ static void usage(FILE *out) {
         "                         /api/check and the challenge\n"
         "  --public-url URL       where this gate is reachable, used to build the\n"
         "                         forwardAuth redirect\n"
-        "  --store file:PATH|bbolt:PATH\n"
+        "  --store file:PATH|bbolt:PATH|valkey:URL\n"
         "                         keep the challenge ledger and the honeypot counters\n"
-        "                         here: a snapshot text file, or an Anubis-style\n"
-        "                         bbolt DB (single writer; valkey and S3 are not\n"
-        "                         implemented)\n"
+        "                         here: a snapshot text file, an Anubis-style bbolt DB\n"
+        "                         (single writer), or Valkey/Redis (redis://, rediss://,\n"
+        "                         unix:///path?db=N; S3 is not implemented)\n"
         "  --challenge-extension NAME\n"
         "                         css-load: the page's stylesheet must be fetched\n"
         "                         before pass-challenge is accepted\n"
@@ -12728,11 +15172,20 @@ int main(int argc, char **argv) {
                 pthread_detach(store_thread_id);
             logmsg("store: bbolt %s, flushed every five seconds (single writer)",
                    store_path);
+        } else if (!strncmp(cfg.store, "valkey:", 7)) {
+            snprintf(store_path, sizeof store_path, "%s", cfg.store + 7);
+            if (!store_path[0]) {
+                fprintf(stderr, "betterAnusbis: --store valkey: wants a URL, e.g. "
+                                "redis://127.0.0.1:6379/0\n");
+                return 2;
+            }
+            store_valkey = 1;
+            if (store_load() != 0) return 1;
         } else if (!strcmp(cfg.store, "memory") || !strcmp(cfg.store, "none")) {
             logmsg("store: memory only, as before");
         } else {
-            fprintf(stderr, "betterAnusbis: --store wants file:PATH, bbolt:PATH "
-                            "or memory (valkey and S3 are not implemented)\n");
+            fprintf(stderr, "betterAnusbis: --store wants file:PATH, bbolt:PATH, "
+                            "valkey:URL or memory (S3 is not implemented)\n");
             return 2;
         }
     }
