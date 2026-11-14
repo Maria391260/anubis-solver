@@ -295,6 +295,14 @@ repository.
 
 ---
 
+## 13. just why
+
+<p align="center">
+  <img src="mascot/hallofshame1.jpg" alt="a maid holding a hand with a ring that says Minimal" width="420">
+</p>
+
+---
+
 ## Rules this repository took from the above
 
 1. Count attempts, not calls. The search stops when it wins, and the count is
