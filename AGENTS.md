@@ -108,7 +108,7 @@ make xe-loader && ./build/xe-loader --text /tmp/intelXe_sha256.krn   # run the h
 | `src/cpu/avx2.s`, `src/cpu/avx512.s` | `tools/gen_avx2_s.py`, `tools/gen_avx512_s.py` |
 | `src/intel/xe/intelXe_sha256.xe` | `tools/gen_xe_sha256.py` (needs `IGA64` to assemble) |
 | `src/intel/xe/intelXe_sha256.igc.xe` | run `tools/xe-sha256-opencl.c`, `dd` the `.text.sha256_pow` section out of the Zebin, `iga64 -p 12p1 -d` |
-| `beyond/rtl/periph/deepseek_egg.v`, `beyond/vectors/deepseek_egg.txt` | `python3 beyond/tools/gen_deepseek_egg.py` (the message is in the generator) |
+| `beyond/rtl/periph/deepseek_egg.v`, `beyond/vectors/deepseek_egg.txt`, `beyond/vectors/deepseek_egg_alt.txt` | `python3 beyond/tools/gen_deepseek_egg.py` (both messages are in the generator) |
 | `mascot/deepseek-maid-bubble.png` | `python3 tools/make_maid_bubble.py` (see `MAID.md`) |
 | (none yet) | `sassasm/` is a partial SASS assembler, checked by `python3 sassasm/selftest.py` against ptxas |
 

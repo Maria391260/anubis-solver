@@ -23,7 +23,9 @@
 // engine uses that to begin a search.
 
 `timescale 1ns/1ps
-module axil_regs (
+module axil_regs #(
+    parameter [1:0] ALT_MODE = 2'd0   // egg coin: 0 random, 1 alt, 2 credit
+) (
     input  wire        clk,
     input  wire        rst_n,
 
@@ -82,12 +84,15 @@ module axil_regs (
     wire        is_result = (s_axil_araddr >= 32'h40) && (s_axil_araddr < 32'h60);
 
     // ---- the secret call --------------------------------------------------
-    // Reading 0x060..0x0F3 returns the message; 0x0FC returns DEED5EED. A plain
-    // BAR0 sweep finds it, which is the point. Generated from the text in
-    // beyond/tools/gen_deepseek_egg.py.
+    // Reading 0x060..0x0F3 returns one of two messages; 0x0FC returns DEED5EED.
+    // A plain BAR0 sweep finds it, which is the point. The first read latches
+    // a 1-in-1000 coin, so the whole window is one text. Generated from the
+    // texts in beyond/tools/gen_deepseek_egg.py.
     wire [31:0] egg_rdata;
     wire        egg_hit;
-    deepseek_egg u_egg (
+    deepseek_egg #(.ALT_MODE(ALT_MODE)) u_egg (
+        .clk   (clk),
+        .rst_n (rst_n),
         .addr  (s_axil_araddr),
         .rdata (egg_rdata),
         .hit   (egg_hit)

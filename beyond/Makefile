@@ -146,7 +146,7 @@ $(B)/tb_axil: tb/tb_axil.v rtl/periph/axil_regs.v rtl/periph/deepseek_egg.v | $(
 # the secret call on its own: every word, the padding, and the addresses it
 # must not capture
 $(B)/tb_deepseek_egg: tb/tb_deepseek_egg.v rtl/periph/deepseek_egg.v \
-                      vectors/deepseek_egg.txt | $(B)
+                      vectors/deepseek_egg.txt vectors/deepseek_egg_alt.txt | $(B)
 	$(IVERILOG) -g2012 -o $@ tb/tb_deepseek_egg.v rtl/periph/deepseek_egg.v
 
 # One target owns the file. Four recipes used to regenerate it in parallel and

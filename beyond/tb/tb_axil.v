@@ -22,7 +22,7 @@ module tb_axil;
     reg  [7:0]  lz = 0;
     reg  [255:0] tag = 0;
 
-    axil_regs dut (
+    axil_regs #(.ALT_MODE(2'd2)) dut (
         .clk(clk), .rst_n(rst_n),
         .s_axil_awaddr(awaddr), .s_axil_awvalid(awvalid), .s_axil_awready(awready),
         .s_axil_wdata(wdata), .s_axil_wstrb(4'hF), .s_axil_wvalid(wvalid),

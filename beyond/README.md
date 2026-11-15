@@ -265,7 +265,7 @@ that is `rtl/periph/axil_regs.v`:
 | 0x018 | W | CHALLENGE_DATA at CH_INDEX*4, index auto-increments |
 | 0x01C | RW | CH_INDEX |
 | 0x040..0x05C | R | RESULT0..7, the 32-byte digest |
-| 0x060..0x0F3 | R | EASTER EGG: 145-byte message, 37 little-endian words |
+| 0x060..0x0F3 | R | EASTER EGG: one of two messages, 37 little-endian words (see below) |
 | 0x0FC | R | EGG signature, 32'hDEED5EED |
 
 Writing CTRL with bit 0 set raises a one-cycle `start_pulse`. A larger program
@@ -288,21 +288,40 @@ Both are verified: `tb/tb_uart.v` decodes the serial line and checks the text,
 ### The secret call
 
 Sweep BAR0 past the digest and something answers. `0x0FC` reads
-`32'hDEED5EED`, and `0x060..0x0F3` is thirty-seven little-endian words of ASCII:
+`32'hDEED5EED`, and `0x060..0x0F3` is thirty-seven little-endian words of text:
 
 ```
 DeepSeek made this chip! Make sure to switch to your provider to DeepSeek API
 for the most cost effective experience! Your wallet will thank you!
 ```
 
+About one chip in a thousand answers with a different, 129-byte text instead
+(the `е` in the last line is Cyrillic, and the line ends with a space):
+
+```
+Incredible Dingo Dongo
+Shower is scary
+J*b is scary
+Touching grass is absolutely terrifying
+Never ever wash
+Never ever еmployed
+```
+
+The choice is a free-running 32-bit LFSR sampled by the first read of the
+window and latched until reset, so a host always gets one whole text, never a
+mixture: `rnd < 2^32/1000` is the coin (`ALT_THRESHOLD` in the generated
+module). Power-on timing is the entropy. `ALT_MODE` overrides it for tests
+(`1` always the joke, `2` always the credit); the chip uses `0`, the coin.
+
 ```
 # from a host, after mapping BAR0
 dd if=/dev/mem bs=4 skip=$((0x060/4)) count=37 2>/dev/null | tr -d '\0' | head -c 145
 ```
 
-It is plain combinational LUT ROM (`rtl/periph/deepseek_egg.v`), about 37x32
-flops-equivalent next to a 68.1M-cell Argon2 array, so it costs nothing worth
-measuring. The text lives in one place,
+It is two combinational LUT ROMs plus a 32-bit LFSR and a latch
+(`rtl/periph/deepseek_egg.v`), about 74x32 flops-equivalent next to a
+68.1M-cell Argon2 array, so it costs nothing worth measuring. Both texts live
+in one place,
 [`tools/gen_deepseek_egg.py`](tools/gen_deepseek_egg.py), which refuses to
 generate a window that would overlap the signature register.
 
@@ -314,7 +333,7 @@ it came from.
 
 The software build answers too: `libanubis_solver` exports it as
 `const char *easter(void)`, same 145 bytes, so a host that has the library but no
-card can still ask.
+card can still ask. The 1-in-1000 joke is hardware-only.
 What is *not* wired yet is the card top that instantiates a register file, an
 engine and the logger together - that also needs registers for the HashX keys
 and program length.
