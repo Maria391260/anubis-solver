@@ -1,0 +1,63 @@
+{
+  "host": "Intel i7-1260P (Alder Lake), 16 threads, powersave governor, laptop",
+  "config": "Chrome 154.0.8037.97 headless and Node 26.13.0; fixed challenge 9f2c1b4a...5c4b, nonce 0; one hash per timing, best of 2-3; Argon2id v1.3 m=19456 t=2 p=1 out=32; pure JS, no WebAssembly",
+  "date": "2026-11-15",
+  "challenge_hex": "9f2c1b4a7e5d3c0b8a1f6e2d4c7b0a9f5e3d1c8b7a6f4e2d1c0b9a8f7e6d5c4b",
+  "node": [
+    {
+      "when": "quiet",
+      "ms_per_hash": 735,
+      "hashes_per_second": 1.36
+    },
+    {
+      "when": "quiet",
+      "ms_per_hash": 620,
+      "hashes_per_second": 1.61
+    },
+    {
+      "when": "warm laptop",
+      "ms_per_hash": 1075,
+      "hashes_per_second": 0.93
+    },
+    {
+      "when": "warm laptop",
+      "ms_per_hash": 1190,
+      "hashes_per_second": 0.84
+    }
+  ],
+  "chrome": [
+    {
+      "when": "cold run",
+      "ms_per_hash": 3663
+    },
+    {
+      "when": "second run",
+      "ms_per_hash": 1464,
+      "hashes_per_second": 0.68
+    }
+  ],
+  "wasm": {
+    "whole_hash_ms": [
+      64.6,
+      74.8
+    ],
+    "same_session_ms_per_hash": 85.9,
+    "fill_block_us": [
+      2.09,
+      2.29
+    ],
+    "command": "node wasm/bench-a2i.mjs"
+  },
+  "tier_seconds_js_at_0_7s": {
+    "2": 2.8,
+    "4": 11.2,
+    "6": 44.8
+  },
+  "notes": [
+    "The JS host side is the WebGPU demo's BLAKE2b/H0/H'/tag code; the fill is a 32-bit-pair port of third_party/argon2/ref.c.",
+    "One 19.9 MiB Uint32Array plus scratch, allocated once and reused across nonces.",
+    "The laptop drifts 2x with load; the ranges are runs, not error bars. The same-session wasm check is the honest ratio.",
+    "tests_js_argon2id.mjs checks the tag against argon2id_pow.wasm and the C engine's anubis_verify_argon2id."
+  ],
+  "reproduce": "node betterAnusbis/bench-js-argon2id.mjs --json; node wasm/bench-a2i.mjs"
+}

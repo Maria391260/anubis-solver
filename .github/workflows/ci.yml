@@ -28,3 +28,4 @@ jobs:
         run: |
           node betterAnusbis/tests_js_sha256.mjs
           node betterAnusbis/tests_js_hashx.mjs
+          node betterAnusbis/tests_js_argon2id.mjs

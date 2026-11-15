@@ -12208,6 +12208,398 @@ function buildModule(challenge) {
     return run(instance.exports);
   }
 
+  // ---------------------------------------------------------------- Argon2id
+  // Pure-JavaScript Argon2id, for browsers where WebAssembly is disabled,
+  // missing, or refused. The host side (BLAKE2b, H0, B0/B1, the final tag) is
+  // the same code the WebGPU demo uses; the fill phase is a straight port of
+  // third_party/argon2/ref.c with the parameters Anubis fixes: Argon2id v1.3,
+  // m=19456 KiB, t=2, p=1, 32-byte tag. 64-bit words are (lo, hi) u32 pairs;
+  // 38,912 block fills per hash, one hash at a time.
+// argon2id-blake2b.js — BLAKE2b-512, blake2b_long and Argon2id's host-side
+// derivation (H0, B0, B1, the final tag), ported from the vendored reference:
+//
+//   third_party/argon2/blake2/blake2b.c      blake2b_init/update/final, blake2b_long
+//   third_party/argon2/core.c                initial_hash(), fill_first_blocks(), finalize()
+//   wasm/argon2id_pow.c                      the password/salt encoding Anubis uses
+//
+// The state is BigInt because this runs ~67 BLAKE2b compressions per Argon2id
+// hash against 38,912 block fills on the GPU — it is noise either way, and
+// BigInt is the version that is obviously right. See the comment in
+// argon2id.html for the split of work between host and device.
+
+const MASK64 = (1n << 64n) - 1n;
+
+const IV = [
+  0x6a09e667f3bcc908n, 0xbb67ae8584caa73bn, 0x3c6ef372fe94f82bn, 0xa54ff53a5f1d36f1n,
+  0x510e527fade682d1n, 0x9b05688c2b3e6c1fn, 0x1f83d9abfb41bd6bn, 0x5be0cd19137e2179n,
+];
+
+const SIGMA = [
+  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+  [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+  [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+  [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+  [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+  [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+  [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+  [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+  [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+];
+
+const rotr64 = (x, n) => {
+  const k = BigInt(n);
+  return ((x >> k) | (x << (64n - k))) & MASK64;
+};
+
+class Blake2b {
+  constructor(outlen) {
+    this.outlen = outlen;
+    this.h = IV.slice();
+    // blake2b_param: digest_length, key_length, fanout=1, depth=1, the rest 0
+    this.h[0] ^= BigInt(outlen) | (1n << 16n) | (1n << 24n);
+    this.t = [0n, 0n];
+    this.f = [0n, 0n];
+    this.buf = new Uint8Array(128);
+    this.buflen = 0;
+  }
+
+  increment(inc) {
+    const before = this.t[0];
+    this.t[0] = (before + BigInt(inc)) & MASK64;
+    if (this.t[0] < before) this.t[1] = (this.t[1] + 1n) & MASK64;
+  }
+
+  update(bytes) {
+    const inlen = bytes.length;
+    if (inlen === 0) return;
+    let pin = 0;
+    if (this.buflen + inlen > 128) {
+      const fill = 128 - this.buflen;
+      this.buf.set(bytes.subarray(0, fill), this.buflen);
+      this.increment(128);
+      this.compress(this.buf);
+      this.buflen = 0;
+      pin = fill;
+      while (inlen - pin > 128) {
+        this.increment(128);
+        this.compress(bytes.subarray(pin, pin + 128));
+        pin += 128;
+      }
+    }
+    this.buf.set(bytes.subarray(pin), this.buflen);
+    this.buflen += inlen - pin;
+  }
+
+  compress(block) {
+    const dv = new DataView(block.buffer, block.byteOffset, 128);
+    const m = new Array(16);
+    for (let i = 0; i < 16; i++) m[i] = dv.getBigUint64(8 * i, true);
+    const v = new Array(16);
+    for (let i = 0; i < 8; i++) v[i] = this.h[i];
+    v[8] = IV[0]; v[9] = IV[1]; v[10] = IV[2]; v[11] = IV[3];
+    v[12] = IV[4] ^ this.t[0];
+    v[13] = IV[5] ^ this.t[1];
+    v[14] = IV[6] ^ this.f[0];
+    v[15] = IV[7] ^ this.f[1];
+
+    const G = (a, b, c, d, x, y) => {
+      v[a] = (v[a] + v[b] + m[x]) & MASK64;
+      v[d] = rotr64(v[d] ^ v[a], 32);
+      v[c] = (v[c] + v[d]) & MASK64;
+      v[b] = rotr64(v[b] ^ v[c], 24);
+      v[a] = (v[a] + v[b] + m[y]) & MASK64;
+      v[d] = rotr64(v[d] ^ v[a], 16);
+      v[c] = (v[c] + v[d]) & MASK64;
+      v[b] = rotr64(v[b] ^ v[c], 63);
+    };
+
+    for (let r = 0; r < 12; r++) {
+      const s = SIGMA[r];
+      G(0, 4, 8, 12, s[0], s[1]);
+      G(1, 5, 9, 13, s[2], s[3]);
+      G(2, 6, 10, 14, s[4], s[5]);
+      G(3, 7, 11, 15, s[6], s[7]);
+      G(0, 5, 10, 15, s[8], s[9]);
+      G(1, 6, 11, 12, s[10], s[11]);
+      G(2, 7, 8, 13, s[12], s[13]);
+      G(3, 4, 9, 14, s[14], s[15]);
+    }
+
+    for (let i = 0; i < 8; i++) this.h[i] = this.h[i] ^ v[i] ^ v[i + 8];
+  }
+
+  final() {
+    this.increment(this.buflen);
+    this.f[0] = MASK64;                       // last block
+    this.buf.fill(0, this.buflen, 128);
+    this.compress(this.buf);
+    const out = new Uint8Array(64);
+    const dv = new DataView(out.buffer);
+    for (let i = 0; i < 8; i++) dv.setBigUint64(8 * i, this.h[i], true);
+    return out.slice(0, this.outlen);
+  }
+}
+
+function blake2b(outlen, input) {
+  const s = new Blake2b(outlen);
+  s.update(input);
+  return s.final();
+}
+
+const u32le = (x) => {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, x >>> 0, true);
+  return b;
+};
+
+const concat = (...parts) => {
+  const n = parts.reduce((a, p) => a + p.length, 0);
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+};
+
+/** blake2b_long() from blake2b.c: expand a digest to an arbitrary length. */
+function blake2bLong(outlen, input) {
+  const prefix = u32le(outlen);
+  if (outlen <= 64) return blake2b(outlen, concat(prefix, input));
+
+  const out = new Uint8Array(outlen);
+  let buf = blake2b(64, concat(prefix, input));
+  out.set(buf.subarray(0, 32), 0);
+  let pos = 32;
+  let toproduce = outlen - 32;
+  while (toproduce > 64) {
+    buf = blake2b(64, buf);
+    out.set(buf.subarray(0, 32), pos);
+    pos += 32;
+    toproduce -= 32;
+  }
+  buf = blake2b(toproduce, buf);
+  out.set(buf.subarray(0, toproduce), pos);
+  return out;
+}
+
+/* ---------------------------- Argon2id host side ---------------------------- */
+
+const ARGON2 = {
+  lanes: 1, outlen: 32, mCost: 19456, tCost: 2, version: 0x13, type: 2, /* Argon2_id */
+};
+
+/** H0 = blake2b_512(LE32 params || LE32 pwdlen || pwd || LE32 saltlen || salt ||
+ *                  LE32 secretlen || LE32 adlen) — initial_hash() in core.c. */
+function h0(password, salt, p = ARGON2) {
+  const s = new Blake2b(64);
+  s.update(u32le(p.lanes));
+  s.update(u32le(p.outlen));
+  s.update(u32le(p.mCost));
+  s.update(u32le(p.tCost));
+  s.update(u32le(p.version));
+  s.update(u32le(p.type));
+  s.update(u32le(password.length));
+  s.update(password);
+  s.update(u32le(salt.length));
+  s.update(salt);
+  s.update(u32le(0));                        // secretlen, no secret
+  s.update(u32le(0));                        // adlen, no associated data
+  return s.final();
+}
+
+/** B0 = H'(H0 || LE32(0) || LE32(lane)), B1 = H'(H0 || LE32(1) || LE32(lane)). */
+function firstBlocks(h0bytes, lane = 0) {
+  const seed = new Uint8Array(72);
+  seed.set(h0bytes, 0);
+  const dv = new DataView(seed.buffer);
+  dv.setUint32(64, 0, true);
+  dv.setUint32(68, lane, true);
+  const b0 = blake2bLong(1024, seed);
+  dv.setUint32(64, 1, true);
+  const b1 = blake2bLong(1024, seed);
+  return { b0, b1 };
+}
+
+/** The tag: H'(C, outlen) over the final 1 KiB block (one lane, so no XOR). */
+function tagFromFinalBlock(finalBlock, outlen = 32) {
+  return blake2bLong(outlen, finalBlock);
+}
+
+/**
+ * Anubis's salt: 8 bytes, the u32 nonce in bytes 0..3 little-endian if the last
+ * challenge byte is >= 0x80 (bytes 4..7 zero), otherwise the nonce in bytes
+ * 4..7 big-endian (bytes 0..3 zero). Copied from wasm/argon2id_pow.c.
+ */
+function anubisSalt(challenge, nonce) {
+  const salt = new Uint8Array(8);
+  const le = challenge.length > 0 && challenge[challenge.length - 1] >= 0x80;
+  const n = nonce >>> 0;
+  if (le) {
+    salt[0] = n & 255; salt[1] = (n >>> 8) & 255;
+    salt[2] = (n >>> 16) & 255; salt[3] = (n >>> 24) & 255;
+  } else {
+    salt[7] = n & 255; salt[6] = (n >>> 8) & 255;
+    salt[5] = (n >>> 16) & 255; salt[4] = (n >>> 24) & 255;
+  }
+  return salt;
+}
+
+
+
+const A2_BLOCKS = 19456, A2_WORDS = 256, A2_SEGMENT = 4864, A2_ADDRESSES = 128;
+
+let mem = null, R = null, T = null, V = null, ADDR = null, INPUT = null, ZERO = null;
+function scratch() {
+    if (!mem) {
+        mem = new Uint32Array(A2_BLOCKS * A2_WORDS);
+        R = new Uint32Array(A2_WORDS); T = new Uint32Array(A2_WORDS);
+        V = new Uint32Array(32);
+        ADDR = new Uint32Array(A2_WORDS); INPUT = new Uint32Array(A2_WORDS);
+        ZERO = new Uint32Array(A2_WORDS);
+    }
+}
+
+function mulhi32(a, b) {
+    a >>>= 0; b >>>= 0;
+    const al = a & 0xffff, ah = a >>> 16, bl = b & 0xffff, bh = b >>> 16;
+    const t0 = al * bl, t1 = al * bh, t2 = ah * bl, t3 = ah * bh;
+    const mid = (t0 >>> 16) + (t1 & 0xffff) + (t2 & 0xffff);
+    return (t3 + (t1 >>> 16) + (t2 >>> 16) + (mid >>> 16)) >>> 0;
+}
+
+// v[a] = fBlaMka(v[a], v[b]); 32-bit pair layout, v is Uint32Array of u32 words
+function blamka(v, a, b) {
+    const ai = 2 * a, bi = 2 * b;
+    const xl = v[ai], xh = v[ai + 1], yl = v[bi], yh = v[bi + 1];
+    const lo = Math.imul(xl, yl) >>> 0;
+    const hi = mulhi32(xl, yl);
+    const dl = (lo << 1) >>> 0, dh = ((hi << 1) | (lo >>> 31)) >>> 0;
+    const sl = (xl + yl) >>> 0, sh = (xh + yh + (sl < xl ? 1 : 0)) >>> 0;
+    const rl = (sl + dl) >>> 0, rh = (sh + dh + (rl < sl ? 1 : 0)) >>> 0;
+    v[ai] = rl; v[ai + 1] = rh;
+}
+function xorRotr(v, d, s, n) {
+    const di = 2 * d, si = 2 * s;
+    let lo = (v[di] ^ v[si]) >>> 0, hi = (v[di + 1] ^ v[si + 1]) >>> 0;
+    let l, h;
+    if (n === 32) { l = hi; h = lo; }
+    else if (n < 32) { l = ((lo >>> n) | (hi << (32 - n))) >>> 0; h = ((hi >>> n) | (lo << (32 - n))) >>> 0; }
+    else { const m = 64 - n; l = ((lo << m) | (hi >>> (32 - m))) >>> 0; h = ((hi << m) | (lo >>> (32 - m))) >>> 0; }
+    v[di] = l; v[di + 1] = h;
+}
+// g/round over a 16-u64 window starting at u64 index `base`; lets the
+// contiguous groups run in R directly instead of being copied to V.
+function gAt(v, base, a, b, c, d) {
+    blamka(v, base + a, base + b); xorRotr(v, base + d, base + a, 32);
+    blamka(v, base + c, base + d); xorRotr(v, base + b, base + c, 24);
+    blamka(v, base + a, base + b); xorRotr(v, base + d, base + a, 16);
+    blamka(v, base + c, base + d); xorRotr(v, base + b, base + c, 63);
+}
+function roundAt(v, base) {
+    gAt(v, base, 0, 4, 8, 12); gAt(v, base, 1, 5, 9, 13);
+    gAt(v, base, 2, 6, 10, 14); gAt(v, base, 3, 7, 11, 15);
+    gAt(v, base, 0, 5, 10, 15); gAt(v, base, 1, 6, 11, 12);
+    gAt(v, base, 2, 7, 8, 13); gAt(v, base, 3, 4, 9, 14);
+}
+
+function fill(prevBuf, prevOff, refBuf, refOff, dstBuf, dstOff, withXor) {
+    for (let j = 0; j < A2_WORDS; j++) {
+        const x = (refBuf[refOff + j] ^ prevBuf[prevOff + j]) >>> 0;
+        R[j] = x;
+        T[j] = withXor ? (x ^ dstBuf[dstOff + j]) >>> 0 : x;
+    }
+    // contiguous 16-u64 groups (ref.c's first loop), in place
+    for (let i = 0; i < 8; i++) roundAt(R, 16 * i);
+    // strided groups (ref.c's second loop)
+    for (let i = 0; i < 8; i++) {
+        for (let m = 0; m < 16; m++) {
+            const src = 2 * i + (m >> 1) * 16 + (m & 1);
+            V[2 * m] = R[2 * src]; V[2 * m + 1] = R[2 * src + 1];
+        }
+        roundAt(V, 0);
+        for (let m = 0; m < 16; m++) {
+            const src = 2 * i + (m >> 1) * 16 + (m & 1);
+            R[2 * src] = V[2 * m]; R[2 * src + 1] = V[2 * m + 1];
+        }
+    }
+    for (let j = 0; j < A2_WORDS; j++) dstBuf[dstOff + j] = (T[j] ^ R[j]) >>> 0;
+}
+
+function nextAddresses() {
+    const lo = (INPUT[12] + 1) >>> 0;
+    INPUT[12] = lo;
+    if (lo === 0) INPUT[13] = (INPUT[13] + 1) >>> 0;
+    fill(ZERO, 0, INPUT, 0, ADDR, 0, false);
+    fill(ZERO, 0, ADDR, 0, ADDR, 0, false);
+}
+
+function indexAlpha(pass, slice, idx, pseudoRand) {
+    let area;
+    if (pass === 0) area = slice === 0 ? idx - 1 : slice * A2_SEGMENT + idx - 1;
+    else area = A2_BLOCKS - A2_SEGMENT + idx - 1;
+    const rp = mulhi32(pseudoRand >>> 0, pseudoRand >>> 0);
+    const rel = (area - 1 - mulhi32(area >>> 0, rp)) >>> 0;
+    let start = 0;
+    if (pass !== 0 && slice !== 3) start = (slice + 1) * A2_SEGMENT;
+    return (start + rel) % A2_BLOCKS;
+}
+
+function resetInput(pass, slice) {
+    INPUT.fill(0);
+    INPUT[0] = pass; INPUT[2] = 0; INPUT[4] = slice;
+    INPUT[6] = A2_BLOCKS; INPUT[8] = 2; INPUT[10] = 2;
+}
+
+function storeBlock(off, bytes) {
+    for (let i = 0; i < A2_WORDS; i++) {
+        const p = 4 * i;
+        mem[off + i] = (bytes[p] | (bytes[p + 1] << 8) | (bytes[p + 2] << 16) | (bytes[p + 3] << 24)) >>> 0;
+    }
+}
+function blockBytes(off) {
+    const out = new Uint8Array(1024);
+    for (let i = 0; i < A2_WORDS; i++) {
+        const w = mem[off + i];
+        out[4 * i] = w & 255; out[4 * i + 1] = (w >>> 8) & 255;
+        out[4 * i + 2] = (w >>> 16) & 255; out[4 * i + 3] = (w >>> 24) & 255;
+    }
+    return out;
+}
+
+function argon2idTag(password, nonce) {
+    scratch();
+    const salt = anubisSalt(password, nonce);
+    const h0bytes = h0(password, salt);
+    const { b0, b1 } = firstBlocks(h0bytes);
+    storeBlock(0, b0); storeBlock(A2_WORDS, b1);
+
+    for (let pass = 0; pass < 2; pass++) {
+        for (let slice = 0; slice < 4; slice++) {
+            const independent = pass === 0 && slice < 2;
+            if (independent) resetInput(pass, slice);
+            let i = (pass === 0 && slice === 0) ? 2 : 0;
+            if (pass === 0 && slice === 0 && independent) nextAddresses();
+            let curr = slice * A2_SEGMENT + i;
+            let prev = curr === 0 ? A2_BLOCKS - 1 : curr - 1;
+            for (; i < A2_SEGMENT; i++, curr++, prev++) {
+                if (curr === 1) prev = 0;
+                let pseudo;
+                if (independent) {
+                    if (i % A2_ADDRESSES === 0) nextAddresses();
+                    pseudo = ADDR[2 * (i % A2_ADDRESSES)];
+                } else {
+                    pseudo = mem[prev * A2_WORDS];
+                }
+                const refIndex = indexAlpha(pass, slice, i, pseudo);
+                fill(mem, prev * A2_WORDS, mem, refIndex * A2_WORDS, mem, curr * A2_WORDS, pass !== 0);
+            }
+        }
+    }
+    return tagFromFinalBlock(blockBytes((A2_BLOCKS - 1) * A2_WORDS), 32);
+}
+
   const shaAlgo=algo==="sha256"||algo==="wasm-sha256";
   // A URL ending in #pure-js asks for the JavaScript solvers explicitly; they
   // are also the automatic fallback when WebAssembly is not available at all.
@@ -12215,15 +12607,18 @@ function buildModule(challenge) {
   const noWasm=forcedJs || typeof WebAssembly!=="object";
   if(shaAlgo && noWasm){ solveSha256InJs(); return; }
   if(algo==="hashx" && noWasm){ solveHashxInJs(); return; }
+  if(algo==="argon2id" && noWasm){ solveArgon2idInJs(); return; }
   if(algo==="sha256"||algo==="wasm-sha256"||algo==="argon2id"||algo==="hashx"){
     solveWithWasm().then(r=>{
       if(r){ say("solved with nonce "+r.nonce+" in "+r.ms.toFixed(0)+" ms"); pass(r.hash,r.nonce,r.ms); }
       else if(shaAlgo){ solveSha256InJs(); }
       else if(algo==="hashx"){ solveHashxInJs(); }
+      else if(algo==="argon2id"){ solveArgon2idInJs(); }
       else { say(algo+" could not load its kernel, use the anubis_fetch CLI or the Firefox extension"); }
     }).catch(e=>{
       if(shaAlgo){ solveSha256InJs(); }
       else if(algo==="hashx"){ solveHashxInJs(); }
+      else if(algo==="argon2id"){ solveArgon2idInJs(); }
       else { say(algo+" kernel failed to load: "+e); }
     });
     return;
@@ -12349,6 +12744,20 @@ function buildModule(challenge) {
     for(let i=0;i<4;i++){
       let w=hxU64(r[i]^r[4+i]);
       for(let b=0;b<8;b++){ out[i*8+b]=Number(w&255n); w>>=8n; }
+    }
+  }
+  async function solveArgon2idInJs(){
+    const raw=hex2bytes(ch.randomData);
+    const t0=performance.now();
+    say("solving argon2id in pure JavaScript (about a second per attempt)");
+    for(let nonce=0;;nonce++){
+      const tag=argon2idTag(raw,nonce);
+      if(lz(tag)>=diff){
+        say("solved with nonce "+nonce+" in JavaScript");
+        pass(tohex(tag),nonce,performance.now()-t0);
+        return;
+      }
+      await new Promise(r=>setTimeout(r,0));
     }
   }
   async function solveHashxInJs(){

@@ -36,6 +36,7 @@ between algorithms is what matters.
 | `argon2id` (WASM) | ~15/s | 19,456 KiB and ~65 ms per hash |
 | `sha256` (pure JS, browser fallback) | ~0.89 M/s | one nonce per hash, reused padding; ~9x slower than the wasm kernel |
 | `hashx` (pure JS, browser fallback) | ~13-15 k/s | BigInt interpreter of the challenge's program; no wasm/WebGPU |
+| `argon2id` (pure JS, browser fallback) | ~0.7-1.4/s | ~0.7-1.5 s/hash, 19 MiB; ~9-16x the wasm module |
 | `fast`, `slow` (pure JS, browser) | ~0.36 M/s | a fresh padded block per candidate; the nibble challenges have no wasm module |
 
 Correcting an earlier row here: this table used to say `hashx` was 3.6 M/s
@@ -93,7 +94,9 @@ The pure-JavaScript fallback is ~13-15k hashes/s, or about 24 ms / 2.44 s /
 
 `argon2id` is deliberately expensive per attempt, so its observed hashrate is
 ~15/s per core — and each worker thread needs ~19 MiB, so 16 threads cost
-~300 MiB. These numbers were 30% faster than reality before the module was
+~300 MiB. The pure-JavaScript fallback is ~0.7-1.5 s/hash, or 2.8 s / 11 s /
+45 s at these tiers; see
+[Argon2id in pure JavaScript](#argon2id-in-pure-javascript). These numbers were 30% faster than reality before the module was
 rebuilt; see [the wasm section](#argon2id-in-wasm-why-it-was-2x-slower-and-what-fixed-it).
 
 ## Per-version table
@@ -888,6 +891,47 @@ and requires identical digests.
 
 Reproduce: `node betterAnusbis/bench-js-hashx.mjs`; raw data:
 [`results/js-hashx-2026-11-15.json`](results/js-hashx-2026-11-15.json).
+
+### Argon2id in pure JavaScript
+
+The last fallback. When WebAssembly is unavailable, or `#pure-js` is set, the
+page runs Argon2id v1.3 with Anubis's parameters (m = 19456 KiB, t = 2, p = 1,
+32-byte tag) in JavaScript: the reference fill from `third_party/argon2/ref.c`
+ported to 32-bit `(lo, hi)` pairs, plus the WebGPU demo's BLAKE2b/H0/H'/tag
+host code. It allocates one 19.9 MiB `Uint32Array` and reuses it for every
+nonce, so a tab pays ~20 MiB while it solves.
+
+Method: one hash (nonce 0) after warm-up, best of two or three, Chrome 154
+headless and Node 26 on the same i7-1260P. This one is dominated by the
+38,912 block fills, and the laptop's `powersave` drift is visible in it:
+
+| path | ms/hash | hashes/s | note |
+|---|---:|---:|---|
+| wasm module (`argon2id_pow.wasm`) | 64.6-74.8 | 13-15 | the fast path |
+| wasm module, same-session check | 85.9 | 12 | warm laptop |
+| **pure JS, quiet run** | **620-735** | **1.4-1.6** | best measured |
+| pure JS, warm laptop | 1050-1460 | 0.7-1.0 | later runs |
+
+That is roughly **9-16x the wasm module** depending on which side of the drift
+the runs land; the ratio within one warm session was 14.6x. At Anubis's tiers
+(4/16/64 hashes expected), using the quiet 0.7 s/hash run:
+
+| tier | difficulty | expected hashes | wasm | pure JS |
+|---|---:|---:|---:|---:|
+| light | 2 | 4 | 260 ms | 2.8 s |
+| medium | 4 | 16 | 1.03 s | 11.2 s |
+| hard | 6 | 64 | 4.1 s | 44.8 s |
+
+A warm laptop roughly doubles those. This is the least practical of the three
+JavaScript fallbacks — the wasm module is the right path whenever it loads —
+but a browser with WebAssembly disabled can still clear a light Argon2id
+challenge in a few seconds instead of being locked out. Correctness: the tag is
+checked against `argon2id_pow.wasm` and the C engine's
+`anubis_verify_argon2id` by `betterAnusbis/tests_js_argon2id.mjs`.
+
+Reproduce: `node betterAnusbis/bench-js-argon2id.mjs`; the wasm comparison is
+`node wasm/bench-a2i.mjs`. Raw data:
+[`results/js-argon2id-2026-11-15.json`](results/js-argon2id-2026-11-15.json).
 
 ### WebGPU: three algorithms, three different verdicts
 

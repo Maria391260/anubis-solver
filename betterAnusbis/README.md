@@ -315,6 +315,13 @@ light-tier fallback (medium is a couple of seconds, hard over a minute). The
 interpreter is checked against both the wasm module and the C engine by
 `node tests_js_hashx.mjs`.
 
+`argon2id` has one as well: the reference fill (`third_party/argon2/ref.c`)
+ported to 32-bit pairs, with the BLAKE2b/H0/H'/tag host side, ~20 MiB of memory
+and ~0.7-1.5 s per hash — 9-16x the wasm module. Light is a few seconds, medium
+~11-20 s, hard ~45-90 s, so it is the last resort of the three, but it keeps a
+wasm-less browser able to solve. Checked against `argon2id_pow.wasm` and the C
+engine by `node tests_js_argon2id.mjs`.
+
 `hashx` also shows what it costs. The page compiles the challenge's program,
 then scans nonces in windows of 262,144 and drives a progress bar that says
 **slowing you down!** with the measured MHash/s and an estimate of the time
@@ -636,6 +643,7 @@ a site owner actually configures. That is the point: `--target` and you are done
 ./test-all-algorithms.sh      # all six algorithms, needs a backend on :8002
 node tests_js_sha256.mjs      # the page's JavaScript SHA-256 and both JS solvers
 node tests_js_hashx.mjs       # the JS HashX interpreter vs hashx_pow.wasm and the C engine
+node tests_js_argon2id.mjs    # the JS Argon2id fill vs argon2id_pow.wasm and the C engine
 python3 test_parity.py        # the flags taken from cmd/anubis, checked on the wire
 python3 tests_http23.py -v    # HTTP/2 and HTTP/3, listener and backend hop
 python3 tests_valkey.py       # the Valkey store against an in-process RESP mock

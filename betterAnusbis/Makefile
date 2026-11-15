@@ -94,6 +94,7 @@ test-s3: betterAnusbis
 test-js:
 	node tests_js_sha256.mjs
 	node tests_js_hashx.mjs
+	node tests_js_argon2id.mjs
 
 clean:
 	rm -f betterAnusbis
