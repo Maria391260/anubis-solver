@@ -62,7 +62,11 @@ def main():
     # with the re-check on, a mismatch inside solve_tensor would silently fall
     # back to the CPU and still pass here - so compare the GPU digest directly
     # with the CPU digest, and separately prove the verification really ran.
-    lib.anubis_set_gpu_verify(1)
+    # Verification OFF for the comparison: with it on, a mismatch inside
+    # solve_tensor falls back to the CPU digest and the test would pass while
+    # the GPU is wrong. That is exactly the failure this found first, so the
+    # GPU digest is read raw, then the verified path is checked separately.
+    lib.anubis_set_gpu_verify(0)
     for d in DIFFICULTIES:
         for ch in CHALLENGES:
             nonce, gpu_hex, ms = native.solve_tensor(ch, d, 1, 0)
@@ -70,6 +74,15 @@ def main():
             check(f"d={d:2d} {ch[:8]} gpu == cpu", ok and gpu_hex == cpu_hex,
                   f"{gpu_hex[:16]} != {cpu_hex[:16]}")
             check(f"d={d:2d} {ch[:8]} nonce is 0", nonce == 0, str(nonce))
+
+    # the default path (GPU digest re-checked against the CPU) must agree too
+    lib.anubis_set_gpu_verify(1)
+    for d in DIFFICULTIES:
+        ch = CHALLENGES[0]
+        verified = native.solve_tensor(ch, d, 1, 0)[1]
+        _, cpu_hex = native.verify_tensor(ch, 0, d)
+        check(f"d={d:2d} verified path == cpu", verified == cpu_hex,
+              f"{verified[:16]} != {cpu_hex[:16]}")
 
     # an independent reference for one size, so this is not CPU-vs-CPU with a
     # GPU-shaped hole: A and B are rebuilt here with hashlib and the product is

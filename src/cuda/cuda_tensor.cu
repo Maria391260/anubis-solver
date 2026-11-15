@@ -332,7 +332,11 @@ int anubis_cuda_tensor_c(const uint8_t seed[32], int n, int32_t *c_host,
         int row0 = d * rows_per;
         int rows = (d == ndev - 1) ? (n - row0) : rows_per;
         cudaSetDevice(d);
-        if (cudaMemcpyAsync(c_host + (size_t)row0 * n, dC[d],
+        /* the kernel wrote this device's rows at their global row offset inside
+         * dC, so the source has to move with it; copying from dC[0] returns
+         * whatever the allocator left there for every device but the first */
+        if (cudaMemcpyAsync(c_host + (size_t)row0 * n,
+                            dC[d] + (size_t)row0 * (size_t)n,
                             (size_t)rows * (size_t)n * sizeof(int32_t),
                             cudaMemcpyDeviceToHost, streams[d]) != cudaSuccess) {
             goto out;
