@@ -2,8 +2,10 @@
 
 Anubis is a proof-of-work gate that many sites put in front of their pages.
 `anubis-solver` solves that proof of work for you: a small C core (SHA-256,
-Argon2id and HashX, with optional GPU backends) and a Python library that
-wraps it and handles the HTTP dance.
+Argon2id, HashX and the `tensor` GEMM proof, with optional GPU backends), a
+Python library that wraps it and handles the HTTP dance, and — since 2.0.0
+`"shaoogle"` — two C services over the same library: an MCP server and an HTTP
+JSON API.
 
 This page gets you from zero to a working request in a few minutes. Deeper
 material lives in [`docs/`](docs/index.md).
@@ -18,7 +20,7 @@ You need a C compiler and `make`. Python 3.9+ for the library.
 git clone https://github.com/celikfana-lab/anubis-solver.git
 cd anubis-solver
 make                 # builds ./libanubis_solver.so
-python3 -c "import anubis_solver; print(anubis_solver.__version__)"
+python3 -c "import anubis_solver; print(anubis_solver.__version__)"   # 2.0.0
 ```
 
 `make` detects what your machine offers:
@@ -34,6 +36,9 @@ python3 -c "import anubis_solver; print(anubis_solver.__version__)"
 
 Missing pieces are skipped silently — the library still builds and uses the
 CPU.
+
+Two optional binaries come from the same sources: `make services` builds
+`anubis_api` and `anubis_mcp` (section 6).
 
 Optional Python extras:
 
@@ -64,6 +69,11 @@ print(solver.verify(challenge, solution.nonce))   # True
 ```
 
 `Solution.response` is the hex string the site expects back.
+
+The `tensor` proof works the same way — `parse_challenge` recognises it and
+`solve` does one deterministic int8 GEMM — so nothing changes in your code. If
+the challenge names an algorithm you did not expect, `challenge.algorithm`
+shows it before you solve.
 
 ---
 
@@ -161,7 +171,70 @@ Runnable samples live in [`examples/c_demo.c`](examples/c_demo.c) and
 [`examples/cpp_demo.cpp`](examples/cpp_demo.cpp). The full function reference,
 return codes and the `dlopen` variant are in [`docs/c-api.md`](docs/c-api.md).
 
-## 6. Where to go next
+## 6. Use the C services (MCP and HTTP API)
+
+Both are plain C on top of the library — no Python, no Node — so you can drop
+them anywhere a small binary runs. They share one client
+(`src/fetch/anubis_fetch.c`) that fetches the page, reads the `anubis_challenge`
+JSON, solves it with the `.so`, submits `pass-challenge` with the cookies the
+server set, and re-fetches.
+
+```bash
+make services        # ./anubis_api and ./anubis_mcp
+```
+
+They need OpenSSL headers on top of the compiler (`libssl-dev` on Debian and
+Ubuntu, `openssl-devel` on Fedora).
+
+Keep each binary in the same directory as `libanubis_solver.so`: they link it
+with `$ORIGIN` in the runpath.
+
+### The HTTP API
+
+```bash
+./anubis_api --listen 127.0.0.1:8088
+curl -s localhost:8088/v1/solve -d '{
+  "algorithm":"sha256",
+  "challenge":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+  "difficulty":12}'
+# {"nonce":3356,"response":"0003dcd734e4...d8720956507","elapsed_ms":1.658}
+```
+
+`/v1/solve`, `/v1/verify` and `/v1/fetch` all take and return JSON, and
+`/healthz` / `/v1/version` tell you what is running:
+
+```bash
+curl -s localhost:8088/v1/version
+# {"version":"2.0.0","codename":"shaoogle","algorithms":[...]}
+```
+
+**There is no authentication.** Bind it to loopback, or put it behind auth you
+control: anyone who can reach it can spend your CPU on proofs of work.
+
+### The MCP server
+
+`anubis_mcp` speaks JSON-RPC 2.0 over stdio, so an MCP client starts it as a
+subprocess:
+
+```json
+{
+  "mcpServers": {
+    "anubis": { "command": "/absolute/path/to/anubis_mcp" }
+  }
+}
+```
+
+It exposes three tools: `anubis_fetch` (solve the challenge and return the page
+as text), `anubis_solve` (solve a challenge you already have) and
+`anubis_version`.
+
+Any language with an HTTP client can use the API; anything that speaks MCP can
+use the server. Details: [`docs/api-service.md`](docs/api-service.md) and
+[`docs/mcp.md`](docs/mcp.md).
+
+---
+
+## 7. Where to go next
 
 | I want to… | read |
 |---|---|
@@ -169,6 +242,8 @@ return codes and the `dlopen` variant are in [`docs/c-api.md`](docs/c-api.md).
 | call it from C | [`docs/c-api.md`](docs/c-api.md) |
 | use the command line | [`docs/cli.md`](docs/cli.md) |
 | use a GPU | [`docs/gpu.md`](docs/gpu.md) |
+| call it from an MCP client | [`docs/mcp.md`](docs/mcp.md) |
+| call it over HTTP from any language | [`docs/api-service.md`](docs/api-service.md) |
 | fix a build/runtime problem | [`docs/troubleshooting.md`](docs/troubleshooting.md) |
 | hack on the solver | [`docs/development.md`](docs/development.md) |
 | see measured speeds | [`SPEED.md`](SPEED.md) |
@@ -176,7 +251,7 @@ return codes and the `dlopen` variant are in [`docs/c-api.md`](docs/c-api.md).
 
 ---
 
-## 7. A word of caution
+## 8. A word of caution
 
 This tool exists for testing your own deployments, research, and
 interoperability. Only solve challenges for sites you are authorised to test,
