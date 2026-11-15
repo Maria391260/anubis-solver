@@ -116,7 +116,7 @@ DEP := $(OBJ:.o=.d)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all test clean shader windows
+.PHONY: all test clean shader windows services test-api test-mcp
 
 # The Windows pair and the release zip/msi: a mingw-w64 cross build, no Windows
 # needed. `make windows WIN_ARGS=--smoke` also runs a challenge/pass round trip
@@ -146,6 +146,31 @@ $(BUILD)/argon2/%.o: third_party/argon2/%.c | $(BUILD)
 
 $(LIB): $(OBJ)
 	$(LINK) $(LDFLAGS) -o $@ $(OBJ)
+
+# ---------------------------------------------------------------------------
+# The C services (2.0.0 "shaoogle"): an MCP server and an HTTP API service,
+# both thin layers over libanubis_solver.so plus the shared fetch client. They
+# are separate binaries on purpose - a gate operator should not have to install
+# a JSON-RPC server, and an agent should not have to run a gate.
+# ---------------------------------------------------------------------------
+FETCH_SRC := src/fetch/anubis_fetch.c
+SERVICE_LIBS := -L. -lanubis_solver -Wl,-rpath,'$$ORIGIN' -lssl -lcrypto
+
+anubis_api: src/api/anubis_api.c $(FETCH_SRC) $(LIB)
+	$(CC) $(CFLAGS) -Isrc/fetch -Iinclude -o $@ src/api/anubis_api.c $(FETCH_SRC) \
+	    $(SERVICE_LIBS)
+
+anubis_mcp: src/mcp/anubis_mcp.c $(FETCH_SRC) $(LIB)
+	$(CC) $(CFLAGS) -Isrc/fetch -Iinclude -o $@ src/mcp/anubis_mcp.c $(FETCH_SRC) \
+	    $(SERVICE_LIBS)
+
+services: anubis_api anubis_mcp
+
+test-api: anubis_api
+	tests/api_test.sh
+
+test-mcp: anubis_mcp
+	tests/mcp_test.sh
 
 test: $(LIB)
 	python3 tests/test_core.py
@@ -201,4 +226,4 @@ else
 endif
 
 clean:
-	rm -rf $(BUILD) $(LIB)
+	rm -rf $(BUILD) $(LIB) anubis_api anubis_mcp

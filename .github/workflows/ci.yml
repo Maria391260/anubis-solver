@@ -30,5 +30,14 @@ jobs:
           node betterAnusbis/tests_js_hashx.mjs
           node betterAnusbis/tests_js_argon2id.mjs
           node betterAnusbis/tests_js_tensor.mjs
+
+      - name: build the C services
+        run: make -j4 services
+
+      - name: C services tests
+        run: |
+          make test-api
+          make test-mcp
+
       - name: tensor CUDA test (skips without a device)
         run: python3 tests/test_tensor_cuda.py
