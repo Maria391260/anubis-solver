@@ -258,7 +258,7 @@ static char *build_module(int lanes, const uint32_t words[16], int nonce_off,
                         "{comparison_direction = #stablehlo<comparison_direction LT>, "
                         "compare_type = #stablehlo<comparison_type UNSIGNED>} "
                         ": (tensor<%dxi32>, tensor<%dxi32>) -> tensor<%dxi1>\n",
-                    cmp, h0, ts, lanes, lanes);
+                    cmp, h0, ts, lanes, lanes, lanes);
             bprintf(&b, "    %s = \"stablehlo.convert\"(%s) "
                         ": (tensor<%dxi1>) -> tensor<%dxi8>\n", fl, cmp, lanes, lanes);
             bprintf(&b, "    return %s : tensor<%dxi8>\n", fl, lanes);
