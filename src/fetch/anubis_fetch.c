@@ -293,13 +293,42 @@ static int http_get(const char *url, jar *j, const char *extra_headers,
     {
         size_t cap = 2048 + strlen(u.path) + strlen(u.host) + (cookie ? strlen(cookie) : 0);
         req = malloc(cap);
-        snprintf(req, cap,
-                 "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
-                 "Accept: text/html,application/json;q=0.9,*/*;q=0.8\r\n"
-                 "Accept-Encoding: identity\r\n%s%s%s"
-                 "Connection: close\r\n\r\n",
-                 u.path, u.host, UA, cookie ? "Cookie: " : "", cookie ? cookie : "",
-                 extra_headers ? extra_headers : "");
+        /* Each header owns its line: the cookie is formatted as a complete
+         * "Cookie: ...\r\n" line, and extra_headers (currently unused) must be
+         * supplied the same way. Concatenating a value straight into the next
+         * header is what silently dropped the auth cookie once. */
+        {
+            char *cookie_line = NULL;
+            size_t clen = 0;
+            size_t cap = 2048 + strlen(u.path) + strlen(u.host) +
+                         (cookie ? strlen(cookie) : 0) +
+                         (extra_headers ? strlen(extra_headers) : 0);
+            if (cookie != NULL && *cookie != '\0') {
+                clen = strlen(cookie) + 16;
+                cookie_line = malloc(clen);
+                if (!cookie_line) {
+                    seterr(out, "oom");
+                    goto done;
+                }
+                snprintf(cookie_line, clen, "Cookie: %s\r\n", cookie);
+            }
+            cap += clen;
+            req = malloc(cap);
+            if (!req) {
+                free(cookie_line);
+                seterr(out, "oom");
+                goto done;
+            }
+            snprintf(req, cap,
+                     "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
+                     "Accept: text/html,application/json;q=0.9,*/*;q=0.8\r\n"
+                     "Accept-Encoding: identity\r\n%s%s"
+                     "Connection: close\r\n\r\n",
+                     u.path, u.host, UA,
+                     extra_headers ? extra_headers : "",
+                     cookie_line ? cookie_line : "");
+            free(cookie_line);
+        }
     }
     if (ssl) {
         if (SSL_write(ssl, req, (int)strlen(req)) <= 0) {
