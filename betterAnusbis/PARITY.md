@@ -126,6 +126,12 @@ The 24 that are missing:
 Flags with no upstream counterpart, kept as extras: `--algorithm`, `--no-honeypot`, `--honeypot-log`, `--stateless`,
 `--web`, `--tls-cert`, `--tls-key`, `--challenge-status`, `--deny-status`, `--policy`.
 
+`--algorithm tensor` is also ours alone: upstream has no GEMM challenge. It is
+accepted by `known_algorithms`, by per-rule `algorithm:` lines and by the
+`--algorithm` flag, and its difficulty unit is the matrix size
+(`N = 64*clamp(d,2,16)`), not nibbles or bits, so a policy that switches an
+existing rule to `tensor` should also set its difficulty.
+
 ### Environment variables upstream reads
 
 `flagenv.Parse()` runs before `flag.Parse()` (`cmd/anubis/main.go:236-237`), so every flag above is also an environment
