@@ -912,12 +912,16 @@ static const char TOOLS_JSON[] =
     "{\"tools\":["
     "{\"name\":\"anubis_fetch\","
     "\"description\":\"Fetch an Anubis-protected URL, solving any challenge on the "
-    "way, and return the page as readable text. The text begins with status: <code> "
-    "and url: <final_url>.\","
+    "way, and return the page as readable text. The text begins with status: <code>, "
+    "url: <final_url> and transport: <openssl|curl-impersonate/profile>.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"url\":{\"type\":\"string\",\"description\":\"Absolute http or https URL.\"},"
     "\"max_chars\":{\"type\":\"integer\",\"description\":\"Maximum body characters "
-    "to return (default 100000, 0 means unlimited).\"}},"
+    "to return (default 100000, 0 means unlimited).\"},"
+    "\"impersonate\":{\"type\":\"string\",\"description\":\"TLS fingerprint to "
+    "present: chrome (default when a curl-impersonate library is installed), a "
+    "concrete profile such as chrome116, edge101 or safari15_5, \\\"auto\\\" or "
+    "\\\"off\\\" for the built-in OpenSSL client.\"}},"
     "\"required\":[\"url\"]}},"
     "{\"name\":\"anubis_solve\","
     "\"description\":\"Solve one Anubis proof-of-work challenge locally, without "
@@ -947,8 +951,10 @@ static void tool_version(const json_value *id) {
     if (!codename || !*codename) codename = "shaoogle";
     snprintf(text, sizeof text,
              "{\"version\":\"%s\",\"codename\":\"%s\",\"algorithms\":[\"fast\","
-             "\"slow\",\"sha256\",\"wasm-sha256\",\"argon2id\",\"hashx\",\"tensor\"]}",
-             version, codename);
+             "\"slow\",\"sha256\",\"wasm-sha256\",\"argon2id\",\"hashx\",\"tensor\"],"
+             "\"impersonate\":\"%s\",\"impersonate_available\":%s}",
+             version, codename, anubis_fetch_impersonate(),
+             anubis_fetch_impersonate_available() ? "true" : "false");
     send_tool_text(id, text, strlen(text), 0);
 }
 
@@ -999,6 +1005,7 @@ static void tool_solve(const json_value *id, const json_value *args) {
 
 static void tool_fetch(const json_value *id, const json_value *args) {
     const char *url = jv_string(args, "url");
+    const char *impersonate = jv_string(args, "impersonate");
     long max_chars = 100000;
     anubis_page page;
     sb body, text;
@@ -1019,7 +1026,7 @@ static void tool_fetch(const json_value *id, const json_value *args) {
         }
     }
     memset(&page, 0, sizeof page);
-    if (anubis_fetch_get(url, &page) != 0) {
+    if (anubis_fetch_get_with(url, impersonate, &page) != 0) {
         send_tool_error(id, "fetch failed: %s",
                         page.error[0] ? page.error : "unknown error");
         anubis_page_free(&page);
@@ -1032,8 +1039,8 @@ static void tool_fetch(const json_value *id, const json_value *args) {
         keep = utf8_truncate(body.s, keep, (size_t)max_chars);
 
     sb_init(&text);
-    sb_printf(&text, "status: %d\nurl: %s\n\n", page.status,
-              page.final_url ? page.final_url : url);
+    sb_printf(&text, "status: %d\nurl: %s\ntransport: %s\n\n", page.status,
+              page.final_url ? page.final_url : url, anubis_fetch_transport());
     if (keep > 0) sb_putn(&text, body.s, keep);
     send_tool_text(id, text.s, text.len, 0);
     sb_free(&text);

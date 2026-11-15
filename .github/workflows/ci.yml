@@ -38,6 +38,10 @@ jobs:
         run: |
           make test-api
           make test-mcp
+          # No libcurl-impersonate on the runner, so this proves the OpenSSL
+          # fallback path and prints SKIP; the fingerprint itself is tested
+          # locally (make test-impersonate) against a bundled library.
+          make test-impersonate
 
       - name: tensor CUDA test (skips without a device)
         run: python3 tests/test_tensor_cuda.py

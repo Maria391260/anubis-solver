@@ -6,13 +6,13 @@
 # HTTP server this script starts. python3 is used only to validate the JSON the
 # server produced, never inside the server.
 #
-#   ./tests/mcp_test.sh            # builds the .so and /tmp/anubis_mcp if needed
+#   ./tests/mcp_test.sh            # builds the .so and ./anubis_mcp if needed
 #   MCP_BIN=/path/to/bin ./tests/mcp_test.sh
 set -u
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
-BIN=${MCP_BIN:-/tmp/anubis_mcp}
+BIN=${MCP_BIN:-$ROOT/anubis_mcp}
 PORT_BACKEND=8098
 PORT_GATE=8099
 
@@ -73,13 +73,10 @@ if [ ! -f "$ROOT/libanubis_solver.so" ]; then
 fi
 if [ ! -x "$BIN" ] || [ "$ROOT/src/mcp/anubis_mcp.c" -nt "$BIN" ] ||
     [ "$ROOT/src/fetch/anubis_fetch.c" -nt "$BIN" ] ||
+    [ "$ROOT/src/fetch/fetch_impersonate.c" -nt "$BIN" ] ||
     [ "$ROOT/src/fetch/anubis_fetch.h" -nt "$BIN" ] ||
     [ "$ROOT/include/anubis-solver.h" -nt "$BIN" ]; then
-    if ! (cd "$ROOT" &&
-        cc -O2 -Wall -Wextra -Isrc/fetch -Iinclude -o "$BIN" \
-            src/mcp/anubis_mcp.c src/fetch/anubis_fetch.c \
-            -L. -lanubis_solver -Wl,-rpath,"$ROOT" -lssl -lcrypto) \
-        >"$TMP/build_mcp.log" 2>&1; then
+    if ! (cd "$ROOT" && make anubis_mcp >"$TMP/build_mcp.log" 2>&1); then
         cat "$TMP/build_mcp.log" >&2
         echo "FAIL build $BIN" >&2
         exit 1

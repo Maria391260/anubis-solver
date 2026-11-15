@@ -1,0 +1,4 @@
+# The impersonation library is a runtime dependency, not source: it is 16 MB
+# and comes from a curl-impersonate build. `make impersonate-lib
+# CURL_IMPERSONATE_LIB=/path/to/libcurl-impersonate-chrome.so.4` puts it here.
+lib/

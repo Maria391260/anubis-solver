@@ -3,7 +3,8 @@ PY      ?= python3
 CFLAGS  ?= -O3 -fPIC -Wall -Wextra -std=gnu17
 NATIVE  ?= -march=native
 LDFLAGS ?= -shared -pthread
-INC     := -Isrc -Isrc/core -Isrc/hashx -Isrc/cpu -Isrc/cuda \
+LDLIBS  ?=
+INC     := -Iinclude -Isrc -Isrc/core -Isrc/hashx -Isrc/cpu -Isrc/cuda \
            -Isrc/levelzero -Isrc/vulkan -Isrc/opencl -Ithird_party/argon2
 
 # ---- build configuration --------------------------------------------------
@@ -98,6 +99,26 @@ CFLAGS   += -DANUBIS_HAVE_NEON_ASM
 else
 ASM_SRC  :=
 endif
+# The C fetch layer: follow an Anubis challenge and solve it, over HTTPS.
+# It lives in the library so the services and every .so consumer (Python, the
+# language bindings) share one client. It needs OpenSSL headers; the
+# libcurl-impersonate browser fingerprint is dlopen()ed at runtime, so there is
+# no build-time dependency on it. `make FETCH=0` drops the layer, and the .so
+# then has no OpenSSL dependency at all.
+FETCH_SRC := src/fetch/anubis_fetch.c src/fetch/fetch_impersonate.c
+FETCH ?= auto
+HAVE_FETCH :=
+ifneq ($(FETCH),0)
+ifneq ($(ARCH),none)
+ifneq ($(shell printf '#include <openssl/ssl.h>\n' | $(CC) -x c -E - >/dev/null 2>&1 && echo yes),)
+CORE_SRC += $(FETCH_SRC)
+CFLAGS   += -I$(CURDIR)/src/fetch -DANUBIS_HAVE_FETCH
+LDLIBS   += -lssl -lcrypto -ldl
+HAVE_FETCH := 1
+endif
+endif
+endif
+
 ARGON2_ALL := $(wildcard third_party/argon2/*.c third_party/argon2/blake2/*.c)
 # opt.c needs x86 SSE/AVX intrinsics; ref.c is the portable implementation.
 ifeq ($(ARCH),x86_64)
@@ -116,7 +137,7 @@ DEP := $(OBJ:.o=.d)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all test clean shader windows services test-api test-mcp
+.PHONY: all test clean shader windows services test-api test-mcp test-impersonate impersonate-lib
 
 # The Windows pair and the release zip/msi: a mingw-w64 cross build, no Windows
 # needed. `make windows WIN_ARGS=--smoke` also runs a challenge/pass round trip
@@ -145,7 +166,7 @@ $(BUILD)/argon2/%.o: third_party/argon2/%.c | $(BUILD)
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -pthread -MMD -MP -c $< -o $@
 
 $(LIB): $(OBJ)
-	$(LINK) $(LDFLAGS) -o $@ $(OBJ)
+	$(LINK) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
 
 # ---------------------------------------------------------------------------
 # The C services (2.0.0 "shaoogle"): an MCP server and an HTTP API service,
@@ -153,24 +174,58 @@ $(LIB): $(OBJ)
 # are separate binaries on purpose - a gate operator should not have to install
 # a JSON-RPC server, and an agent should not have to run a gate.
 # ---------------------------------------------------------------------------
-FETCH_SRC := src/fetch/anubis_fetch.c
-SERVICE_LIBS := -L. -lanubis_solver -Wl,-rpath,'$$ORIGIN' -lssl -lcrypto
+SERVICE_LIBS := -L. -lanubis_solver -Wl,-rpath,'$$ORIGIN' -lpthread
 
-anubis_api: src/api/anubis_api.c $(FETCH_SRC) $(LIB)
-	$(CC) $(CFLAGS) -Isrc/fetch -Iinclude -o $@ src/api/anubis_api.c $(FETCH_SRC) \
-	    $(SERVICE_LIBS)
+# The fetch layer lives in the library (see the FETCH block above), so the
+# services are one translation unit plus the .so. Building it into the library
+# as well means .so consumers (Python, the bindings) get the same client.
+ifeq ($(HAVE_FETCH),1)
+SERVICES := anubis_api anubis_mcp
+else
+SERVICES :=
+endif
 
-anubis_mcp: src/mcp/anubis_mcp.c $(FETCH_SRC) $(LIB)
-	$(CC) $(CFLAGS) -Isrc/fetch -Iinclude -o $@ src/mcp/anubis_mcp.c $(FETCH_SRC) \
-	    $(SERVICE_LIBS)
+anubis_api: src/api/anubis_api.c $(LIB)
+	$(CC) $(CFLAGS) -Isrc/fetch -Iinclude -o $@ src/api/anubis_api.c $(SERVICE_LIBS)
 
-services: anubis_api anubis_mcp
+anubis_mcp: src/mcp/anubis_mcp.c $(LIB)
+	$(CC) $(CFLAGS) -Isrc/fetch -Iinclude -o $@ src/mcp/anubis_mcp.c $(SERVICE_LIBS)
+
+services: $(SERVICES)
+ifeq ($(HAVE_FETCH),1)
+	@echo "services: anubis_api and anubis_mcp are up to date"
+else
+	@echo "services need OpenSSL headers (libssl-dev) and the fetch layer;" >&2
+	@echo "this build ran with FETCH=0 or a compiler that has no <openssl/ssl.h>" >&2
+	@false
+endif
+
+# The browser impersonation profile is a runtime library: copy it into the
+# layout the fetch layer searches. It is not linked, and not needed to build.
+# Point CURL_IMPERSONATE_LIB at a libcurl-impersonate-chrome.so.4 (from a
+# curl-impersonate build, or a curl_cffi wheel's lib64/ directory).
+CURL_IMPERSONATE_LIB ?=
+impersonate-lib:
+	@if [ -z "$(CURL_IMPERSONATE_LIB)" ]; then \
+	    echo "usage: make impersonate-lib CURL_IMPERSONATE_LIB=/path/to/libcurl-impersonate-chrome.so.4"; \
+	    false; \
+	fi
+	@if [ ! -f "$(CURL_IMPERSONATE_LIB)" ]; then \
+	    echo "not a file: $(CURL_IMPERSONATE_LIB)"; false; \
+	fi
+	@mkdir -p 3rd_party/curl-impersonate/lib
+	cp -a "$(CURL_IMPERSONATE_LIB)" 3rd_party/curl-impersonate/lib/
+	@echo "installed 3rd_party/curl-impersonate/lib/$$(basename $(CURL_IMPERSONATE_LIB))"
+	@echo "run: ./anubis_mcp   (or anubis_api) and look for \"curl-impersonate\" in the fetch result"
 
 test-api: anubis_api
 	tests/api_test.sh
 
 test-mcp: anubis_mcp
 	tests/mcp_test.sh
+
+test-impersonate: $(LIB) anubis_mcp anubis_api
+	tests/impersonate_test.sh
 
 test: $(LIB)
 	python3 tests/test_core.py

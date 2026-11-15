@@ -652,7 +652,12 @@ static void handle_version(int fd) {
     sb_json_string(&b, anubis_solver_codename(),
                    strlen(anubis_solver_codename()));
     sb_puts(&b, ",\"algorithms\":[\"fast\",\"slow\",\"sha256\","
-               "\"wasm-sha256\",\"argon2id\",\"hashx\",\"tensor\"]}");
+               "\"wasm-sha256\",\"argon2id\",\"hashx\",\"tensor\"],"
+               "\"impersonate\":");
+    sb_json_string(&b, anubis_fetch_impersonate(),
+                   strlen(anubis_fetch_impersonate()));
+    sb_printf(&b, ",\"impersonate_available\":%s}",
+              anubis_fetch_impersonate_available() ? "true" : "false");
     http_reply(fd, 200, b.data);
     sb_free(&b);
 }
@@ -855,6 +860,7 @@ static void handle_verify(int fd, const char *body, size_t blen) {
 
 static void handle_fetch(int fd, const char *body, size_t blen) {
     char *url = NULL;
+    char *impersonate = NULL;
     int r = json_get_string(body, blen, "url", &url);
     if (r <= 0) {
         reply_error(fd, 400, r < 0 ? "bad json" : "missing field");
@@ -866,10 +872,20 @@ static void handle_fetch(int fd, const char *body, size_t blen) {
         return;
     }
 
+    /* Optional per-request profile: the service is multi-threaded, so this
+     * must not go through the process-wide default. */
+    if (json_get_string(body, blen, "impersonate", &impersonate) < 0) {
+        free(url);
+        free(impersonate);
+        reply_error(fd, 400, "bad json");
+        return;
+    }
+
     anubis_page page;
     memset(&page, 0, sizeof page);
-    int rc = anubis_fetch_get(url, &page);
+    int rc = anubis_fetch_get_with(url, impersonate, &page);
     free(url);
+    free(impersonate);
     if (rc != 0) {
         const char *msg = page.error[0] ? page.error : "fetch failed";
         reply_error(fd, 502, msg);
@@ -881,6 +897,8 @@ static void handle_fetch(int fd, const char *body, size_t blen) {
     sb_printf(&b, "{\"status\":%d,\"final_url\":", page.status);
     sb_json_string(&b, page.final_url ? page.final_url : "",
                    page.final_url ? strlen(page.final_url) : 0);
+    sb_puts(&b, ",\"transport\":");
+    sb_json_string(&b, anubis_fetch_transport(), strlen(anubis_fetch_transport()));
     sb_puts(&b, ",\"content\":");
     sb_json_string(&b, page.body ? page.body : "",
                    page.body ? page.body_len : 0);

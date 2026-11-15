@@ -11,6 +11,12 @@
  * TLS is OpenSSL, verification on by default (set ANUBIS_INSECURE=1 to skip,
  * for testing against a self-signed gate). The solver is the .so this project
  * already builds, so every algorithm it supports is supported here.
+ *
+ * When a curl-impersonate library is present — $ANUBIS_IMPERSONATE_LIB, or
+ * 3rd_party/curl-impersonate/lib/ in this repository — the requests go through
+ * it instead, with a real browser TLS fingerprint (Chrome by default). The
+ * hand-written OpenSSL client stays as the fallback and is still what runs when
+ * no such library exists.
  */
 #ifndef ANUBIS_FETCH_H
 #define ANUBIS_FETCH_H
@@ -34,6 +40,29 @@ typedef struct {
  * out->error set. Free with anubis_page_free(). */
 int anubis_fetch_get(const char *url, anubis_page *out);
 void anubis_page_free(anubis_page *page);
+
+/* Same, but choose the impersonation profile for this call only, so a
+ * multi-threaded caller (the API service) never races on global state.
+ * `target` may be NULL for the default, "off" for the built-in OpenSSL
+ * client, "auto" to impersonate when a library is present, or a profile name
+ * such as "chrome", "chrome116", "edge101", "safari15_5". Thread-safe. */
+int anubis_fetch_get_with(const char *url, const char *target, anubis_page *out);
+
+/* Default profile for anubis_fetch_get(): NULL/"auto" (impersonate when
+ * available), "off" (never), or a profile name. The default is also settable
+ * through $ANUBIS_IMPERSONATE, which takes precedence over this setting.
+ * Returns 0, or -1 when the profile is not in the loaded library. */
+int anubis_fetch_set_impersonate(const char *target);
+
+/* The configured profile, "" when impersonation is disabled. */
+const char *anubis_fetch_impersonate(void);
+
+/* 1 when a usable libcurl-impersonate is installed, 0 otherwise. */
+int anubis_fetch_impersonate_available(void);
+
+/* Transport used by the calling thread's most recent fetch:
+ * "openssl", or "curl-impersonate/<profile>". Never NULL. */
+const char *anubis_fetch_transport(void);
 
 /* Version of this layer, for MCP serverInfo and API /version. */
 const char *anubis_fetch_version(void);

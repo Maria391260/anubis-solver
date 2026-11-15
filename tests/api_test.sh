@@ -122,12 +122,13 @@ fi
 
 BIN="$TMP/anubis_api"
 echo "building $BIN"
-cc -O2 -Wall -Wextra -Isrc/fetch -Iinclude -o "$BIN" \
-    src/api/anubis_api.c src/fetch/anubis_fetch.c \
-    -L. -lanubis_solver -Wl,-rpath,"$ROOT" -lssl -lcrypto -lpthread || {
+# The fetch layer lives in the .so now, so this is one file plus the library.
+(cd "$ROOT" && make anubis_api >"$TMP/build_api.log" 2>&1) || {
+    cat "$TMP/build_api.log" >&2
     echo "FAIL build"
     exit 1
 }
+BIN="$ROOT/anubis_api"
 
 # ---- ports --------------------------------------------------------------
 

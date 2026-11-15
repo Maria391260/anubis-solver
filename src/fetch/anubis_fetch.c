@@ -7,9 +7,12 @@
  * implements: a JSON payload in <script id="anubis_challenge">, a
  * pass-challenge GET with id/response/nonce, and a cookie that follows.
  *
- * Deliberately small: HTTP/1.1, Content-Length or chunked, one request per
- * connection (Connection: close), a cookie list, and redirects. No HTTP/2, no
- * connection reuse. This is a client for a tool, not a browser.
+ * Two transports. The built-in one is deliberately small: HTTP/1.1,
+ * Content-Length or chunked, one request per connection (Connection: close), a
+ * cookie list, and redirects. The other is libcurl-impersonate, when it is
+ * installed (see fetch_impersonate.c): HTTP/2 with a real browser TLS
+ * fingerprint, its own cookie engine, and connection reuse. The built-in client
+ * is the fallback and needs nothing but OpenSSL.
  */
 #include "anubis_fetch.h"
 
@@ -29,6 +32,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "fetch_impersonate.h"
 #include "anubis-solver.h"
 
 #define MAX_HEADER 65536
@@ -438,6 +442,31 @@ done:
     return rc;
 }
 
+/* --------------------------------------------------- transport dispatch */
+
+/* One get, through whichever transport this session selected. The cookie jar
+ * is only used by the built-in client; libcurl keeps its own. */
+typedef struct {
+    anubis_imp_handle *imp;
+    jar j;
+} xport;
+
+static int xport_get(xport *x, const char *url, anubis_page *out) {
+    if (x->imp) {
+        const char *insecure = getenv("ANUBIS_INSECURE");
+        return anubis_imp_get(x->imp, url, insecure && *insecure == '1', out);
+    }
+    return http_get(url, &x->j, NULL, out);
+}
+
+static void xport_close(xport *x) {
+    if (x->imp) {
+        anubis_imp_close(x->imp);
+        x->imp = NULL;
+    }
+    jar_free(&x->j);
+}
+
 /* ------------------------------------------------------------------ JSON */
 
 static int json_string(const char *json, const char *key, char *out, size_t cap) {
@@ -553,6 +582,109 @@ static void sleep_ms(long ms) {
 
 /* ------------------------------------------------------------------- API */
 
+/* ---- impersonation configuration ------------------------------------- */
+
+/* Empty string means "auto": impersonate when a library is installed.
+ * "off" forces the built-in OpenSSL client. */
+static char g_target[64];
+static int g_off;
+
+static int is_off_word(const char *s) {
+    if (!s) return 0;
+    return !strcasecmp(s, "off") || !strcmp(s, "0") || !strcasecmp(s, "none") ||
+           !strcasecmp(s, "no") || !strcasecmp(s, "openssl") ||
+           !strcasecmp(s, "false");
+}
+
+static int is_auto_word(const char *s) {
+    return !s || !*s || !strcasecmp(s, "auto");
+}
+
+static __thread char t_transport[64] = "openssl";
+
+const char *anubis_fetch_transport(void) {
+    return t_transport;
+}
+
+int anubis_fetch_impersonate_available(void) {
+    return anubis_imp_load(NULL, 0) == 0;
+}
+
+int anubis_fetch_set_impersonate(const char *target) {
+    char resolved[64];
+    char err[512] = "";
+
+    if (is_auto_word(target)) {
+        g_target[0] = '\0';
+        g_off = 0;
+        return 0;
+    }
+    if (is_off_word(target)) {
+        g_target[0] = '\0';
+        g_off = 1;
+        return 0;
+    }
+    if (anubis_imp_load(err, sizeof err) != 0) return -1;
+    if (anubis_imp_resolve_target(target, resolved, sizeof resolved) != 0) return -1;
+    snprintf(g_target, sizeof g_target, "%s", resolved);
+    g_off = 0;
+    return 0;
+}
+
+const char *anubis_fetch_impersonate(void) {
+    static __thread char buf[64];
+    if (g_off) return "";
+    if (g_target[0]) return g_target;
+    if (anubis_imp_load(NULL, 0) != 0) return "";
+    if (anubis_imp_resolve_target("chrome", buf, sizeof buf) != 0) return "";
+    return buf;
+}
+
+/* Decide the transport for one fetch. Reads $ANUBIS_IMPERSONATE first (so a
+ * deployment can pin a profile without recompiling or re-calling the setter),
+ * then the per-call target, then the process default. */
+static int open_transport(xport *x, const char *target, anubis_page *out) {
+    const char *env = getenv("ANUBIS_IMPERSONATE");
+    const char *want;
+    int strict = 0;
+    char err[512] = "";
+
+    if (env && *env) {
+        want = env;
+        strict = 1;
+    } else if (target && *target) {
+        want = target;
+        strict = 1;
+    } else if (g_off) {
+        want = "off";
+    } else if (g_target[0]) {
+        want = g_target;
+        strict = 1;
+    } else {
+        want = "auto";
+    }
+
+    snprintf(t_transport, sizeof t_transport, "openssl");
+    if (is_off_word(want)) return 0;
+
+    if (is_auto_word(want)) {
+        /* Best effort: no library, no impersonation, no error. */
+        if (anubis_imp_load(NULL, 0) != 0) return 0;
+    }
+    x->imp = anubis_imp_open(is_auto_word(want) ? "chrome" : want, err, sizeof err);
+    if (!x->imp) {
+        if (strict) {
+            snprintf(out->error, sizeof out->error,
+                     "impersonation requested but unavailable: %s", err);
+            return -1;
+        }
+        return 0;
+    }
+    snprintf(t_transport, sizeof t_transport, "curl-impersonate/%s",
+             anubis_imp_handle_target(x->imp));
+    return 0;
+}
+
 const char *anubis_fetch_version(void) {
     return "2.0.0 \"shaoogle\"";
 }
@@ -564,21 +696,30 @@ void anubis_page_free(anubis_page *page) {
     memset(page, 0, sizeof *page);
 }
 
-int anubis_fetch_get(const char *url, anubis_page *out) {
-    jar j = {0};
+int anubis_fetch_get_with(const char *url, const char *target, anubis_page *out) {
+    xport x = {0};
     char *current = xstrdup(url);
     int attempt;
+
     if (!out) return -1;
     memset(out, 0, sizeof *out);
-    if (!current) return -1;
+    if (!url || !current) {
+        snprintf(out->error, sizeof out->error, "bad url");
+        free(current);
+        return -1;
+    }
+    if (open_transport(&x, target, out) != 0) {
+        free(current);
+        return -1;
+    }
 
     for (attempt = 0; attempt < 8; attempt++) {
         anubis_page page = {0};
-        if (http_get(current, &j, NULL, &page) != 0) {
+        if (xport_get(&x, current, &page) != 0) {
             snprintf(out->error, sizeof out->error, "%s", page.error);
             anubis_page_free(&page);
             free(current);
-            jar_free(&j);
+            xport_close(&x);
             return -1;
         }
         if (page.final_url && (page.status == 301 || page.status == 302 ||
@@ -607,7 +748,7 @@ int anubis_fetch_get(const char *url, anubis_page *out) {
                 snprintf(out->error, sizeof out->error, "challenge without randomData");
                 anubis_page_free(&page);
                 free(current);
-                jar_free(&j);
+                xport_close(&x);
                 return -1;
             }
             origin = origin_of(current);
@@ -615,7 +756,7 @@ int anubis_fetch_get(const char *url, anubis_page *out) {
                 snprintf(out->error, sizeof out->error, "bad url");
                 anubis_page_free(&page);
                 free(current);
-                jar_free(&j);
+                xport_close(&x);
                 return -1;
             }
             enc_id = url_encode(id);
@@ -650,7 +791,7 @@ int anubis_fetch_get(const char *url, anubis_page *out) {
                     free(origin); free(enc_id); free(enc_rd); free(enc_redir);
                     anubis_page_free(&page);
                     free(current);
-                    jar_free(&j);
+                    xport_close(&x);
                     return -1;
                 }
                 enc_resp = url_encode(digest);
@@ -667,34 +808,34 @@ int anubis_fetch_get(const char *url, anubis_page *out) {
             free(enc_rd);
             free(enc_redir);
 
-            if (http_get(pass, &j, NULL, &solved) != 0) {
+            if (xport_get(&x, pass, &solved) != 0) {
                 snprintf(out->error, sizeof out->error, "pass-challenge failed: %.200s",
                          solved.error);
                 free(pass);
                 anubis_page_free(&solved);
                 anubis_page_free(&page);
                 free(current);
-                jar_free(&j);
+                xport_close(&x);
                 return -1;
             }
             free(pass);
-            if (solved.final_url && (solved.status == 301 || solved.status == 302 ||
-                                     solved.status == 303 || solved.status == 307)) {
-                /* the cookie is what matters; keep the redirect target unused */
-            }
             anubis_page_free(&solved);
             anubis_page_free(&page);
             continue; /* re-fetch the original URL with the new cookie */
         }
 
         *out = page;
-        out->final_url = xstrdup(current);
+        if (!out->final_url) out->final_url = xstrdup(current);
         free(current);
-        jar_free(&j);
+        xport_close(&x);
         return 0;
     }
     snprintf(out->error, sizeof out->error, "too many challenge rounds");
     free(current);
-    jar_free(&j);
+    xport_close(&x);
     return -1;
+}
+
+int anubis_fetch_get(const char *url, anubis_page *out) {
+    return anubis_fetch_get_with(url, NULL, out);
 }
