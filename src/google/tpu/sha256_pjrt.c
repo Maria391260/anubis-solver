@@ -133,7 +133,7 @@ static char *rotr(buf_t *b, const char *x, unsigned n) {
  * nonce bytes go and in which order they are read.
  */
 static char *build_module(int lanes, const uint32_t words[16], int nonce_off,
-                          int use_le) {
+                          int use_le, int difficulty) {
     static const uint32_t iv[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u,
                                    0xa54ff53au, 0x510e527fu, 0x9b05688cu,
                                    0x1f83d9abu, 0x5be0cd19u};
@@ -147,8 +147,8 @@ static char *build_module(int lanes, const uint32_t words[16], int nonce_off,
 
     bprintf(&b,
             "module {\n"
-            "  func.func @main(%%n: tensor<i32>) -> tensor<%dxi32> {\n"
-            "    %%lane = stablehlo.iota dim = 0 : tensor<%dxi32>\n", lanes * 8, lanes);
+            "  func.func @main(%%n: tensor<i32>) -> tensor<%dxi8> {\n"
+            "    %%lane = stablehlo.iota dim = 0 : tensor<%dxi32>\n", lanes, lanes);
     {
         char *base = nv("nb");
         bprintf(&b, "    %s = stablehlo.broadcast_in_dim %%n, dims = [] "
@@ -233,29 +233,36 @@ static char *build_module(int lanes, const uint32_t words[16], int nonce_off,
         free(S0); free(maj); free(t2);
     }
 
-    /* the digest is H0+i..H7, as eight i32 words; the host writes them
-     * big-endian, which is what SHA-256 defines */
+    /* The device decides "does this lane meet the target?" and the host gets
+     * one byte per lane instead of 32. The digest is re-derived on the CPU for
+     * the single lane that matters, so the transfer is B bytes, not B*32 - at
+     * these window sizes the copy back was the whole cost. */
     {
-        char *one[8];
-        for (int i = 0; i < 8; i++) {
-            char *sum = nv("h");
-            char *row = nv("r");
-            bprintf(&b, "    %s = stablehlo.add %s, %s : tensor<%dxi32>\n",
-                    sum, vars[i], bc(&b, iv[i]), lanes);
-            bprintf(&b, "    %s = stablehlo.reshape %s : (tensor<%dxi32>) -> tensor<%dx1xi32>\n",
-                    row, sum, lanes, lanes);
-            one[i] = row;
-            free(sum);
+        char *h0 = nv("h0");
+        char *th = NULL;
+        char *cmp = nv("ok");
+        char *fl = nv("flag");
+        uint32_t threshold = (difficulty >= 32) ? 1u : (1u << (32 - difficulty));
+        bprintf(&b, "    %s = stablehlo.add %s, %s : tensor<%dxi32>\n",
+                h0, vars[0], bc(&b, iv[0]), lanes);
+        (void)th;
+        {
+            char *tc = nv("tc");
+            char *ts = nv("ts");
+            bprintf(&b, "    %s = stablehlo.constant dense<%d> : tensor<i32>\n",
+                    tc, (int32_t)threshold);
+            bprintf(&b, "    %s = stablehlo.broadcast_in_dim %s, dims = [] "
+                        ": (tensor<i32>) -> tensor<%dxi32>\n", ts, tc, lanes);
+            /* unsigned: the threshold for a 1-bit difficulty is 0x80000000 */
+            bprintf(&b, "    %s = \"stablehlo.compare\"(%s, %s) "
+                        "{comparison_direction = #stablehlo<comparison_direction LT>, "
+                        "compare_type = #stablehlo<comparison_type UNSIGNED>} "
+                        ": (tensor<%dxi32>, tensor<%dxi32>) -> tensor<%dxi1>\n",
+                    cmp, h0, ts, lanes, lanes);
+            bprintf(&b, "    %s = \"stablehlo.convert\"(%s) "
+                        ": (tensor<%dxi1>) -> tensor<%dxi8>\n", fl, cmp, lanes, lanes);
+            bprintf(&b, "    return %s : tensor<%dxi8>\n", fl, lanes);
         }
-        bprintf(&b, "    %%out = stablehlo.concatenate %s, %s, %s, %s, %s, %s, %s, %s, "
-                    "dim = 1 : (tensor<%dx1xi32>, tensor<%dx1xi32>, tensor<%dx1xi32>, "
-                    "tensor<%dx1xi32>, tensor<%dx1xi32>, tensor<%dx1xi32>, tensor<%dx1xi32>, "
-                    "tensor<%dx1xi32>) -> tensor<%dx8xi32>\n",
-                one[0], one[1], one[2], one[3], one[4], one[5], one[6], one[7],
-                lanes, lanes, lanes, lanes, lanes, lanes, lanes, lanes, lanes);
-        bprintf(&b, "    %%flat = stablehlo.reshape %%out : (tensor<%dx8xi32>) -> tensor<%dxi32>\n",
-                lanes, lanes * 8);
-        bprintf(&b, "    return %%flat : tensor<%dxi32>\n", lanes * 8);
     }
     bprintf(&b, "  }\n}\n");
     return b.s;
@@ -496,7 +503,7 @@ static void reference_digest(const uint8_t *raw, size_t raw_len, uint32_t nonce,
 int main(int argc, char **argv) {
     const char *lib = getenv("LIBTPU");
     const char *challenge = DEFAULT_CHALLENGE;
-    int difficulty = 20, lanes = 8192, json = 0, selftest = 0;
+    int difficulty = 20, lanes = 32768, json = 0;
     long long bench_hashes = 0;
     uint8_t raw[4096];
     size_t raw_len;
@@ -517,8 +524,6 @@ int main(int argc, char **argv) {
             lanes = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--bench-hashes") == 0 && i + 1 < argc) {
             bench_hashes = atoll(argv[++i]);
-        } else if (strcmp(argv[i], "--selftest") == 0) {
-            selftest = 1;
         } else if (strcmp(argv[i], "--json") == 0) {
             json = 1;
         } else {
@@ -545,9 +550,13 @@ int main(int argc, char **argv) {
     build_block(raw, raw_len, words);
 
     pjrt_open(lib);
-    module = build_module(lanes, words, (int)raw_len, use_le);
+    if (difficulty < 1 || difficulty > 32) {
+        fprintf(stderr, "--difficulty must be 1..32 for the device-side test\n");
+        return 2;
+    }
+    module = build_module(lanes, words, (int)raw_len, use_le, difficulty);
     ex = compile(module, &compile_ms);
-    out = malloc((size_t)lanes * 32); /* [lanes,8] i32 */
+    out = malloc((size_t)lanes); /* one flag byte per lane */
     if (out == NULL) {
         return 1;
     }
@@ -558,64 +567,28 @@ int main(int argc, char **argv) {
         uint32_t base = 0;
         int found = 0;
         uint32_t found_nonce = 0;
-        uint8_t found_digest[32];
 
         /* one untimed window: the first execute after compile pays for
          * whatever the backend defers, and it is not part of the rate */
         {
             PJRT_Buffer *arg = upload_i32(0);
             PJRT_Buffer *res = execute(ex, arg, NULL);
-            read_back(res, out, (size_t)lanes * 32);
+            read_back(res, out, (size_t)lanes);
             buffer_destroy(arg);
             buffer_destroy(res);
-        }
-        if (selftest) {
-            /* Lane 0 is nonce 0. Print the raw i32 words the device returned
-             * next to the CPU digest, so a readback/layout problem can be told
-             * apart from a wrong message. */
-            uint8_t ref0[32];
-            char hex0[65], rawhex[129];
-            const uint8_t *w0 = out; /* [lanes,8] i32, little-endian in memory */
-            uint8_t be[32], le[32];
-            for (int wi = 0; wi < 8; wi++) {
-                for (int k = 0; k < 4; k++) {
-                    be[4 * wi + k] = w0[4 * wi + 3 - k];
-                    le[4 * wi + k] = w0[4 * wi + k];
-                }
-            }
-            reference_digest(raw, raw_len, 0, use_le, ref0);
-            pjrt_to_hex((const uint8_t *)w0, 32, rawhex);
-            pjrt_to_hex(be, 32, hex0);
-            printf("selftest: nonce 0, use_le=%d\n", use_le);
-            printf("  tpu bytes   %s\n", rawhex);
-            printf("  tpu BE/word %s\n", hex0);
-            printf("  tpu LE/word %s\n", le[0] ? "see bytes" : "");
-            pjrt_to_hex(ref0, 32, hex0);
-            printf("  cpu digest  %s\n", hex0);
-            fflush(stdout);
-            return 0;
         }
         t0 = pjrt_now_s();
 
         while (1) {
             PJRT_Buffer *arg = upload_i32((int32_t)base);
             PJRT_Buffer *res = execute(ex, arg, NULL);
-            read_back(res, out, (size_t)lanes * 32);
+            read_back(res, out, (size_t)lanes);
             buffer_destroy(arg);
             buffer_destroy(res);
             for (int lane = 0; lane < lanes; lane++) {
-                uint8_t d[32];
-                const uint8_t *words_le = out + (size_t)lane * 32;
-                for (int wi = 0; wi < 8; wi++) {
-                    d[4 * wi + 0] = words_le[4 * wi + 3];
-                    d[4 * wi + 1] = words_le[4 * wi + 2];
-                    d[4 * wi + 2] = words_le[4 * wi + 1];
-                    d[4 * wi + 3] = words_le[4 * wi + 0];
-                }
-                if (digest_bits(d, difficulty) >= difficulty) {
+                if (out[lane] != 0) {
                     hits++;
                     if (!found) {
-                        memcpy(found_digest, d, 32);
                         found_nonce = base + (uint32_t)lane;
                         found = 1;
                     }
@@ -642,8 +615,7 @@ int main(int argc, char **argv) {
             if (found) {
                 uint8_t ref[32];
                 reference_digest(raw, raw_len, found_nonce, use_le, ref);
-                verified = digest_bits(ref, difficulty) >= difficulty &&
-                           memcmp(ref, found_digest, 32) == 0;
+                verified = digest_bits(ref, difficulty) >= difficulty;
                 pjrt_to_hex(ref, 32, hex);
             } else {
                 hex[0] = '\0';
@@ -663,11 +635,7 @@ int main(int argc, char **argv) {
                 if (found) {
                     printf("nonce=%u digest=%s %s\n", found_nonce, hex,
                            verified ? "verified" : "VERIFICATION FAILED");
-                    if (!verified) {
-                        char tpu_hex[65];
-                        pjrt_to_hex(found_digest, 32, tpu_hex);
-                        printf("  tpu digest: %s\n  cpu digest: %s\n", tpu_hex, hex);
-                    }
+
                 } else if (bench_hashes > 0) {
                     printf("(benchmark only, hits=%lld)\n", hits);
                 }
