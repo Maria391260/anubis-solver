@@ -47,9 +47,9 @@ make xe-loader && ./build/xe-loader --text /tmp/intelXe_sha256.krn   # run the h
 | `src/core/anubis_solver.c` | core: hashing, search loop, backend dispatch, verification |
 | `src/hashx/hashx.c/.h` | HashX generator, interpreter, x86-64/AArch64 JITs (LGPL-3.0) |
 | `src/cpu/*.s` | hand-written SHA-256 kernels (AVX2, SHA-NI, AVX-512, NEON) |
-| `src/cuda/*.cu` | CUDA backends (SHA-256, Argon2id, HashX) |
+| `src/nvidia/cuda/*.cu` | CUDA backends (SHA-256, Argon2id, HashX) |
 | `src/intel/xe/` | Intel Xe (gen12lp) assembly for the SHA-256 kernel: a hand-written listing from `tools/gen_xe_sha256.py`, and IGC's own code extracted from a Zebin that ran on the GPU |
-| `src/levelzero/*.c` | Level Zero backends; kernels in `src/levelzero/*.cl` |
+| `src/intel/levelzero/*.c` | Level Zero backends; kernels in `src/intel/levelzero/*.cl` |
 | `src/vulkan/vulkan.c` | Vulkan backends; kernels in `src/vulkan/*.comp` |
 | `src/opencl/` | portable OpenCL host, wired for SHA-256; its own `sha256_pow.cl` |
 | `include/anubis-solver.h` | public C/C++ header — keep in sync with exports |
@@ -95,10 +95,10 @@ make xe-loader && ./build/xe-loader --text /tmp/intelXe_sha256.krn   # run the h
 | file | regenerate with |
 |---|---|
 | `src/vulkan/sha256_comp.spv(.h)` | `tools/build_shader.sh` + `tools/embed_spv.py` |
-| `src/levelzero/sha256_pow.spv(.h)` | `tools/build_l0_shader.sh` + `tools/embed_l0_spv.py` |
-| `src/levelzero/argon2id_l0.spv(.h)` | `tools/build_l0_argon2.sh` |
+| `src/intel/levelzero/sha256_pow.spv(.h)` | `tools/build_l0_shader.sh` + `tools/embed_l0_spv.py` |
+| `src/intel/levelzero/argon2id_l0.spv(.h)` | `tools/build_l0_argon2.sh` |
 | `src/vulkan/argon2id.spv(.h)` | `tools/build_argon2_vk.sh` |
-| `src/levelzero/hashx_l0.spv(.h)`, `src/vulkan/hashx.spv(.h)` | clang/llvm-spirv and `glslangValidator` (see `docs/development.md`) |
+| `src/intel/levelzero/hashx_l0.spv(.h)`, `src/vulkan/hashx.spv(.h)` | clang/llvm-spirv and `glslangValidator` (see `docs/development.md`) |
 | `src/opencl/opencl_kernels.h` | `python3 tools/embed_opencl_kernels.py` |
 | `src/cpu/avx2.s`, `src/cpu/avx512.s` | `tools/gen_avx2_s.py`, `tools/gen_avx512_s.py` |
 | `src/intel/xe/intelXe_sha256.xe` | `tools/gen_xe_sha256.py` (needs `IGA64` to assemble) |

@@ -4,8 +4,8 @@ CFLAGS  ?= -O3 -fPIC -Wall -Wextra -std=gnu17
 NATIVE  ?= -march=native
 LDFLAGS ?= -shared -pthread
 LDLIBS  ?=
-INC     := -Iinclude -Isrc -Isrc/core -Isrc/hashx -Isrc/cpu -Isrc/cuda \
-           -Isrc/levelzero -Isrc/vulkan -Isrc/opencl -Ithird_party/argon2
+INC     := -Iinclude -Isrc -Isrc/core -Isrc/hashx -Isrc/cpu -Isrc/nvidia/cuda \
+           -Isrc/intel/levelzero -Isrc/vulkan -Isrc/opencl -Ithird_party/argon2
 
 # ---- build configuration --------------------------------------------------
 # `make config` answers three questions and writes config.mk:
@@ -31,8 +31,8 @@ NVCC ?= nvcc
 CUDA_SRC :=
 ifneq ($(CUDA),0)
 ifneq ($(shell command -v $(NVCC) 2>/dev/null),)
-CUDA_SRC := src/cuda/cuda_sha256.cu src/cuda/cuda_argon2.cu src/cuda/cuda_hashx.cu \
-            src/cuda/cuda_tensor.cu
+CUDA_SRC := src/nvidia/cuda/cuda_sha256.cu src/nvidia/cuda/cuda_argon2.cu src/nvidia/cuda/cuda_hashx.cu \
+            src/nvidia/cuda/cuda_tensor.cu
 CFLAGS   += -DANUBIS_HAVE_CUDA
 # nvcc is the linker here; it rejects bare -pthread, so pass it to the host
 # compiler explicitly.
@@ -77,8 +77,8 @@ L0_INC ?= $(if $(wildcard /usr/include/level_zero/ze_api.h),/usr/include,\
             $(if $(wildcard /usr/local/include/level_zero/ze_api.h),/usr/local/include,))
 ifneq ($(L0),0)
 ifneq ($(wildcard $(L0_INC)/level_zero/ze_api.h),)
-CORE_SRC += src/levelzero/levelzero_sha256.c src/levelzero/levelzero_argon2.c \
-             src/levelzero/levelzero_hashx.c
+CORE_SRC += src/intel/levelzero/levelzero_sha256.c src/intel/levelzero/levelzero_argon2.c \
+             src/intel/levelzero/levelzero_hashx.c
 CFLAGS   += -DANUBIS_HAVE_LEVELZERO -I$(L0_INC)
 LDFLAGS  += -ldl
 endif

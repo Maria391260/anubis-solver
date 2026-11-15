@@ -50,7 +50,7 @@ exactly the shape a kernel needs.
 3. **Nothing to read.** Baking the program in is what makes this page-sized
    listing possible at all: a kernel that read the program from a buffer would
    need `send.dc1` messages and surface descriptors, which is what the OpenCL
-   kernel in `src/levelzero/hashx_l0.cl` gets from the compiler.
+   kernel in `src/intel/levelzero/hashx_l0.cl` gets from the compiler.
 
 ### Verified how
 
@@ -168,7 +168,7 @@ difference, not a GPU difference.
 ## Why ours is 2,844 and IGC's is 1,711
 
 - **Ours is fully unrolled**: 64 rounds as straight-line code, like the CUDA
-  kernel in `src/cuda/`. IGC emits loops and re-enters them, which is why its
+  kernel in `src/nvidia/cuda/`. IGC emits loops and re-enters them, which is why its
   code is a third shorter and still faster.
 - **Ours keeps K as immediates**; IGC reads it from `.data.const` with
   `send.dc1` (190 of them), trading instructions for constant-bandwidth.
@@ -251,7 +251,7 @@ by the destination subregister (`r18.0`, `r18.1`, …).
 
 ## What the library uses
 
-Nothing here is loaded at runtime: `src/levelzero/` and `src/vulkan/` ship SPIR-V
+Nothing here is loaded at runtime: `src/intel/levelzero/` and `src/vulkan/` ship SPIR-V
 and let the driver compile it, and the newly available OpenCL path
 (`src/opencl/`, not wired yet) would go through IGC the same way the harness
 above does. This directory is the readable record of what that compilation does,

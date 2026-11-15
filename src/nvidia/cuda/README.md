@@ -14,12 +14,12 @@ Nothing here is required for a correct solve.
 
 | workload | GPU | one CPU thread | ratio | receipt |
 |---|---:|---:|---:|---|
-| `fast`, difficulty 6 | 922.4 MH/s | 17.6 MH/s | 52.3x | [`cuda-t4.json`](../../results/cuda-t4.json) |
+| `fast`, difficulty 6 | 922.4 MH/s | 17.6 MH/s | 52.3x | [`cuda-t4.json`](../../../results/cuda-t4.json) |
 | `fast`, difficulty 7 | 2286.3 MH/s | 16.4 MH/s | 139.7x | same run |
 | `sha256`, 24 bits | 1719.8 MH/s | 22.7 MH/s | 75.7x | same run |
 | `sha256`, 26 bits | 2985.1 MH/s | 22.8 MH/s | 130.9x | same run |
-| `argon2id`, difficulty 8 | 1758.6 h/s | 85.0 h/s | 20.7x | [`argon2id-cuda-t4.json`](../../results/argon2id-cuda-t4.json) |
-| `hashx`, difficulty 28 | 108.5 MH/s | 8.87 MH/s | 12.2x | [`hashx-cuda-t4.json`](../../results/hashx-cuda-t4.json) |
+| `argon2id`, difficulty 8 | 1758.6 h/s | 85.0 h/s | 20.7x | [`argon2id-cuda-t4.json`](../../../results/argon2id-cuda-t4.json) |
+| `hashx`, difficulty 28 | 108.5 MH/s | 8.87 MH/s | 12.2x | [`hashx-cuda-t4.json`](../../../results/hashx-cuda-t4.json) |
 
 Three of those rows are lower than a reader expects, and each for a real reason.
 Argon2id is memory-bound, so 128 concurrent hashes per device (2,550 MB of a
@@ -54,7 +54,7 @@ by Xe Iaso, September 6 2026, announcing memory-hard challenges:
 > CUDA Anubis solver" route is on its way to being fundamentally dead.
 
 This directory is the thing that sentence describes. `cuda_argon2.cu` is the
-"vibeslop me a CUDA Anubis solver" file. It is in `src/cuda/`, it was written by
+"vibeslop me a CUDA Anubis solver" file. It is in `src/nvidia/cuda/`, it was written by
 an AI — DeepSeek V4.1 Flash, per `AGENTS.md` — and it computes 1,758.6 hashes per
 second on two T4s, 20.7x a CPU thread, with every tag checked against
 `argon2-cffi` before it is reported. The route is not dead. It has a toll booth,
@@ -87,7 +87,7 @@ Pretending the whole criticism is wrong would be its own kind of vibeslop.
 What survives the whole exchange is the economic point, and it is the one Anubis
 always made for itself: memory-hardening does not make solving impossible, it
 makes solving cost money. The measurement that supports it is
-[`HALL_OF_SHAME.md` entry 8](../../HALL_OF_SHAME.md): a difficulty-4 challenge
+[`HALL_OF_SHAME.md` entry 8](../../../HALL_OF_SHAME.md): a difficulty-4 challenge
 costs one Xeon core 9.8 ms. This directory is the faster car in that argument, and
 the argument is still correct.
 
@@ -117,5 +117,5 @@ ANUBIS_GPU_HASHX=1 python3 tools/bench_hashx_gpu.py
 ```
 
 The machine code these compile to is disassembled and annotated, one comment per
-instruction, in [`src/sass/`](../sass/README.md) — which is the part of the story
+instruction, in [`src/nvidia/sass/`](../sass/README.md) — which is the part of the story
 that makes the vibeslop criticism age worse, not better.

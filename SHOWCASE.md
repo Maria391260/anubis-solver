@@ -20,7 +20,7 @@ against the shipped reference vectors before any timing:
 | HashX | 62.7 MH/s | **1,244 MH/s** | **19.9×** | the challenge program emitted as straight-line code instead of interpreted |
 | Argon2id | 715 H/s | **960 H/s** | **1.34×** | 16-byte block copies, `prev^ref` kept in shared memory |
 
-The SASS for all three ships in `src/sass/`, along with the jobs that produced
+The SASS for all three ships in `src/nvidia/sass/`, along with the jobs that produced
 it. Two of those kernels are additionally **annotated instruction by instruction**
 — 4,896 comments in total, and stripping the comments reproduces the original
 `.sass` byte for byte.
@@ -118,7 +118,7 @@ node --test dsh-plugin/test.mjs       # the fetch tool, incl. a live solve
 cd bindings/asm && make run && make run-arm   # assembly on x86-64 and AArch64
 ```
 
-Reproduce the GPU numbers: `src/sass/kaggle_t4_sass.py`,
+Reproduce the GPU numbers: `src/nvidia/sass/kaggle_t4_sass.py`,
 `kaggle_t4_hashx.py` and `kaggle_t4_argon2id.py` are the exact jobs that ran on
 the T4; each prints the SASS, the register/spill report and the timings.
 
@@ -131,8 +131,8 @@ the T4; each prints the SASS, the register/spill report and the timings.
   flat ~2,400 is the more useful number.
 - **All chip numbers are simulation.** No synthesis-to-netlist timing, no silicon.
 - **Nothing is wired into the library itself.** The optimised kernels live in
-  `src/sass/` as measured references and are not compiled into
-  `src/cuda/*.cu` — that would need a GPU to validate the library path end to end.
+  `src/nvidia/sass/` as measured references and are not compiled into
+  `src/nvidia/cuda/*.cu` — that would need a GPU to validate the library path end to end.
 - **The JS engine coverage is no longer partial, but argon2id still is.**
   `tools/anubis_fetch.js` solves `fast`, `slow`, `sha256` and now `hashx` by
   itself (`hashx` is compiled to wasm for the challenge, in JavaScript);

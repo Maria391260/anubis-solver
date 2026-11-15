@@ -2,7 +2,7 @@
 # test, then measure the GEMM on one T4 and on both. Everything that happens is
 # copied into /kaggle/working/result.json, so a failure is still evidence.
 #
-#   kaggle kernels push -p src/cuda/kaggle_tensor
+#   kaggle kernels push -p src/nvidia/cuda/kaggle_tensor
 #   kaggle kernels status monktelv31/anubis-t4-tensor
 #   kaggle kernels output monktelv31/anubis-t4-tensor -p /tmp/t4 --file-pattern 'result\.json'
 import json

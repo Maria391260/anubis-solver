@@ -10,7 +10,7 @@ after an edit to the kernels is visible as a diff instead of silence.
     python3 tools/embed_opencl_kernels.py --check    # fail if it is stale
 
 The .cl files are shared with the Level Zero backend, which ships precompiled
-SPIR-V in src/levelzero/*.spv.h; changing a .cl here does NOT rebuild that
+SPIR-V in src/intel/levelzero/*.spv.h; changing a .cl here does NOT rebuild that
 SPIR-V. tools/build_l0_shader.sh does, when spare cycles and a GPU matter.
 """
 from __future__ import annotations

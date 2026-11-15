@@ -4,7 +4,7 @@
     make config
 
   1. Which GPU architecture are you building for?  A T4 is sm_75, and this repo
-     ships hand-measured SASS for sm_75 in src/sass/. For an architecture with no
+     ships hand-measured SASS for sm_75 in src/nvidia/sass/. For an architecture with no
      shipped SASS the CUDA backend still builds, from standard .cu sources - the
      SASS is an optimisation, not a requirement.
   2. Which CPU architecture?  x86-64 or AArch64/ARM.

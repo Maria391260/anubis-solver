@@ -3,7 +3,7 @@
  *
  * One work-item per candidate nonce: expand the 512-bit register file from
  * the SipHash key + nonce, interpret the HashX program, finalize, check the
- * leading zero bits and append hits. Mirrors src/cuda_hashx.cu.
+ * leading zero bits and append hits. Mirrors src/nvidia/cuda_hashx.cu.
  */
 
 #define HX_MAX_INSTR 512

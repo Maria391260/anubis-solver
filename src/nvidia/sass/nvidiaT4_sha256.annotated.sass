@@ -1,6 +1,6 @@
 // ===========================================================================
 //  ANNOTATED SASS - sha256_pow_kernel, sm_75 (Tesla T4)
-//  Source   : src/cuda/cuda_sha256.cu - one thread hashes one nonce through a
+//  Source   : src/nvidia/cuda/cuda_sha256.cu - one thread hashes one nonce through a
 //             single 64-byte tail block, tests the digest's leading zero bits
 //             and claims a result slot with an atomicAdd. This is the SHIPPED
 //             kernel: it still builds that block in an unsigned char[64].

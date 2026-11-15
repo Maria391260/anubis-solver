@@ -31,3 +31,15 @@ bindings/java/build/
 bindings/asm/build/
 build-arm64/
 bindings/rust/target/
+
+# local build products at the repo root (make services)
+/anubis_api
+/anubis_mcp
+
+# vendored trees from upstream checkouts; not part of this repository
+/3rd_party/curl_cffi/
+/betterAnusbis/3rd_party/
+
+# personal images that are not part of the documentation site
+/meme/
+/mascot/JanusMadeDeepSeek.webp

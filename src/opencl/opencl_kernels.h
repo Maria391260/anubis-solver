@@ -1426,7 +1426,7 @@ static const char ocl_hashx_src[] =
     ""
     " * the SipHash key + nonce, interpret the HashX program, finalize, check the\n"
     ""
-    " * leading zero bits and append hits. Mirrors src/cuda_hashx.cu.\n"
+    " * leading zero bits and append hits. Mirrors src/nvidia/cuda_hashx.cu.\n"
     ""
     " */\n"
     ""

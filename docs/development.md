@@ -9,8 +9,15 @@ examples/               Python, C and C++ samples
 src/core/anubis_solver.c   C core: hashing, search loop, dispatch
 src/hashx/hashx.c/.h       HashX generator, interpreter, x86-64/AArch64 JITs
 src/cpu/*.s             hand-written SHA-256 kernels
-src/cuda/*.cu           CUDA backends (SHA-256, Argon2id, HashX)
-src/levelzero/*.c       Level Zero backends (+ *.cl kernels, *.spv.h)
+
+vendor-specific backends are grouped by vendor:
+src/nvidia/cuda/*.cu    CUDA backends (SHA-256, Argon2id, HashX, tensor)
+src/nvidia/sass/        hand-measured T4 SASS listings, the kernels that produced them,
+                        and the Kaggle notebooks that ran them
+src/intel/levelzero/    Level Zero backends (+ *.cl kernels, *.spv.h)
+src/intel/xe/           Intel Xe (gen12lp) SASS for the SHA-256 kernel
+
+portable backends:
 src/vulkan/*.c          Vulkan backends (GLSL kernels in *.comp)
 src/opencl/             portable OpenCL host + its own sha256 kernel
 third_party/argon2      Argon2id reference implementation
@@ -50,9 +57,9 @@ changes.
 |---|---|
 | `tools/build_shader.sh` | `src/vulkan/sha256_comp.comp` → Vulkan SPIR-V |
 | `tools/embed_spv.py` | SPIR-V → `src/vulkan/sha256_comp.spv.h` |
-| `tools/build_l0_shader.sh` | `src/levelzero/sha256_pow.cl` → `src/levelzero/sha256_pow.spv` |
-| `tools/embed_l0_spv.py` | → `src/levelzero/sha256_pow.spv.h` |
-| `tools/build_l0_argon2.sh` | `src/levelzero/argon2id_l0.cl` → `src/levelzero/argon2id_l0.spv(.h)` |
+| `tools/build_l0_shader.sh` | `src/intel/levelzero/sha256_pow.cl` → `src/intel/levelzero/sha256_pow.spv` |
+| `tools/embed_l0_spv.py` | → `src/intel/levelzero/sha256_pow.spv.h` |
+| `tools/build_l0_argon2.sh` | `src/intel/levelzero/argon2id_l0.cl` → `src/intel/levelzero/argon2id_l0.spv(.h)` |
 | `tools/build_argon2_vk.sh` | `src/vulkan/argon2id.comp` → `src/vulkan/argon2id.spv` (needs `glslangValidator`) |
 | `tools/gen_avx2_s.py`, `tools/gen_avx512_s.py` | generate the x86-64 assembly kernels |
 
@@ -60,7 +67,7 @@ changes.
 backend; regenerate it with `python3 tools/embed_opencl_kernels.py` after
 editing one (`--check` fails instead of writing if it is stale). The SHA-256
 entry comes from `src/opencl/sha256_pow.cl`, the other two from
-`src/levelzero/`.
+`src/intel/levelzero/`.
 
 Level Zero rejects SPIR-V newer than 1.2, hence
 `llvm-spirv --spirv-max-version=1.2` in the build scripts.

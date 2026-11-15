@@ -6,7 +6,7 @@ capability, which is what enables the `__dp4a` path), runs
 both, plus one end-to-end challenge through the gate.
 
 ```bash
-kaggle kernels push -p src/cuda/kaggle_tensor
+kaggle kernels push -p src/nvidia/cuda/kaggle_tensor
 kaggle kernels status monktelv31/anubis-t4-tensor
 kaggle kernels output monktelv31/anubis-t4-tensor -p /tmp/t4 \
     --file-pattern 'result\.json'

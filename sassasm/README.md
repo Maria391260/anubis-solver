@@ -110,7 +110,7 @@ There are existing SASS assemblers, which changes what this directory is for:
 | [MaxAs](https://github.com/NervanaSystems/maxas) | Maxwell | Archived/discontinued, but the reference for the **control-code** problem and a scheduler. |
 | [F2Asm](https://arxiv.org/abs/2608.20532) (2026) | recent data-centre GPUs | Learns exact 128-bit encoders as affine maps over GF(2), from paired disassembly and cubin words. This is the rigorous version of the oracle method used here, and worth reading before deriving more families by hand. |
 
-Tried TuringAs on `src/sass/nvidiaT4_sha256.sass` as-is: it rejects the file at
+Tried TuringAs on `src/nvidia/sass/nvidiaT4_sha256.sass` as-is: it rejects the file at
 line 0, because nvdisasm output carries directives (`.section`, `.global`,
 `.size`) and no control-code prefixes, while TuringAs wants a bare instruction
 body with `--:-:-:Y:0`-style control codes on every line. Converting a listing
@@ -132,7 +132,7 @@ assembler, not an assembler. The plan that follows from here:
 2. add `LDG`/`STG`/`BRA`, which need the uniform-register and address forms;
 3. write a scheduler that assigns the control word, so output becomes
    byte-exact against ptxas;
-4. only then is `src/sass/nvidiaT4_sha256.sass` round-trippable: read the
+4. only then is `src/nvidia/sass/nvidiaT4_sha256.sass` round-trippable: read the
    listing, emit bytes, diff against the original cubin.
 
 Step 4 is the test that would make this real, and it is the reason the work is

@@ -2,7 +2,7 @@
 """gen_xe_sha256.py — emit Intel Xe (gen12lp) assembly for a SHA-256 solver.
 
 Why this exists: the repository has NVIDIA SASS for the SHA-256 kernel
-(`src/sass/`) and DXIL/SPIR-V for the Vulkan and Level Zero backends, but no
+(`src/nvidia/sass/`) and DXIL/SPIR-V for the Vulkan and Level Zero backends, but no
 Intel Xe assembly. This produces it.
 
 What is verified, and what is not:
@@ -25,7 +25,7 @@ Usage:
     python3 tools/gen_xe_sha256.py --out /tmp/x.xe
 
 The listing is one thread = 8 lanes; lane i solves nonce base+i. It mirrors the
-shape of `src/cuda/cuda_sha256.cu`: one 64-byte tail block, the nonce in the
+shape of `src/nvidia/cuda/cuda_sha256.cu`: one 64-byte tail block, the nonce in the
 first word, the digest compared against the difficulty, and a branch that skips
 the write when the digest does not qualify.
 """

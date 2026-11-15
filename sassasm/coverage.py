@@ -5,7 +5,7 @@ Pointing the assembler at a real file is the honest way to measure it: parse the
 listing, try to encode every instruction, and report what is supported, what is
 not, and which mnemonics block the most lines. That list is the work order.
 
-    python3 sassasm/coverage.py src/sass/nvidiaT4_argon2id_opt.sass
+    python3 sassasm/coverage.py src/nvidia/sass/nvidiaT4_argon2id_opt.sass
 """
 from __future__ import annotations
 

@@ -6,7 +6,7 @@ compiling a second kernel and beating the compiler's own output is the thing
 people get paid for. It took one prompt, and the prompt was boring enough that no
 safety filter had anything to object to.
 
-`src/cuda/README.md` answers the "hey Claude vibeslop me a CUDA Anubis solver"
+`src/nvidia/cuda/README.md` answers the "hey Claude vibeslop me a CUDA Anubis solver"
 criticism. This directory is where that criticism gets worse rather than better:
 writing a kernel is the objectionable-sounding part and the easy part. **Reading
 the machine code that came out of it, annotating all 2,024 instructions, and then
@@ -35,8 +35,8 @@ byte for byte the original:
 
 ```bash
 strip() { sed 's|//.*$||; s/[[:space:]]*$//' "$1" | sed '/^[[:space:]]*$/d'; }
-diff <(strip src/sass/nvidiaT4_sha256.annotated.sass) \
-     <(strip src/sass/nvidiaT4_sha256.sass)        # prints nothing
+diff <(strip src/nvidia/sass/nvidiaT4_sha256.annotated.sass) \
+     <(strip src/nvidia/sass/nvidiaT4_sha256.sass)        # prints nothing
 ```
 
 2,052 instruction lines, zero differences. The same holds for the `_opt` pair at
@@ -75,7 +75,7 @@ correctness check before timing. Report instructions per hash, registers, stack
 frame, and throughput for both.
 ```
 
-That is it. `src/sass/kaggle_t4_sass.py` is the answer to the second prompt,
+That is it. `src/nvidia/sass/kaggle_t4_sass.py` is the answer to the second prompt,
 written out.
 
 ## Why no safety filter stops this
@@ -101,7 +101,7 @@ understand", which is where the work actually happens.
 
 ## What came out of it
 
-From [`results/t4-sha256-sass-2026-11-13.json`](../../results/t4-sha256-sass-2026-11-13.json),
+From [`results/t4-sha256-sass-2026-11-13.json`](../../../results/t4-sha256-sass-2026-11-13.json),
 both kernels timed in one process on a Tesla T4, digests checked word-for-word
 against a CPU compression before any timing:
 
@@ -130,7 +130,7 @@ been wrong about why.
 
 ## What it did not do
 
-- **The optimised kernel is not wired into `src/cuda/cuda_sha256.cu`.** Wiring it
+- **The optimised kernel is not wired into `src/nvidia/cuda/cuda_sha256.cu`.** Wiring it
   needs a GPU to validate against the C engine, and that is a maintainer's call,
   not an agent's. The SASS is evidence, not a patch.
 - **It is sha256-family only.** The shipped kernel branches at runtime between the
@@ -144,7 +144,7 @@ been wrong about why.
 
 ```bash
 # on a machine with a GPU, or as a Kaggle kernel with a T4 attached:
-python3 src/sass/kaggle_t4_sass.py     # compiles, dumps SASS, A/Bs both kernels
+python3 src/nvidia/sass/kaggle_t4_sass.py     # compiles, dumps SASS, A/Bs both kernels
 nvdisasm -c kernel.cubin               # what the job does for you
 ```
 
@@ -155,5 +155,5 @@ sound right.
 
 ---
 
-The CUDA half of this argument is in [`src/cuda/README.md`](../cuda/README.md), and
-the claim it is answering is entry 1 of [`HALL_OF_SHAME.md`](../../HALL_OF_SHAME.md).
+The CUDA half of this argument is in [`src/nvidia/cuda/README.md`](../cuda/README.md), and
+the claim it is answering is entry 1 of [`HALL_OF_SHAME.md`](../../../HALL_OF_SHAME.md).

@@ -503,7 +503,7 @@ the T4: GPU == CPU at difficulties 2, 5, 8, 12, 16 on three challenges, plus an
 independent `hashlib` reference.
 
 Raw data: [`results/cuda-tensor-t4-2026-11-15.json`](results/cuda-tensor-t4-2026-11-15.json).
-Reproduce: `kaggle kernels push -p src/cuda/kaggle_tensor` (the harness clones
+Reproduce: `kaggle kernels push -p src/nvidia/cuda/kaggle_tensor` (the harness clones
 this repo, builds with `CUDA_ARCH=sm_75`, runs the tests and both benchmarks).
 
 ## TPU: the `tensor` tier through PJRT, no Python
@@ -1518,10 +1518,10 @@ are indistinguishable here.
 
 ### Tesla T4 (sm_75): the SHA-256 kernel and its SASS
 
-`src/sass/nvidiaT4_sha256.sass` is the shipped `src/cuda/cuda_sha256.cu` kernel
+`src/nvidia/sass/nvidiaT4_sha256.sass` is the shipped `src/nvidia/cuda/cuda_sha256.cu` kernel
 compiled for `sm_75` and disassembled with `nvdisasm -c`;
-`src/sass/nvidiaT4_sha256_opt.sass` is the same algorithm with the block assembly moved
-out of local memory. Built and run by `src/sass/kaggle_t4_sass.py` on a Tesla
+`src/nvidia/sass/nvidiaT4_sha256_opt.sass` is the same algorithm with the block assembly moved
+out of local memory. Built and run by `src/nvidia/sass/kaggle_t4_sass.py` on a Tesla
 T4 (40 SMs, 1590 MHz, CUDA 13.0).
 
 | kernel | instruction lines | stack frame | registers | MH/s |
@@ -1562,7 +1562,7 @@ conversion still costs, so it is not claimed here.
 ### Tesla T4 (sm_75): HashX, and what an interpreter costs
 
 Same treatment as SHA-256, and the answer is much bigger.
-`src/sass/nvidiaT4_hashx.sass` is the shipped `src/cuda/cuda_hashx.cu` kernel for
+`src/nvidia/sass/nvidiaT4_hashx.sass` is the shipped `src/nvidia/cuda/cuda_hashx.cu` kernel for
 `sm_75`; `_opt` pins the register file; `_jit` is the challenge program compiled
 to straight-line code. All three reproduce the repo's own HashX vector
 (`beyond/vectors/hx_vectors.hex` case 0, nonce 0) exactly.
@@ -1590,7 +1590,7 @@ JIT is already issue-bound at 48 registers.
 
 ### Tesla T4 (sm_75): Argon2id, and the block copy
 
-`src/sass/nvidiaT4_argon2id.sass` is the shipped `src/cuda/cuda_argon2.cu` kernel
+`src/nvidia/sass/nvidiaT4_argon2id.sass` is the shipped `src/nvidia/cuda/cuda_argon2.cu` kernel
 for `sm_75`. The device source is sliced straight out of the shipped file, so the
 baseline really is the baseline; only the block copy is swapped for `_opt`.
 

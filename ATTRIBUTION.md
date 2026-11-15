@@ -35,7 +35,7 @@ Section 3 of the license is a condition of the grant, so it applies when you:
 - publish a modified version, fork or port;
 - **tape out, synthesise or ship a design derived from `beyond/`** — the Verilog
   is covered too, and section 4 then also requires the marks on the part;
-- redistribute the SASS in `src/sass/` or the annotated versions.
+- redistribute the SASS in `src/nvidia/sass/` or the annotated versions.
 
 It does not apply to private use you never distribute, or to quoting this project
 in a review, comparison or paper where you already cite it.
