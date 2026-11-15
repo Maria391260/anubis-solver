@@ -152,6 +152,12 @@ int main(int argc, char **argv) {
         {"mhlo dot_general i8->i32", "mlir", mhlo_dot},
     };
 
+    /* CompileOptionsProto{ executable_build_options{ num_replicas=1,
+     * num_partitions=1 } } - field 3 (message), inside it fields 4 and 5 as
+     * varint 1. Without it libtpu asks for a device assignment of zero
+     * replicas and refuses: "Requested total cores: 0". */
+    static const unsigned char compile_options[] = {0x1a, 0x04, 0x20, 0x01, 0x28, 0x01};
+
     for (size_t v = 0; v < sizeof variants / sizeof variants[0]; v++) {
         PJRT_Program prog = {0};
         prog.struct_size = sizeof prog;
@@ -164,6 +170,8 @@ int main(int argc, char **argv) {
         cc.struct_size = sizeof cc;
         cc.client = ca.client;
         cc.program = &prog;
+        cc.compile_options = (const char *)compile_options;
+        cc.compile_options_size = sizeof compile_options;
         PJRT_Error *ce = api->PJRT_Client_Compile(&cc);
         if (ce != NULL) {
             PJRT_Error_Message_Args ma = {0};
