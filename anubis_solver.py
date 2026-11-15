@@ -308,6 +308,18 @@ class _Native:
                 ctypes.POINTER(ctypes.c_double),
             ]
 
+        if hasattr(lib, "anubis_solve_tensor"):
+            fn = lib.anubis_solve_tensor
+            fn.restype = ctypes.c_int
+            fn.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_double,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_double),
+            ]
         for name in ("anubis_verify_argon2id", "anubis_verify_hashx",
                      "anubis_verify_tensor"):
             fn = getattr(lib, name)
@@ -473,6 +485,18 @@ class _Native:
         nonce is always 0. Kept in the same shape as the other solvers so the
         caller does not need a second code path.
         """
+        if hasattr(self.lib, "anubis_solve_tensor"):
+            nonce = ctypes.c_uint32(0)
+            out = ctypes.create_string_buffer(65)
+            elapsed_c = ctypes.c_double(0.0)
+            rc = self.lib.anubis_solve_tensor(
+                challenge_hex.encode(), int(difficulty), int(threads),
+                float(budget_ms), ctypes.byref(nonce), out, ctypes.byref(elapsed_c)
+            )
+            if rc != ANUBIS_OK:
+                raise SolverError(f"tensor solve failed: {_RC_TEXT.get(rc, rc)}")
+            return int(nonce.value), out.value.decode(), float(elapsed_c.value)
+
         fn = self.lib.anubis_tensor_digest
         fn.restype = ctypes.c_int
         fn.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]

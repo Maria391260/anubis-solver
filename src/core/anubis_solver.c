@@ -223,6 +223,10 @@ extern int anubis_cuda_solve(const uint32_t mid[8], uint32_t prefix_len,
 
 extern int anubis_cuda_argon2_available(void);
 extern int anubis_cuda_hashx_available(void);
+extern int anubis_cuda_tensor_available(void);
+extern const char *anubis_cuda_tensor_info(void);
+extern int anubis_cuda_tensor_c(const uint8_t seed[32], int n, int32_t *c_host,
+                                double *out_ms);
 extern int anubis_cuda_hashx_solve(const void *state, size_t state_size,
                                    int difficulty, uint64_t max_nonce,
                                    double budget_ms, uint32_t *out_nonce,
@@ -2437,6 +2441,104 @@ int anubis_verify_tensor(const char *challenge_hex, uint32_t nonce, int difficul
                          char *out_hex) {
     (void)nonce; /* the proof is deterministic: the nonce is always 0 */
     return anubis_tensor_digest(challenge_hex, difficulty, out_hex);
+}
+
+/* CUDA solve for the tensor tier. The GPU produces C; the digest, and unless
+ * GPU verification was disabled the comparison that proves the GPU honest,
+ * stay on the CPU. That is the same rule the other backends follow: a GPU
+ * that quietly miscomputes one element must fail closed here rather than mint
+ * a challenge the server would reject anyway. */
+ANUBIS_EXPORT
+int anubis_solve_tensor(const char *challenge_hex, int difficulty, int threads,
+                        double budget_ms, uint32_t *out_nonce, char *out_hex,
+                        double *out_ms) {
+    uint8_t raw[4096];
+    size_t raw_len = 0;
+    double t0 = 0.0;
+    (void)threads;   /* one GEMM: thread count is the GPU's business */
+    (void)budget_ms; /* and so is the time, it is milliseconds */
+    if (out_nonce != NULL) {
+        *out_nonce = 0;
+    }
+    if (challenge_hex == NULL || out_hex == NULL) {
+        return ANUBIS_ERR_ARG;
+    }
+    if (hex_decode(challenge_hex, raw, sizeof raw, &raw_len) != ANUBIS_OK) {
+        return ANUBIS_ERR_ARG;
+    }
+#if defined(ANUBIS_HAVE_CUDA)
+    if (anubis_cuda_tensor_available()) {
+        int n = tensor_dim(difficulty);
+        size_t cells = (size_t)n * (size_t)n;
+        int32_t *c = malloc(cells * sizeof *c);
+        if (c != NULL) {
+            uint8_t seed[32];
+            sha256_ctx s;
+            double gpu_ms = 0.0;
+            int rc;
+            sha256_init(&s);
+            sha256_update(&s, raw, raw_len);
+            sha256_final(&s, seed);
+            t0 = now_seconds();
+            rc = anubis_cuda_tensor_c(seed, n, c, &gpu_ms);
+            if (rc == 0) {
+                uint8_t *le = malloc(cells * 4);
+                if (le == NULL) {
+                    free(c);
+                    return ANUBIS_ERR_INTERNAL;
+                }
+                {
+                    uint8_t digest[32];
+                    char check[65];
+                    size_t i;
+                    for (i = 0; i < cells; i++) {
+                        uint32_t v = (uint32_t)c[i];
+                        le[4 * i + 0] = (uint8_t)v;
+                        le[4 * i + 1] = (uint8_t)(v >> 8);
+                        le[4 * i + 2] = (uint8_t)(v >> 16);
+                        le[4 * i + 3] = (uint8_t)(v >> 24);
+                    }
+                    sha256_init(&s);
+                    sha256_update(&s, le, cells * 4);
+                    sha256_final(&s, digest);
+                    to_hex(digest, 32, out_hex);
+                    free(le);
+                    if (anubis_gpu_verify() &&
+                        (anubis_tensor_digest(challenge_hex, difficulty, check) !=
+                             ANUBIS_OK ||
+                         strcmp(check, out_hex) != 0)) {
+                        fprintf(stderr,
+                                "anubis: CUDA tensor digest %s is not the CPU digest %s; "
+                                "falling back\n",
+                                out_hex, check);
+                        free(c);
+                        {
+                            int frc = anubis_tensor_digest(challenge_hex, difficulty, out_hex);
+                            if (out_ms != NULL) {
+                                *out_ms = (now_seconds() - t0) * 1000.0;
+                            }
+                            return frc;
+                        }
+                    }
+                    free(c);
+                    if (out_ms != NULL) {
+                        *out_ms = (now_seconds() - t0) * 1000.0;
+                    }
+                    return ANUBIS_OK;
+                }
+            }
+            free(c);
+        }
+    }
+#endif
+    t0 = now_seconds();
+    {
+        int rc = anubis_tensor_digest(challenge_hex, difficulty, out_hex);
+        if (out_ms != NULL) {
+            *out_ms = (now_seconds() - t0) * 1000.0;
+        }
+        return rc;
+    }
 }
 
 /* ------------------------------------------------------------------ */

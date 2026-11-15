@@ -125,6 +125,15 @@ ANUBIS_API int anubis_verify_tensor(const char *challenge_hex, uint32_t nonce,
 ANUBIS_API int anubis_tensor_digest(const char *challenge_hex, int difficulty,
                                     char *out_hex);
 
+/* `tensor` solve. The proof is deterministic (nonce 0), so this is the same
+ * digest as anubis_tensor_digest; when a CUDA device is present the GEMM runs
+ * there and the digest is still checked against the CPU reference unless
+ * anubis_set_gpu_verify(0). threads and budget_ms do not apply. */
+ANUBIS_API int anubis_solve_tensor(const char *challenge_hex, int difficulty,
+                                   int threads, double budget_ms,
+                                   uint32_t *out_nonce, char *out_hex,
+                                   double *out_ms);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
