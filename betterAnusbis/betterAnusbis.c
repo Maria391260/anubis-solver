@@ -23,6 +23,16 @@
  * Build:  make            (or: cc -O2 -pthread -o betterAnusbis betterAnusbis.c -L.. -lanubis_solver)
  */
 #define _GNU_SOURCE
+#if defined(_WIN32)
+/* winsock, winpthreads and the POSIX names Win32 does not have. Included
+ * first so the shims are visible to everything below; see win32-compat.h. */
+#include "win32-compat.h"
+#include <bcrypt.h>
+/* PCRE2 ships a POSIX regcomp()/regexec() wrapper, so the policy code below
+ * is the same on every platform. The gate only asks "does it match". */
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2posix.h>
+#else
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -46,6 +56,7 @@
 
 #include <ctype.h>
 #include <regex.h>
+#endif
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
@@ -61,7 +72,7 @@
 
 /* ----------------------------------------------------------------- config */
 
-#define VERSION "1.50.2"
+#define VERSION "1.50.3"
 #define CODENAME "headslam"
 #define API_PREFIX "/.within.website/x/cmd/anubis/api/"
 #define DEFAULT_COOKIE_PREFIX "techaro.lol-anubis"
@@ -261,6 +272,18 @@ static int hex_decode(const char *in, uint8_t *out, size_t max) {
 }
 
 static int random_bytes(uint8_t *out, size_t n) {
+#if defined(_WIN32)
+    /* There is no /dev/urandom on Windows; BCryptGenRandom is the documented
+     * system RNG and needs no seeding of our own. */
+    while (n > 0) {
+        ULONG chunk = n > 0x10000000u ? 0x10000000u : (ULONG)n;
+        if (BCryptGenRandom(NULL, out, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+            return -1;
+        out += chunk;
+        n = n > chunk ? n - chunk : 0;
+    }
+    return 0;
+#else
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) return -1;
     size_t got = 0;
@@ -271,6 +294,7 @@ static int random_bytes(uint8_t *out, size_t n) {
     }
     close(fd);
     return 0;
+#endif
 }
 
 /* base64url without padding, as JWTs use */
@@ -18019,7 +18043,7 @@ static int load_secret(const char *path, uint8_t out[32]) {
         return -1;
     }
     if (random_bytes(out, 32) != 0) {
-        fprintf(stderr, "betterAnusbis: cannot read /dev/urandom\n");
+        fprintf(stderr, "betterAnusbis: cannot read the system random source\n");
         return -1;
     }
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -18180,6 +18204,9 @@ static void print_settings(void) {
 }
 
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+    ba_wsa_init();
+#endif
     if (parse_args(argc, argv) != 0) return 2;
 
     if (cfg.healthcheck) {
@@ -18393,7 +18420,7 @@ int main(int argc, char **argv) {
     } else if (cfg.secret_file && *cfg.secret_file) {
         if (load_secret(cfg.secret_file, cfg.secret) != 0) return 1;
     } else if (random_bytes(cfg.secret, sizeof cfg.secret) != 0) {
-        fprintf(stderr, "betterAnusbis: cannot read /dev/urandom\n");
+        fprintf(stderr, "betterAnusbis: cannot read the system random source\n");
         return 1;
     }
 

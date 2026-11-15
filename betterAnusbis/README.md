@@ -1,6 +1,6 @@
 # betterAnusbis
 
-**1.50.2 "headslam"** — coming from a running Anubis? [../MIGRATE.md](../MIGRATE.md)
+**1.50.3 "headslam"** — coming from a running Anubis? [../MIGRATE.md](../MIGRATE.md)
 is the step-by-step.
 
 An Anubis-compatible proof-of-work gate in **one C file**. It issues the same
@@ -18,9 +18,46 @@ solves itself and you land on your backend.
 
 ```
 $ ./betterAnusbis --target http://127.0.0.1:3000 --algorithm sha256 --difficulty 12
-[betterAnusbis] betterAnusbis 1.50.2 listening on :8080 -> http://127.0.0.1:3000 (sha256, difficulty 12)
+[betterAnusbis] betterAnusbis 1.50.3 listening on :8080 -> http://127.0.0.1:3000 (sha256, difficulty 12)
 [betterAnusbis] open http://127.0.0.1:8080/ and the challenge page solves it for you
 ```
+
+## Platforms
+
+| platform | build | release artifact |
+|---|---|---|
+| Linux x86-64 | `make` | `betterAnusbis` + `libanubis_solver.so` |
+| Linux aarch64 | `make ARCH=aarch64 CC=aarch64-linux-gnu-gcc NATIVE=`, then the gate next to the library | the same pair with an `-aarch64` suffix |
+| Windows x86-64 | `betterAnusbis/win32/build-windows.sh` (mingw-w64) | `betterAnusbis.exe` + `anubis_solver.dll`, as a `.zip` and an `.msi` |
+
+Windows is a native build, not WSL: the gate is compiled by mingw-w64 against
+winpthreads, winsock, a cross-built OpenSSL and PCRE2's POSIX regex wrapper
+(`win32-compat.h` is the POSIX-to-Win32 layer, `win32/include/` maps the headers
+Windows does not ship). The release pair and the `.zip`/`.msi` are produced by
+`betterAnusbis/win32/build-windows.sh`; [RELEASING.md](../RELEASING.md) has the
+recipe and the verification. Keep `betterAnusbis.exe` and `anubis_solver.dll` in
+the same directory — the executable imports the DLL by name.
+
+What differs on Windows, and why:
+
+- **HTTP/1.1 only in the release.** nghttp2 and nghttp3/QUIC are optional at
+  build time everywhere; the Windows release does not link them. `--http2` says
+  so at startup, `--http3` fails the same way it does on a minimal Linux build.
+- **HashX runs the interpreter, not the JIT.** The generated x86-64 code takes
+  its register-file argument in `rdi` (System V); Windows passes it in `rcx` and
+  wants `rdi`/`rsi` preserved. Correctness is unchanged, the ~9x JIT speedup is
+  the price. `anubis_batch_width()` is 0 for the same reason (no AVX2 kernels).
+- **TLS uses the Windows certificate store** through OpenSSL's winstore support;
+  `SSL_CERT_FILE` points the backend hop at an explicit PEM bundle instead.
+- **No SIGHUP.** `kill -HUP` has no Windows equivalent, so the settings dump is
+  Linux-only. `/metrics`, `/healthz` and `--healthcheck` are unchanged.
+- **`--bind-network unix` needs Windows 10 1803+** for AF_UNIX; the normal TCP
+  listener is not affected.
+- **Ctrl+C / Ctrl+Break** take the place of SIGINT/SIGTERM and flush a
+  `file:`/`bbolt:` store on the way out.
+
+The MSI installs the same files under `Program Files\betterAnusbis`, appends the
+directory to the machine `PATH`, and is uninstalled through *Apps & features*.
 
 ## What "the same thing" means here
 

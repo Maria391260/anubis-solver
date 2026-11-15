@@ -1,0 +1,67 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+  betterAnusbis.wxs — the Windows Installer package for betterAnusbis.
+
+  wixl (msitools) builds this on Linux; WiX Toolset builds it on Windows. The
+  staging directory, the version and the install paths are passed by
+  build-windows.sh through -D, so this file has no machine-specific paths.
+
+    wixl -a x64 -o betterAnusbis.msi \
+         -D Version=1.50.2 -D StageDir=/path/to/stage betterAnusbis.wxs
+
+  ProgramFiles64Folder is deliberate: this is a server-side binary and the
+  per-machine install is what a service or a scheduled task expects. The
+  component adds the install directory to the machine PATH, because a gate
+  that must be invoked by full path is a gate nobody runs.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="78E93DDB-6152-5CDA-B2B6-8FE765DEBC74"
+           Name="betterAnusbis"
+           Language="1033"
+           Version="$(var.Version)"
+           Manufacturer="celikfana-lab"
+           UpgradeCode="39B767CC-A08F-53FD-91F1-22D389D2EFDA">
+    <Package Id="*" InstallerVersion="500" Compressed="yes"
+             InstallScope="perMachine"/>
+    <Media Id="1" Cabinet="betterAnusbis.cab" EmbedCab="yes"/>
+
+    <Icon Id="GateIcon" SourceFile="$(var.StageDir)/betterAnusbis.exe"/>
+    <Property Id="ARPPRODUCTICON" Value="GateIcon"/>
+    <Property Id="ARPCOMMENTS"
+              Value="An Anubis-compatible proof-of-work gate (HTTP/1.1)"/>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="betterAnusbis">
+          <Component Id="GateFiles" Guid="5FED2182-EBA9-5111-A5A9-F4C8C9DA43EE">
+            <File Id="GateExe" Name="betterAnusbis.exe"
+                  Source="$(var.StageDir)/betterAnusbis.exe" KeyPath="yes"/>
+            <File Id="EngineDll" Name="anubis_solver.dll"
+                  Source="$(var.StageDir)/anubis_solver.dll"/>
+            <!-- Appended to the machine PATH so "betterAnusbis" works from any
+                 shell. Action="set" with Part="last" appends; uninstall removes
+                 the value again. -->
+            <Environment Id="MachinePath" Name="PATH"
+                         Value="[INSTALLFOLDER]" Part="last" Action="set"
+                         System="yes"/>
+          </Component>
+          <Component Id="Docs" Guid="D78D8789-0EAC-5637-B667-6DC4DD8480D7">
+            <File Id="Readme" Name="README-WINDOWS.txt"
+                  Source="$(var.StageDir)/README-WINDOWS.txt" KeyPath="yes"/>
+            <File Id="License" Name="LICENSE"
+                  Source="$(var.StageDir)/LICENSE"/>
+            <File Id="Attribution" Name="ATTRIBUTION.md"
+                  Source="$(var.StageDir)/ATTRIBUTION.md"/>
+            <File Id="Migrate" Name="MIGRATE.md"
+                  Source="$(var.StageDir)/MIGRATE.md"/>
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Main" Title="betterAnusbis" Level="1">
+      <ComponentRef Id="GateFiles"/>
+      <ComponentRef Id="Docs"/>
+    </Feature>
+  </Product>
+</Wix>

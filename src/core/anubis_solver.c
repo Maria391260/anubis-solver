@@ -67,6 +67,23 @@
 #include <unistd.h>
 #endif
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+/* One CPU count for both platforms. On Windows sysconf(_SC_NPROCESSORS_ONLN)
+ * does not exist, so ask the kernel for the processor groups instead; the
+ * affinity helpers below already compile to no-ops off Linux. */
+static int anubis_cpu_count(void) {
+#if defined(_WIN32)
+    DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    return n > 0 ? (int)n : 1;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+#endif
+}
+
 #if defined(__aarch64__) && defined(__linux__)
 #include <sys/auxv.h>
 #if defined(__has_include)
@@ -412,7 +429,7 @@ static void build_ordered_set(const unsigned char *mask, int ncpu) {
 static void init_affinity_once(void) {
     const char *env = getenv("ANUBIS_CPU_AFFINITY");
     unsigned char mask[ANUBIS_MAX_CPUS];
-    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    int ncpu = anubis_cpu_count();
     char buf[512];
     int i;
 
@@ -510,7 +527,7 @@ int anubis_default_threads(void) {
     if (g_pin_enabled && g_npcpu_phys > 0) {
         return g_npcpu_phys;
     }
-    return (int)sysconf(_SC_NPROCESSORS_ONLN);
+    return anubis_cpu_count();
 }
 
 ANUBIS_EXPORT
@@ -658,8 +675,10 @@ static void sha256_compress_scalar(uint32_t h[8], const uint8_t block[64]) {
     h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
 }
 
-/* SHA-NI single-block compression lives in shani.s. */
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+/* SHA-NI single-block compression lives in shani.s. The .s files are ELF
+ * assembly, so the Windows build links no hand-written kernels and takes the
+ * portable C paths; -march and the CPU still pick the C code's own paths. */
+#if defined(__x86_64__) && !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
 #define ANUBIS_HAVE_SHANI_ASM 1
 extern void sha256_block_shani(uint32_t state[8], const uint8_t block[64]);
 
@@ -1008,7 +1027,7 @@ enum {
     BATCH_FIXED4 = 2       /* wasm sha256: prefix + 4-byte nonce */
 };
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#if defined(__x86_64__) && !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
 #define ANUBIS_HAVE_AVX2 1
 extern void sha256_compress8_avx2(const uint32_t mid[8],
                                   const uint8_t tails[8][64],

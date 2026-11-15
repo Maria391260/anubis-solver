@@ -1919,7 +1919,11 @@ void hashx_program_execute(const hashx_program* program, uint64_t r[8]) {
  * If mmap/mprotect(PROT_EXEC) is unavailable (W^X, SELinux, snap seccomp),
  * hashx_init() falls back to the interpreter automatically.
  * ---------------------------------------------------------------- */
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+/* The x86-64 JIT is System V ABI: the register file arrives in rdi and rsi is
+ * used as scratch. Windows x64 passes the argument in rcx and requires rdi/rsi
+ * preserved, so the compiler below cannot be called there unchanged. Windows
+ * uses the interpreter, which is the same path a W^X host takes. */
+#if defined(__x86_64__) && !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
 #define HASHX_HAVE_JIT 1
 #include <sys/mman.h>
 
@@ -2093,7 +2097,7 @@ static int hashx_jit_build(const hashx_program *prog, void **mem_out,
 static void hashx_jit_run(void *mem, uint64_t r[8]) {
 	((void (*)(uint64_t *))mem)(r);
 }
-#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+#elif defined(__aarch64__) && !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
 #define HASHX_HAVE_JIT 1
 #include <sys/mman.h>
 

@@ -1,7 +1,8 @@
 # RELEASING.md
 
-How the binaries on the release page are produced. Two architectures, one
-machine, no containers: a Debian 12 sysroot for each, plus qemu for the ARM one.
+How the binaries on the release page are produced. Three targets, one machine,
+no containers: two Debian 12 sysroots for the Linux architectures, qemu for the
+ARM one, and mingw-w64 plus two cross-built libraries for Windows.
 
 The reason for the sysroots is not paranoia. This host's gcc 15 defaults to
 `-std=gnu23`, and glibc headers redirect `strtol` and friends to `__isoc23_*`
@@ -98,14 +99,89 @@ That is a link check and a start check, not a benchmark: qemu is a translator
 and the numbers it produces mean nothing. It does prove the ARM pair loads,
 listens and answers, which is what a release artifact has to do.
 
+## Windows (x86-64)
+
+One command, no Windows involved:
+
+```sh
+./betterAnusbis/win32/build-windows.sh --deps
+```
+
+`--deps` downloads and cross-builds the two libraries the gate needs; leave it
+out to reuse a prepared `build/windows/deps/` (or point `OPENSSL_DIR` and
+`PCRE2_DIR` at your own trees). Requirements: `gcc-mingw-w64-x86-64-posix`,
+`make`, and `curl` or `wget`. Optional: `wine` for the verification step and
+`wixl` (the `msitools` + `wixl` packages) for the MSI.
+
+The script builds two things:
+
+- `anubis_solver.dll` from the engine, with `ARCH=none` so the ELF `.s` kernels
+  are not linked. The portable C fallbacks are what the Windows release runs;
+  SHA-NI/AVX2 dispatch is therefore off, which is why the Windows zip does not
+  claim the Linux bytes-per-second numbers.
+- `betterAnusbis.exe` from `betterAnusbis.c` against `win32-compat.h`,
+  `win32/include/`, the cross-built OpenSSL and PCRE2's POSIX regex wrapper.
+  Both libraries are linked statically, so the pair only needs `KERNEL32.dll`
+  and `msvcrt.dll` at run time. The DLL is the only other import.
+
+The `.exe` and the `.dll` must ship together; the executable imports
+`anubis_solver.dll` by name.
+
+What the Windows build leaves out, on purpose: HTTP/2 and HTTP/3. nghttp2 and
+nghttp3 are optional everywhere, the release links neither, so the binary is
+HTTP/1.1-only and `--http2`/`--http3` say so at startup. HashX uses the
+interpreter: the generated x86-64 code is System V ABI (register file in `rdi`,
+`rsi` as scratch), which is not the Windows x64 calling convention. Everything
+else — six algorithms, policy file, honeypot, the four stores, TLS with
+`--tls-cert`/`--tls-key`, HTTPS origin, metrics, `--healthcheck` — is the same
+code and is exercised by the smoke test.
+
+Verifying without Windows:
+
+```sh
+./betterAnusbis/win32/build-windows.sh --smoke
+```
+
+That asks wine for `--version`, then starts a backend, starts the gate under
+wine, fetches a challenge, solves it with the Linux build of the engine and
+passes it, asserting the protected page comes back with the cookie. The MSI is
+worth checking the same way when it is rebuilt:
+
+```sh
+WINEDEBUG=-all wine msiexec /i betterAnusbis-<ver>-x86_64-windows.msi /qn
+ls "$HOME/.wine/drive_c/Program Files/betterAnusbis"
+WINEDEBUG=-all wine "$HOME/.wine/drive_c/Program Files/betterAnusbis/betterAnusbis.exe" --version
+WINEDEBUG=-all wine msiexec /x '{78E93DDB-6152-5CDA-B2B6-8FE765DEBC74}' /qn
+```
+
+The MSI installs under `Program Files\betterAnusbis`, appends that directory to
+the machine `PATH`, and is a per-machine package (`ProgramFiles64Folder`, x64
+summary information from `wixl -a x64`). No shortcuts: this is a command-line
+gate, and a Start Menu entry that starts a proxy with no `--target` would be a
+trap. The GUIDs in `win32/betterAnusbis.wxs` are fixed on purpose so upgrades
+and uninstalls line up; change `UpgradeCode` only when the product identity
+changes.
+
+The supported floor is Windows 10/11 x86-64. `--bind-network unix` additionally
+needs Windows 10 1803 or newer for AF_UNIX sockets; TCP is the normal mode and
+has no such requirement.
+
 ## What goes on the release
 
-Per architecture: a tarball with both binaries plus LICENSE, ATTRIBUTION.md and
-MIGRATE.md, and the two raw files. The x86-64 raw files keep the canonical names
-(`betterAnusbis`, `libanubis_solver.so`); the aarch64 ones carry a suffix, and
-`libanubis_solver-aarch64.so` has to be renamed to `libanubis_solver.so` next to
-the binary, because that is the name in `DT_NEEDED`.
+Per Linux architecture: a tarball with both binaries plus LICENSE,
+ATTRIBUTION.md and MIGRATE.md, and the two raw files. The x86-64 raw files keep
+the canonical names (`betterAnusbis`, `libanubis_solver.so`); the aarch64 ones
+carry a suffix, and `libanubis_solver-aarch64.so` has to be renamed to
+`libanubis_solver.so` next to the binary, because that is the name in
+`DT_NEEDED`.
+
+For Windows: `betterAnusbis-<ver>-x86_64-windows.zip` (the exe, the DLL,
+`README-WINDOWS.txt`, LICENSE, ATTRIBUTION.md, MIGRATE.md),
+`betterAnusbis-<ver>-x86_64-windows.msi`, and the two raw files
+`betterAnusbis.exe` and `anubis_solver.dll`. The raw Windows pair keeps its
+canonical names and, unlike the Linux pair, must stay side by side: the exe
+imports the DLL by name.
 
 The GPU backends are compiled per machine (CUDA, Level Zero, Vulkan, OpenCL are
 dlopen-based and need local drivers and headers), so the release build is CPU
-only, and says so.
+only, and says so — on both platforms.

@@ -115,7 +115,13 @@ DEP := $(OBJ:.o=.d)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all test clean shader
+.PHONY: all test clean shader windows
+
+# The Windows pair and the release zip/msi: a mingw-w64 cross build, no Windows
+# needed. `make windows WIN_ARGS=--smoke` also runs a challenge/pass round trip
+# under wine. See betterAnusbis/win32/build-windows.sh and RELEASING.md.
+windows:
+	./betterAnusbis/win32/build-windows.sh $(WIN_ARGS)
 
 all: $(LIB)
 

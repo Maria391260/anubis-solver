@@ -1,0 +1,57 @@
+name: windows
+
+on:
+  push:
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the mingw-w64 cross toolchain and packagers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              gcc-mingw-w64-x86-64-posix wixl zip
+          # wine is optional: when present the build verifies the .exe and runs
+          # a challenge/pass round trip against it; when absent those steps are
+          # skipped and only the link check remains.
+          sudo apt-get install -y --no-install-recommends wine64 || true
+
+      - uses: actions/cache@v4
+        with:
+          path: build/windows/deps
+          key: windows-deps-openssl-3.5.3-pcre2-10.45
+
+      - name: Build the exe, dll, zip and msi
+        run: make windows WIN_ARGS="--deps --smoke"
+        env:
+          JOBS: 4
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: betterAnusbis-windows-x86_64
+          if-no-files-found: error
+          path: |
+            build/windows/betterAnusbis.exe
+            build/windows/anubis_solver.dll
+            build/windows/*-x86_64-windows.zip
+            build/windows/*-x86_64-windows.msi
+
+      - name: Attach the Windows assets to the release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/windows/betterAnusbis-*-x86_64-windows.zip
+            build/windows/betterAnusbis-*-x86_64-windows.msi
+            build/windows/betterAnusbis.exe
+            build/windows/anubis_solver.dll

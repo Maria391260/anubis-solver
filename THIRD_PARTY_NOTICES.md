@@ -54,6 +54,21 @@ They are used only as the comparison baseline in `wasm/bench.mjs`,
 `wasm/verify.mjs` and the demo page. The attribution condition in `LICENSE`
 section 3 applies to this repository's own work, not to them.
 
+## PCRE2 (`libpcre2-8`, `libpcre2-posix`) — the Windows build
+
+Win32 has no POSIX `regcomp()`/`regexec()`. The Windows build of the gate links
+PCRE2's POSIX wrapper (`pcre2posix.h`) so the policy file, the regex rules and
+the CLI parsing stay the same C code on every platform. Linux and macOS use the
+system regex and do not link PCRE2 at all.
+
+- Upstream: https://github.com/PCRE2Project/pcre2
+- License: BSD-3-Clause
+- Vendored: **no**. `betterAnusbis/win32/build-windows.sh --deps` fetches the
+  upstream release tarball (10.45) and cross-builds it statically for
+  `x86_64-w64-mingw32`.
+- Scope: the gate only ever asks "does this match" (`REG_NOSUB`-shaped use), so
+  leftmost-longest vs leftmost-first POSIX semantics do not change a decision.
+
 ## nghttp2 (`libnghttp2`)
 
 HTTP/2 framing and HPACK for the gate's listener and its optional backend hop.

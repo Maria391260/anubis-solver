@@ -199,6 +199,10 @@ cd betterAnusbis && make
 ./betterAnusbis --target http://127.0.0.1:3000 --algorithm sha256 --difficulty 12
 ```
 
+It builds for Linux x86-64, Linux aarch64 and Windows x86-64; the Windows release
+is a native mingw-w64 build that ships `betterAnusbis.exe` + `anubis_solver.dll`
+as a zip and an MSI installer (`betterAnusbis/win32/build-windows.sh`).
+
 All six algorithms are gated and verified (fast, slow, sha256, argon2id, hashx,
 metarefresh), `./test-all-algorithms.sh` asserts the protected page comes back for
 each, and tampering gets a 403.
