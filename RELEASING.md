@@ -162,6 +162,26 @@ trap. The GUIDs in `win32/betterAnusbis.wxs` are fixed on purpose so upgrades
 and uninstalls line up; change `UpgradeCode` only when the product identity
 changes.
 
+The MSI is not silent-only. It carries the WixUI_Minimal dialogs, so a normal
+install opens the license page: the anti-anti-ai mascot on the left, the
+project's MIT + attribution text (generated from `LICENSE` at build time) on the
+right, and the *I accept* checkbox that enables **Install**. `wixl-data`
+supplies that dialog set; the build script copies it into
+`build/windows/wixui/`, drops the title font a point, widens `WelcomeEulaDlg`
+from 370 to 410 dialog units so "Please read the betterAnusbis License
+Agreement" stays on one line, and swaps in
+`betterAnusbis/win32/installer/dlgbmp.bmp` as the dialog background. That bitmap
+is generated from `mascot/anti-anti-ai.png` by
+`betterAnusbis/win32/make-installer-art.sh`; regenerate it only when the mascot
+or the dialog size changes. If `wixl-data` is missing the build says so and skips
+the MSI rather than failing the exe.
+
+Review the page before shipping: `wine msiexec /i betterAnusbis-<ver>-x86_64-windows.msi`,
+accept the license, install, then `wine msiexec /x {78E93DDB-6152-5CDA-B2B6-8FE765DEBC74} /qn`.
+The checkbox must enable Install and the license text must scroll; if the page
+is blank, `License.rtf` was generated without its closing brace or was picked up
+from a stale directory.
+
 The supported floor is Windows 10/11 x86-64. `--bind-network unix` additionally
 needs Windows 10 1803 or newer for AF_UNIX sockets; TCP is the normal mode and
 has no such requirement.

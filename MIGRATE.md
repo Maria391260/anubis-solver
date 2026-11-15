@@ -163,8 +163,11 @@ packaging and a handful of things Win32 does not have:
 
 - **The pair must stay together.** `betterAnusbis.exe` imports
   `anubis_solver.dll` by name, so both files have to be in the same directory.
-  The MSI puts them under `Program Files\betterAnusbis` and adds that directory
-  to the machine `PATH`; the zip is enough if you would rather not install.
+  The MSI opens on a license page (our MIT + attribution text, the
+  anti-anti-ai mascot); tick *I accept* and **Install** proceeds. It puts the
+  files under `Program Files\betterAnusbis` and adds that directory to the
+  machine `PATH`; the zip is enough if you would rather not install. Silent
+  installs (`msiexec /i ... /qn`) skip the license page.
 - **No Visual C++ runtime needed.** Everything except `anubis_solver.dll` is
   linked statically, and that DLL only needs the system libraries.
 - **Windows 10/11 x86-64.** `--bind-network unix` additionally needs Windows 10

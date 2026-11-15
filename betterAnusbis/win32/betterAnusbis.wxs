@@ -25,6 +25,12 @@
              InstallScope="perMachine"/>
     <Media Id="1" Cabinet="betterAnusbis.cab" EmbedCab="yes"/>
 
+    <!-- The license page, progress and exit dialogs. WixUI_Minimal gives the
+         "Please read the [ProductName] License Agreement" page with the
+         I-accept checkbox, then installs; the bitmap and the RTF are supplied
+         by build-windows.sh (installer/dlgbmp.bmp and the LICENSE text). -->
+    <UIRef Id="WixUI_Minimal"/>
+
     <Icon Id="GateIcon" SourceFile="$(var.StageDir)/betterAnusbis.exe"/>
     <Property Id="ARPPRODUCTICON" Value="GateIcon"/>
     <Property Id="ARPCOMMENTS"

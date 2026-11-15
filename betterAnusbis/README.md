@@ -56,8 +56,12 @@ What differs on Windows, and why:
 - **Ctrl+C / Ctrl+Break** take the place of SIGINT/SIGTERM and flush a
   `file:`/`bbolt:` store on the way out.
 
-The MSI installs the same files under `Program Files\betterAnusbis`, appends the
+The MSI is not silent-only: it opens on the license page — the anti-anti-ai
+mascot on the left, the project's MIT + attribution text on the right, and the
+"I accept the terms in the License Agreement" checkbox that enables **Install**.
+Then it installs the same files under `Program Files\betterAnusbis`, appends the
 directory to the machine `PATH`, and is uninstalled through *Apps & features*.
+`msiexec /i ... /qn` skips the UI for unattended installs.
 
 ## What "the same thing" means here
 

@@ -202,8 +202,10 @@ Windows specifics:
   * SIGTERM/SIGINT become the console's Ctrl+C/Ctrl+Break handling, which
     flushes a file/bbolt store on the way out.
 
-No installer required: unzip anywhere. The .msi installs the same files under
-Program Files\betterAnusbis and adds that directory to PATH; run it with
+No installer required: unzip anywhere. The .msi shows the license page (read
+it, tick "I accept the terms in the License Agreement", then Install), installs
+the same files under Program Files\betterAnusbis and adds that directory to
+PATH; run it with
 
   msiexec /i betterAnusbis-$VERSION-x86_64-windows.msi          (/qn = silent)
 
@@ -235,18 +237,97 @@ fi
 echo "    $ZIP"
 
 if [ "$MAKE_MSI" = 1 ]; then
-    if command -v wixl >/dev/null 2>&1; then
-        MSI=$OUT/betterAnusbis-$VERSION-x86_64-windows.msi
-        rm -f "$MSI"
-        # Version is already 3-part numeric (e.g. 1.50.3); wixl's preprocessor
-        # takes the source paths through -D so the .wxs stays path-free.
-        wixl -a x64 -o "$MSI" \
-            -D "Version=$VERSION" \
-            -D "StageDir=$stage" \
-            "$GATE/win32/betterAnusbis.wxs"
-        echo "    $MSI"
-    else
+    if ! command -v wixl >/dev/null 2>&1; then
         echo "    (wixl not found; skipping the .msi — install msitools + wixl)" >&2
+    else
+        # wixl-data ships the WixUI dialog set (the license page the MSI
+        # shows). Look for it where distributions put it; WIXL_EXTDIR wins.
+        WIXUI=
+        for d in ${WIXL_EXTDIR:-} /usr/share/wixl-*/ext /usr/local/share/wixl-*/ext; do
+            if [ -n "$d" ] && [ -d "$d/ui" ] && [ -f "$d/ui/WixUI_Minimal.wxs" ]; then
+                WIXUI=$d
+                break
+            fi
+        done
+        if [ -z "$WIXUI" ]; then
+            echo "    (wixl-data / WixUI extension not found; skipping the .msi)" >&2
+            echo "    (install wixl-data, or set WIXL_EXTDIR to its ext/ directory)" >&2
+        else
+            MSI=$OUT/betterAnusbis-$VERSION-x86_64-windows.msi
+            rm -f "$MSI"
+            # A private copy of the UI extension: the dialog bitmap and the
+            # title font are ours, and the system wixl-data stays untouched.
+            rm -rf "$OUT/wixui"
+            mkdir -p "$OUT/wixui"
+            cp -r "$WIXUI" "$OUT/wixui/ext"
+            cp "$GATE/win32/installer/dlgbmp.bmp" \
+               "$OUT/wixui/ext/ui/bitmaps/dlgbmp.bmp"
+            # The stock WelcomeEulaDlg is 370 units wide, which wraps
+            # "Please read the betterAnusbis License Agreement" onto two
+            # lines. Widen it to 410 and drop the title font a point; the
+            # bitmap above is 410x270 units at 4/3 px/unit, 547x312.
+            python3 - "$OUT/wixui/ext/ui" <<'PY'
+import os
+import sys
+
+ui = sys.argv[1]
+patches = {
+    "WixUI_Minimal.wxs": [
+        ('<TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />',
+         '<TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="8" Bold="yes" />'),
+    ],
+    "WelcomeEulaDlg.wxs": [
+        ('Width="370" Height="270"', 'Width="410" Height="270"'),
+        ('Type="Bitmap" X="0" Y="0" Width="370"', 'Type="Bitmap" X="0" Y="0" Width="410"'),
+        ('Type="Line" X="0" Y="234" Width="370"', 'Type="Line" X="0" Y="234" Width="410"'),
+        ('Type="Text" X="130" Y="6" Width="225"', 'Type="Text" X="130" Y="6" Width="266"'),
+        ('Type="ScrollableText" X="130" Y="36" Width="226"',
+         'Type="ScrollableText" X="130" Y="36" Width="266"'),
+        ('Type="CheckBox" X="130" Y="207" Width="226"',
+         'Type="CheckBox" X="130" Y="207" Width="266"'),
+        ('X="156" Y="243" Width="56"', 'X="196" Y="243" Width="56"'),
+        ('X="212" Y="243" Width="80"', 'X="252" Y="243" Width="80"'),
+        ('X="304" Y="243" Width="56"', 'X="344" Y="243" Width="56"'),
+    ],
+}
+for name, pairs in patches.items():
+    path = os.path.join(ui, name)
+    text = open(path, encoding="utf-8").read()
+    for old, new in pairs:
+        if old not in text:
+            raise SystemExit("wixl-data changed: %s no longer contains %r; "
+                             "update the patch in build-windows.sh" % (name, old))
+        text = text.replace(old, new)
+    open(path, "w", encoding="utf-8").write(text)
+PY
+            # The license page text. wixl picks up License.rtf from the
+            # directory it is run in when WixUILicenseRtf is not defined.
+            python3 - "$ROOT/LICENSE" "$OUT/License.rtf" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+body = []
+for ch in text:
+    o = ord(ch)
+    if ch in "\\{}":
+        body.append("\\" + ch)
+    elif o < 128:
+        body.append(ch)
+    else:
+        body.append("\\u%d?" % (o if o < 65536 else 63))
+lines = ["{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Segoe UI;}}\\f0\\fs18"]
+lines += [line + "\\par" for line in "".join(body).splitlines()]
+lines.append("}")
+open(sys.argv[2], "w", encoding="ascii").write("\n".join(lines))
+PY
+            # Run wixl in $OUT so License.rtf is the one it finds.
+            ( cd "$OUT" && wixl -a x64 --ext ui --extdir "$OUT/wixui/ext" -I "$OUT" \
+                -o "$MSI" \
+                -D "Version=$VERSION" \
+                -D "StageDir=$stage" \
+                "$GATE/win32/betterAnusbis.wxs" )
+            echo "    $MSI"
+        fi
     fi
 fi
 
