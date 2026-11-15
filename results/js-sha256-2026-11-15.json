@@ -1,0 +1,137 @@
+{
+  "host": "Intel i7-1260P (Alder Lake), 16 threads, powersave governor, laptop",
+  "config": "Chrome 154.0.8037.97 headless; Node 26.13.0; fixed challenge 9f2c1b4a...5c4b, difficulty 20, warm; JS rows run without WebAssembly",
+  "date": "2026-11-15",
+  "challenge_hex": "9f2c1b4a7e5d3c0b8a1f6e2d4c7b0a9f5e3d1c8b7a6f4e2d1c0b9a8f7e6d5c4b",
+  "difficulty": 20,
+  "found": {
+    "nonce": 5133809,
+    "hashes": 5133810,
+    "digest": "00000dcaf513fbc4ef2f502cdf423fa477eb0ca5d9bca8d20f02637c1b2679a7"
+  },
+  "chrome": {
+    "note": "run 1 is the cold run (2.5x slower); runs 2-3 are the reported range",
+    "runs": [
+      {
+        "difficulty": 20,
+        "jsSearch": {
+          "hashes": 5133810,
+          "best_ms": 15375.89999999851,
+          "median_ms": 16205.800000000745,
+          "rate": 333886.79687045945,
+          "nonce": 5133809,
+          "digest": "00000dcaf513fbc4ef2f502cdf423fa477eb0ca5d9bca8d20f02637c1b2679a7"
+        },
+        "jsRaw": {
+          "iters": 2000000,
+          "best_ms": 5633.199999999255,
+          "median_ms": 5898.599999997765,
+          "rate": 355037.98906487686
+        },
+        "jsOneShot": {
+          "iters": 200000,
+          "best_ms": 985.3000000007451,
+          "rate": 202983.86278275528
+        },
+        "wasmSearch": {
+          "hashes": 5133810,
+          "best_ms": 724.8000000007451,
+          "median_ms": 807.2999999970198,
+          "rate": 7083071.192045699,
+          "nonce": 5133809,
+          "digest": "00000dcaf513fbc4ef2f502cdf423fa477eb0ca5d9bca8d20f02637c1b2679a7"
+        }
+      },
+      {
+        "difficulty": 20,
+        "jsSearch": {
+          "hashes": 5133810,
+          "best_ms": 5928.199999999255,
+          "median_ms": 5941.5,
+          "rate": 865998.1107251181,
+          "nonce": 5133809,
+          "digest": "00000dcaf513fbc4ef2f502cdf423fa477eb0ca5d9bca8d20f02637c1b2679a7"
+        },
+        "jsRaw": {
+          "iters": 2000000,
+          "best_ms": 2198.800000000745,
+          "median_ms": 2210.400000002235,
+          "rate": 909587.0474801357
+        },
+        "jsOneShot": {
+          "iters": 200000,
+          "best_ms": 528,
+          "rate": 378787.8787878788
+        },
+        "wasmSearch": {
+          "hashes": 5133810,
+          "best_ms": 638.0999999977648,
+          "median_ms": 646,
+          "rate": 8045463.093587186,
+          "nonce": 5133809,
+          "digest": "00000dcaf513fbc4ef2f502cdf423fa477eb0ca5d9bca8d20f02637c1b2679a7"
+        }
+      },
+      {
+        "difficulty": 20,
+        "jsSearch": {
+          "hashes": 5133810,
+          "best_ms": 5794.10000000149,
+          "median_ms": 6053.300000000745,
+          "rate": 886040.9727133947,
+          "nonce": 5133809,
+          "digest": "00000dcaf513fbc4ef2f502cdf423fa477eb0ca5d9bca8d20f02637c1b2679a7"
+        },
+        "jsRaw": {
+          "iters": 2000000,
+          "best_ms": 2253.7000000029802,
+          "median_ms": 2256,
+          "rate": 887429.5602774795
+        },
+        "jsOneShot": {
+          "iters": 200000,
+          "best_ms": 581.4000000022352,
+          "rate": 343997.24802069337
+        },
+        "wasmSearch": {
+          "hashes": 5133810,
+          "best_ms": 645.6999999992549,
+          "median_ms": 646.8000000007451,
+          "rate": 7950766.609889924,
+          "nonce": 5133809,
+          "digest": "00000dcaf513fbc4ef2f502cdf423fa477eb0ca5d9bca8d20f02637c1b2679a7"
+        }
+      }
+    ]
+  },
+  "node": {
+    "difficulty": 22,
+    "search": {
+      "hashes": 13691453,
+      "best_ms": 15237.968966,
+      "rate": 898509.0487156988
+    },
+    "raw": {
+      "iters": 2000000,
+      "best_ms": 2258.151760000008,
+      "rate": 885680.0660731469
+    },
+    "oneShot": {
+      "iters": 200000,
+      "best_ms": 392.69360700000834,
+      "rate": 509302.91819086263
+    }
+  },
+  "node_wasm_4wide": {
+    "hashes_per_second": 8310000,
+    "us_per_hash": 0.12,
+    "command": "node wasm/bench-sha256.mjs --difficulty 22 --rounds 3"
+  },
+  "notes": [
+    "Pure JS reuses one padded block and rewrites the 4 nonce bytes per attempt.",
+    "oneShot is sha256bytes() with a fresh padded block (the fast/slow path).",
+    "The JS and the wasm kernel found the same nonce and digest, so the comparison is verified, not assumed.",
+    "The page's JS SHA-256 had a padding-length bug (JS masks shift counts to 5 bits) until this date; these numbers are after the fix."
+  ],
+  "reproduce": "node betterAnusbis/bench-js-sha256.mjs --wasm --json (Node); Chrome: load the challenge page with #pure-js"
+}

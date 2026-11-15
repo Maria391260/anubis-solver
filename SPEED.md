@@ -34,6 +34,8 @@ between algorithms is what matters.
 | `hashx` (WASM, compiled) | ~3.2 M/s | the challenge's program compiled to wasm in the page |
 | `hashx` (WASM, interpreted) | ~0.46 M/s | fallback when the compile cannot run |
 | `argon2id` (WASM) | ~15/s | 19,456 KiB and ~65 ms per hash |
+| `sha256` (pure JS, browser fallback) | ~0.89 M/s | one nonce per hash, reused padding; ~9x slower than the wasm kernel |
+| `fast`, `slow` (pure JS, browser) | ~0.36 M/s | a fresh padded block per candidate; the nibble challenges have no wasm module |
 
 Correcting an earlier row here: this table used to say `hashx` was 3.6 M/s
 "interpreted". It is not. The interpreter measures 0.46 M/s and the 3.2-3.6 M/s
@@ -61,6 +63,10 @@ Anubis' documented light/medium/hard tiers (see the
 | light | 8 | 256 | 0.1 ms |
 | medium | 16 | 65,536 | 8.7 ms |
 | hard | 24 | 16,777,216 | 2.10 s |
+
+The pure-JavaScript fallback (no WebAssembly, or `#pure-js`) is ~9x slower at
+the same tiers; the measured table is in
+[Pure JavaScript: the sha256 fallback](#pure-javascript-the-sha256-fallback).
 
 ### `hashx` (WASM)
 
@@ -788,6 +794,60 @@ Anubis ships, and all four agree on the nonce and the digest. The compile itself
 costs ~6 ms per challenge, which is why the browser does it unconditionally and
 why a threshold would be the refinement if very low difficulties ever mattered:
 below about difficulty 12 the build is a larger cost than the search.
+
+### Pure JavaScript: the sha256 fallback
+
+The page can solve `sha256` with no WebAssembly at all: it happens
+automatically when `WebAssembly` is missing or refuses the module, and
+`#pure-js` on the challenge URL forces it. `fast` and `slow` have no wasm
+module in the first place, so this JavaScript SHA-256 is their only browser
+implementation.
+
+This path was wrong until 2026-11-15: JavaScript masks shift counts to five
+bits, so `bits>>>(8*i)` for `i>=4` repeated the low word, the 64-bit length was
+written twice, and every digest was wrong. The numbers below are from the fixed
+implementation, verified against `node:crypto` and the C engine's
+`anubis_verify_bits` by `betterAnusbis/tests_js_sha256.mjs`.
+
+Method: one fixed challenge (`9f2c1b4a...5c4b`), difficulty 20 (1,048,576
+expected hashes), warm, best of three, Chrome 154 headless on the same
+i7-1260P. The 4-wide wasm kernel ran in the same page and the JS rows never call
+WebAssembly; both found nonce 5,133,809 with digest `00000dcaf513...79a7` — the
+correctness cross-check, not an assumption. Node 26 on the same machine agrees
+within ~15% (0.81-0.89 M/s reused, 7.59-8.31 M/s wasm) and the same two numbers
+come out of `node betterAnusbis/bench-js-sha256.mjs --wasm`. The governor is
+`powersave`, so
+the ranges are run-to-run, not error bars; the first Chrome run was 2.5x slower
+than the next two (cold start) and is kept in the raw data but not quoted here.
+
+| path | hashes/s | per hash | note |
+|---|---:|---:|---|
+| **4-wide wasm kernel, same page** | **7.95-8.05 M** | 0.124-0.126 us | `sha256_pow_batch.wasm`, the fast path |
+| **pure JS, reused padded block** | **0.87-0.91 M** | 1.10-1.15 us | the `sha256` fallback; ~9x slower |
+| pure JS, fresh block per candidate | 0.34-0.38 M | 2.6-2.9 us | `fast`/`slow`; `sha256bytes()` |
+| native C engine, one core | ~8.0 M | 0.125 us | for scale; the wasm kernel matches it |
+
+Expected solve time at Anubis's tiers, from those rates:
+
+| tier | difficulty | expected hashes | wasm | pure JS |
+|---|---:|---:|---:|---:|
+| light | 8 | 256 | 0.1 ms | 0.29 ms |
+| medium | 16 | 65,536 | 8.7 ms | 74 ms |
+| hard | 24 | 16,777,216 | 2.10 s | 18.8 s |
+
+For `fast`/`slow` (nibbles, JavaScript only), the same one-shot rate gives
+0.71 ms at light (d2), 0.18 s at medium (d4) and 47 s at hard (d6).
+
+The fallback is enough for the light and medium tiers, which is what it exists
+for. A hard `sha256` tier costs 19 seconds instead of 2, and a hard nibble tier
+costs 47 seconds against 2 on the native path — that is the price of a browser
+with WebAssembly disabled. The solver is single-threaded and a browser tab will
+not use more cores, so the only lever is the wasm kernel (or WebGPU, which the
+gate does not use).
+
+Reproduce: `node betterAnusbis/bench-js-sha256.mjs --wasm` for the Node numbers;
+the browser column is the challenge page loaded with `#pure-js`. Raw data:
+[`results/js-sha256-2026-11-15.json`](results/js-sha256-2026-11-15.json).
 
 ### WebGPU: three algorithms, three different verdicts
 
