@@ -18,6 +18,7 @@ On Kaggle the JSON lands in /kaggle/working/result.json when --out is given.
 """
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import platform
@@ -80,6 +81,27 @@ def main():
             native.verify_tensor(CHALLENGE, 0, d)
             cpu_ms.append((time.perf_counter() - t0) * 1000.0)
 
+        # The solve above includes everything the client pays: the GPU work, the
+        # 4 MiB copy back and the host SHA-256 of C. Those three have very
+        # different costs, and a single "total" number hides that the GEMM is
+        # a fraction of it, so time the CUDA call on its own as well.
+        gemm_ms = []
+        seed = hashlib.sha256(bytes.fromhex(CHALLENGE)).digest()
+        c_buf = (ctypes.c_int32 * (n * n))()
+        if cuda_available:
+            fn = lib.anubis_cuda_tensor_c
+            fn.restype = ctypes.c_int
+            fn.argtypes = [ctypes.c_char_p, ctypes.c_int,
+                           ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_double)]
+            seed_buf = ctypes.create_string_buffer(seed, 32)
+            for _ in range(args.rounds):
+                ms = ctypes.c_double(0.0)
+                rc = fn(seed_buf, n, c_buf, ctypes.byref(ms))
+                if rc != 0:
+                    gemm_ms.append(float("nan"))
+                else:
+                    gemm_ms.append(ms.value)
+
         macs = 2 * n ** 3
         row = {
             "difficulty": d,
@@ -90,6 +112,9 @@ def main():
             "gpu_verify_ms": statistics.median(verify_ms),
             "cpu_ms": statistics.median(cpu_ms),
             "cpu_gmacs": macs / (statistics.median(cpu_ms) / 1000.0) / 1e9,
+            "cuda_call_ms": statistics.median(gemm_ms) if gemm_ms else None,
+            "cuda_call_gmacs": (macs / (statistics.median(gemm_ms) / 1000.0) / 1e9)
+            if gemm_ms and not any(m != m for m in gemm_ms) else None,
             "digest": gpu_digest,
         }
         row["speedup_vs_cpu"] = row["cpu_ms"] / row["gpu_ms"] if row["gpu_ms"] else None
@@ -99,7 +124,8 @@ def main():
                   f"gpu {row['gpu_ms']:8.3f} ms ({row['gpu_gmacs']:7.1f} GMAC/s)  "
                   f"+verify {row['gpu_verify_ms']:8.2f} ms  "
                   f"cpu {row['cpu_ms']:8.2f} ms  "
-                  f"speedup {row['speedup_vs_cpu']:6.1f}x", flush=True)
+                  f"speedup {row['speedup_vs_cpu']:6.1f}x  "
+                  f"cuda-call {row['cuda_call_ms'] if row['cuda_call_ms'] is None else round(row['cuda_call_ms'], 3)} ms", flush=True)
 
     result = {
         "date": time.strftime("%Y-%m-%d"),
