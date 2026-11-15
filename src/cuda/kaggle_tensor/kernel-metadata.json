@@ -1,6 +1,6 @@
 {
   "id": "monktelv31/anubis-t4-tensor",
-  "title": "anubis t4 tensor gemm",
+  "title": "anubis t4 tensor",
   "code_file": "run.py",
   "language": "python",
   "kernel_type": "script",
