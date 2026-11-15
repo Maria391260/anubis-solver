@@ -170,7 +170,8 @@ static char *build_module(int lanes, const uint32_t words[16], int nonce_off,
     for (int i = 0; i < 4; i++) {
         int byte = nonce_off + i;
         int word = byte / 4;
-        unsigned shift = (unsigned)(8 * (byte % 4));
+        /* the block words are big-endian: byte 0 of a word is its MSB */
+        unsigned shift = (unsigned)(8 * (3 - (byte % 4)));
         unsigned nshift = use_le ? (unsigned)(8 * i) : (unsigned)(8 * (3 - i));
         char *shr = op2(&b, "shift_right_logical", nb, bc(&b, nshift));
         char *m = op2(&b, "and", shr, bc(&b, 0xffu));
@@ -555,6 +556,17 @@ int main(int argc, char **argv) {
         uint32_t found_nonce = 0;
         uint8_t found_digest[32];
 
+        /* one untimed window: the first execute after compile pays for
+         * whatever the backend defers, and it is not part of the rate */
+        {
+            PJRT_Buffer *arg = upload_i32(0);
+            PJRT_Buffer *res = execute(ex, arg, NULL);
+            read_back(res, out, (size_t)lanes * 32);
+            buffer_destroy(arg);
+            buffer_destroy(res);
+        }
+        t0 = pjrt_now_s();
+
         while (1) {
             PJRT_Buffer *arg = upload_i32((int32_t)base);
             PJRT_Buffer *res = execute(ex, arg, NULL);
@@ -621,6 +633,11 @@ int main(int argc, char **argv) {
                 if (found) {
                     printf("nonce=%u digest=%s %s\n", found_nonce, hex,
                            verified ? "verified" : "VERIFICATION FAILED");
+                    if (!verified) {
+                        char tpu_hex[65];
+                        pjrt_to_hex(found_digest, 32, tpu_hex);
+                        printf("  tpu digest: %s\n  cpu digest: %s\n", tpu_hex, hex);
+                    }
                 } else if (bench_hashes > 0) {
                     printf("(benchmark only, hits=%lld)\n", hits);
                 }
