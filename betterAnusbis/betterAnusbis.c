@@ -594,6 +594,23 @@ static const char *find_cookie(const char *headers, const char *name, char *out,
 
 /* --------------------------------------------------------- verification */
 
+/* A tensor response is a SHA-256 digest and nothing else, so a request that
+ * cannot be one is refused before the GEMM runs. This is not a security
+ * boundary - a determined client can still make the server compute one GEMM
+ * per request - but it keeps a fuzzer or a bored scanner from costing a
+ * 130 ms verification each time. */
+static int looks_like_digest(const char *s) {
+    size_t i;
+    if (s == NULL || strlen(s) != 64) return 0;
+    for (i = 0; i < 64; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F')))
+            return 0;
+    }
+    return 1;
+}
+
 static int verify_answer(const char *algorithm, const char *random_data, unsigned long long nonce,
                          int difficulty, char *digest_out, size_t digest_cap) {
     char out[65];
@@ -606,6 +623,10 @@ static int verify_answer(const char *algorithm, const char *random_data, unsigne
         rc = anubis_verify_argon2id(random_data, (uint32_t)nonce, difficulty, out);
     } else if (!strcasecmp(algorithm, "hashx")) {
         rc = anubis_verify_hashx(random_data, (uint32_t)nonce, difficulty, out);
+    } else if (!strcasecmp(algorithm, "tensor")) {
+        /* No nonce search: the digest is the proof. The nonce is still part
+         * of the wire format (Anubis always sends one), and it is always 0. */
+        rc = anubis_verify_tensor(random_data, (uint32_t)nonce, difficulty, out);
     } else if (!strcasecmp(algorithm, "metarefresh") || !strcasecmp(algorithm, "preact")) {
         char hex[65];
         if (anubis_sha256_hex(random_data, strlen(random_data), hex) != ANUBIS_OK) return -1;
@@ -12102,11 +12123,11 @@ function buildModule(challenge) {
     if(workBar) workBar.classList.add("busy");
     if(workSub&&sub) workSub.textContent=sub;
   }
-  function workUpdate(frac,done,ms,expected){
+  function workUpdate(frac,done,ms,expected,unit){
     if(workFill) workFill.style.width=(Math.max(0,Math.min(1,frac))*100).toFixed(1)+"%";
     if(workPct) workPct.textContent=(frac*100).toFixed(1)+"%";
     const rate=ms>0?done/(ms/1000):0;
-    if(workRate) workRate.textContent=rate>0?(rate/1e6).toFixed(2)+" MHash/s":"\u2014";
+    if(workRate) workRate.textContent=rate>0?(rate/1e6).toFixed(2)+" M"+(unit||"Hash")+"/s":"\u2014";
     if(workEta&&rate>0) workEta.textContent="~"+Math.max(0,expected/rate-ms/1000).toFixed(0)+" s left at this rate";
   }
   function workDone(){ if(workBar) workBar.classList.remove("busy"); }
@@ -12151,7 +12172,8 @@ function buildModule(challenge) {
   // Our own kernels, served next to the page. Same ABI as the modules Anubis
   // ships: data_ptr / set_data_length / anubis_work / result_hash_*.
   const KERNELS={sha256:"sha256_pow_batch.wasm","wasm-sha256":"sha256_pow_batch.wasm",
-                 argon2id:"argon2id_pow.wasm",hashx:"hashx_pow.wasm"};
+                 argon2id:"argon2id_pow.wasm",hashx:"hashx_pow.wasm",
+                 tensor:"tensor_pow.wasm"};
   async function solveWithWasm(){
     const name=KERNELS[algo];
     if(!name) return null;
@@ -12600,11 +12622,131 @@ function argon2idTag(password, nonce) {
     return tagFromFinalBlock(blockBytes((A2_BLOCKS - 1) * A2_WORDS), 32);
 }
 
+  // --------------------------------------------------------------- tensor
+  // One integer GEMM: A (N x N, uint8 masked to 0..127) times B (N x N,
+  // int8), accumulated exactly in int32, digest = SHA-256 of C written as
+  // N*N little-endian int32. There is no nonce to search: the digest is the
+  // whole proof, and the server recomputes one GEMM to check it.
+  //
+  // Three paths produce the same bytes. WebNN (navigator.ml) is the point of
+  // the tier: an int8 gemm on a GPU or an NPU, which is far more than a CPU
+  // can do and is the reason a browser without WebAssembly can still work.
+  // The wasm kernel is the portable accelerated floor, and the plain
+  // JavaScript GEMM below is the last resort, at roughly a tenth of the wasm
+  // rate. Unlike the hash tiers, none of this is optimisable away: the
+  // digest covers every output element, so the work has to happen.
+  const tenN=()=>64*Math.max(2,Math.min(16,diff));
+  function tensorExpand(rd,n){
+    const raw=hex2bytes(rd);
+    const cells=n*n, seed=sha256bytes(raw);
+    const a=new Uint8Array(cells), b=new Int8Array(cells);
+    const msg=new Uint8Array(36), ctr=msg.subarray(32,36);
+    msg.set(seed,0);
+    let pos=0, counter=0;
+    while(pos<2*cells){
+      ctr[0]=counter&255; ctr[1]=(counter>>>8)&255;
+      ctr[2]=(counter>>>16)&255; ctr[3]=(counter>>>24)&255;
+      const block=sha256bytes(msg);
+      for(let i=0;i<32&&pos<2*cells;i++,pos++){
+        if(pos<cells) a[pos]=block[i]&0x7f;
+        else b[pos-cells]=(block[i]<<24)>>24;
+      }
+      counter++;
+    }
+    return {a:a,b:b};
+  }
+  // i-k-j: one row of B and one row of C walked sequentially, which is the
+  // order V8 keeps in cache. Skipping a zero in A is safe: 0*anything is 0.
+  function tensorRows(a,b,c,n,from,to){
+    for(let i=from;i<to;i++){
+      const row=i*n;
+      for(let k=0;k<n;k++){
+        const av=a[row+k]; if(av===0) continue;
+        const brow=k*n;
+        for(let j=0;j<n;j++) c[row+j]+=av*b[brow+j];
+      }
+    }
+  }
+  function tensorDigest(c,n){
+    const bytes=new Uint8Array(n*n*4), v=new DataView(bytes.buffer);
+    for(let i=0;i<c.length;i++) v.setInt32(4*i,c[i],true);
+    return tohex(sha256bytes(bytes));
+  }
+  async function tensorInJs(n){
+    say("solving tensor in pure JavaScript (no WebAssembly)");
+    const {a,b}=tensorExpand(ch.randomData,n);
+    const c=new Int32Array(n*n);
+    const t0=performance.now(), blocks=Math.max(1,n>>4), macs=2*n*n*n;
+    workShow("pure-JavaScript int8 GEMM, "+n+"x"+n+"x"+n+" ("+
+             (macs/1e9).toFixed(1)+" GMAC, "+blocks+" row blocks)");
+    for(let s=0;s<blocks;s++){
+      tensorRows(a,b,c,n,Math.floor(n*s/blocks),Math.floor(n*(s+1)/blocks));
+      workUpdate((s+1)/blocks,macs*(s+1)/blocks,performance.now()-t0,macs,"MAC");
+      await new Promise(r=>setTimeout(r,0));
+    }
+    workDone();
+    return {hash:tensorDigest(c,n),nonce:0,ms:performance.now()-t0};
+  }
+  // WebNN: the graph is a single int8 gemm. Support varies by browser and by
+  // backend, so nothing here is trusted: the result of two rows is recomputed
+  // in JavaScript and compared before the digest is accepted. A backend that
+  // cannot do int8 gemm throws at build() and the wasm kernel takes over.
+  async function tensorWebNN(n){
+    const ml=navigator.ml;
+    if(!ml||typeof ml.createContext!=="function") return null;
+    say("asking WebNN for an int8 GEMM");
+    const ctx=await ml.createContext({deviceType:"gpu"});
+    const builder=new MLGraphBuilder(ctx);
+    const A=builder.input("A",{dataType:"uint8",shape:[n,n]});
+    const B=builder.input("B",{dataType:"int8",shape:[n,n]});
+    const C=builder.gemm(A,B);
+    const graph=await builder.build({C});
+    const {a,b}=tensorExpand(ch.randomData,n);
+    const tA=ctx.createTensor({dataType:"uint8",shape:[n,n],writable:true,readable:false});
+    const tB=ctx.createTensor({dataType:"int8",shape:[n,n],writable:true,readable:false});
+    const tC=ctx.createTensor({dataType:"int32",shape:[n,n],writable:false,readable:true});
+    const t0=performance.now();
+    ctx.writeTensor(tA,a); ctx.writeTensor(tB,b);
+    ctx.dispatch(graph,{A:tA,B:tB},{C:tC});
+    const out=await ctx.readTensor(tC);
+    const c=new Int32Array(out.buffer?out.buffer.slice(out.byteOffset,out.byteOffset+out.byteLength):out);
+    // two rows of independent JavaScript GEMM: cheap (0.4% of the work) and
+    // the difference between "WebNN worked" and "WebNN returned rubbish"
+    for(const row of [0,n>>1]){
+      const want=new Int32Array(n);
+      tensorRows(a,b,want,n,row,row+1);
+      for(let j=0;j<n;j++){
+        if(c[row*n+j]!==want[j]) throw new Error("WebNN row "+row+" column "+j+
+          ": "+c[row*n+j]+" != "+want[j]);
+      }
+    }
+    workDone();
+    return {hash:tensorDigest(c,n),nonce:0,ms:performance.now()-t0};
+  }
+  async function solveTensor(){
+    const n=tenN();
+    if(forcedJs){ say("tensor: pure JavaScript requested"); return tensorInJs(n); }
+    if(typeof WebAssembly==="object"){
+      if(typeof navigator!=="undefined"&&navigator.ml){
+        try{ const r=await tensorWebNN(n); if(r){ say("solved with WebNN in "+r.ms.toFixed(0)+" ms"); return r; } }
+        catch(e){ console.warn("WebNN path failed, trying wasm:",e); }
+      }
+      try{ const r=await solveWithWasm(); if(r) return r; }
+      catch(e){ console.warn("tensor wasm kernel failed, using JavaScript:",e); }
+    }
+    return tensorInJs(n);
+  }
+
   const shaAlgo=algo==="sha256"||algo==="wasm-sha256";
   // A URL ending in #pure-js asks for the JavaScript solvers explicitly; they
   // are also the automatic fallback when WebAssembly is not available at all.
   const forcedJs=location.hash.toLowerCase().replace(/^#\/?/,"")==="pure-js";
   const noWasm=forcedJs || typeof WebAssembly!=="object";
+  if(algo==="tensor"){
+    solveTensor().then(r=>{ if(r) pass(r.hash,0,r.ms); })
+                 .catch(e=>say("tensor solver failed: "+e));
+    return;
+  }
   if(shaAlgo && noWasm){ solveSha256InJs(); return; }
   if(algo==="hashx" && noWasm){ solveHashxInJs(); return; }
   if(algo==="argon2id" && noWasm){ solveArgon2idInJs(); return; }
@@ -12949,8 +13091,8 @@ static const char *policy_digest(void) { return policy_digest_value; }
  * the thing this project is avoiding.
  */
 static const char *const known_algorithms[] = {"fast", "slow", "sha256", "wasm-sha256",
-                                              "argon2id", "hashx", "metarefresh", "preact",
-                                              NULL};
+                                              "argon2id", "hashx", "tensor", "metarefresh",
+                                              "preact", NULL};
 
 static int algorithm_known(const char *name) {
     for (int i = 0; known_algorithms[i]; i++)
@@ -15131,8 +15273,13 @@ static void handle_parsed(conn *c, request *req_in, const char *peer_ip) {
                 if (rc == 1) {
                     if (taken_algo[0]) algorithm = taken_algo;
                     used_difficulty = stored_difficulty;
-                    valid = verify_answer(algorithm, stored, nonce, stored_difficulty,
-                                          digest, sizeof digest);
+                    if (!strcasecmp(algorithm, "tensor") && !looks_like_digest(response)) {
+                        logmsg("rejecting: tensor response is not a 64-hex digest");
+                        valid = 0;
+                    } else {
+                        valid = verify_answer(algorithm, stored, nonce, stored_difficulty,
+                                              digest, sizeof digest);
+                    }
                     if (valid && strcasecmp(response, digest) != 0) {
                         logmsg("rejecting: response %s is not the digest %s for nonce %llu",
                                response, digest, nonce);
@@ -15152,6 +15299,8 @@ static void handle_parsed(conn *c, request *req_in, const char *peer_ip) {
                 logmsg("rejecting: id %s is not a challenge we issued", id);
             } else if (issued_at && time(NULL) - issued_at > COOKIE_TTL) {
                 logmsg("rejecting: challenge %s expired", id);
+            } else if (!strcasecmp(algorithm, "tensor") && !looks_like_digest(response)) {
+                logmsg("rejecting: tensor response is not a 64-hex digest");
             } else {
                 valid = verify_answer(algorithm, rd_hex, nonce, cfg.difficulty,
                                       digest, sizeof digest);
@@ -18287,10 +18436,13 @@ static void usage(FILE *out) {
         "  --strip-base-prefix    strip it again before the target sees the request\n"
         "\n"
         "the challenge\n"
-        "  --algorithm NAME       fast, slow, sha256, argon2id, hashx, metarefresh or preact\n"
+        "  --algorithm NAME       fast, slow, sha256, argon2id, hashx, tensor, metarefresh\n"
+        "                         or preact\n"
         "                         (default sha256)\n"
         "  --difficulty N         difficulty; bits for sha256/argon2id/hashx,\n"
-        "                         nibbles for fast/slow (default 4)\n"
+        "                         nibbles for fast/slow, and the matrix size for\n"
+        "                         tensor: N = 64*clamp(N,2,16), so 8 is 512x512\n"
+        "                         (default 4)\n"
         "  --challenge-status N   status for the challenge page (default 200)\n"
         "  --deny-status N        status for a policy deny (default 200, as Anubis\n"
         "                         ships it; 403 is what a human would choose)\n"

@@ -14,6 +14,7 @@
  *   metarefresh  follow the refresh, which is what proves a browser
  *   hashx        compiled to wasm for this challenge by ../wasm/hashx_jit.mjs,
  *                then searched in wasm - no interpreter, no toolchain
+ *   tensor       one integer GEMM, digest of the result; no nonce search
  *   argon2id     not implemented here - needs ~19 MiB of memory-hard work; the
  *                Python driver (tools/anubis_fetch.py) or the C engine does it
  *
@@ -328,6 +329,60 @@ async function solveHashX(randomData, difficulty) {
   return { nonce, response: digest.toString('hex'), elapsedMs: msSince(started) };
 }
 
+/**
+ * Solve a `tensor` challenge: one integer GEMM, digest of the result.
+ *
+ * The tier exists because it is the one primitive that a GPU or an NPU does
+ * faster than a CPU, so the browser page runs it on WebNN or on a wasm kernel.
+ * Here it is plain JavaScript, which is also the page's last-resort path; at
+ * difficulty 8 that is a 512x512x512 product, about 270 million multiply-adds
+ * and roughly half a second.
+ *
+ * There is no nonce to search: the digest *is* the proof, and the server
+ * recomputes the same GEMM to check it. Everything is integer - A is uint8
+ * masked to 0..127, B is int8, C is exact int32 - so this implementation and
+ * every browser kernel produce identical bytes. A float BLAS would not: float
+ * addition reassociates, and two correct kernels would disagree.
+ *
+ * N = 64 * clamp(difficulty, 2, 16), the same rule the gate uses.
+ */
+export async function solveTensor(randomData, difficulty) {
+  const n = 64 * Math.max(2, Math.min(16, difficulty));
+  const cells = n * n;
+  const seed = createHash('sha256').update(Buffer.from(randomData, 'hex')).digest();
+
+  // SHA-256 in counter mode: the first N*N bytes are A, the next N*N are B.
+  const a = new Uint8Array(cells);
+  const b = new Int8Array(cells);
+  const counter = Buffer.alloc(4);
+  let pos = 0;
+  for (let i = 0; pos < 2 * cells; i++) {
+    counter.writeUInt32LE(i >>> 0, 0);
+    const block = createHash('sha256').update(seed).update(counter).digest();
+    for (let k = 0; k < 32 && pos < 2 * cells; k++, pos++) {
+      if (pos < cells) a[pos] = block[k] & 0x7f;
+      else b[pos - cells] = (block[k] << 24) >> 24;
+    }
+  }
+
+  const started = process.hrtime.bigint();
+  const c = new Int32Array(cells);
+  for (let i = 0; i < n; i++) {
+    const row = i * n;
+    for (let k = 0; k < n; k++) {
+      const av = a[row + k];
+      if (av === 0) continue;
+      const brow = k * n;
+      for (let j = 0; j < n; j++) c[row + j] += av * b[brow + j];
+    }
+  }
+
+  const digest = createHash('sha256')
+    .update(Buffer.from(c.buffer, c.byteOffset, c.byteLength))
+    .digest();
+  return { nonce: 0, response: digest.toString('hex'), elapsedMs: msSince(started) };
+}
+
 /** Solve one parsed challenge with the algorithm it names. */
 export async function solveChallenge(challenge) {
   const algorithm = String(challenge.algorithm ?? '').toLowerCase();
@@ -341,6 +396,9 @@ export async function solveChallenge(challenge) {
   }
   if (algorithm === 'hashx') {
     return { algorithm, difficulty, ...(await solveHashX(challenge.randomData, difficulty)) };
+  }
+  if (algorithm === 'tensor') {
+    return { algorithm, difficulty, ...(await solveTensor(challenge.randomData, difficulty)) };
   }
   if (algorithm === 'metarefresh') {
     throw new Error(

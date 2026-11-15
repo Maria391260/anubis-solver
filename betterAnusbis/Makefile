@@ -50,8 +50,11 @@ web/hashx_pow.wasm: $(WASM)/hashx_pow.wasm
 	cp -f $< $@
 web/sha256_pow_batch.wasm: $(WASM)/sha256_pow_batch.wasm
 	cp -f $< $@
+web/tensor_pow.wasm: $(WASM)/tensor_pow.wasm
+	cp -f $< $@
 
-wasm-kernels: web/argon2id_pow.wasm web/hashx_pow.wasm web/sha256_pow_batch.wasm
+wasm-kernels: web/argon2id_pow.wasm web/hashx_pow.wasm web/sha256_pow_batch.wasm \
+              web/tensor_pow.wasm
 
 betterAnusbis: betterAnusbis.c $(LIBDIR)/libanubis_solver.so
 	$(CC) $(CFLAGS) $(HTTP_CFLAGS) -I$(LIBDIR)/include -o $@ betterAnusbis.c $(LDLIBS) $(HTTP_LIBS)
@@ -95,6 +98,7 @@ test-js:
 	node tests_js_sha256.mjs
 	node tests_js_hashx.mjs
 	node tests_js_argon2id.mjs
+	node tests_js_tensor.mjs
 
 clean:
 	rm -f betterAnusbis
