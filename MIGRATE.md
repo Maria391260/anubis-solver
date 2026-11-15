@@ -21,9 +21,13 @@ you cannot yet, the README's first three paragraphs are enough to get there.
 
 ## What you need
 
-- A Linux box (or macOS; the gate is plain C)
-- `cc`, `make`, and OpenSSL's headers: `apt install build-essential libssl-dev`
+- A Linux box (or macOS; the gate is plain C), **or** Windows 10/11 x86-64
+- On Linux: `cc`, `make`, and OpenSSL's headers: `apt install build-essential libssl-dev`
   / `dnf install gcc make openssl-devel` / `apk add build-base openssl-dev`
+- On Windows: nothing to build — the release ships `betterAnusbis.exe` +
+  `anubis_solver.dll` as a zip and as an MSI. Building from source is a
+  mingw-w64 cross build (`betterAnusbis/win32/build-windows.sh`); the recipe is
+  in [RELEASING.md](RELEASING.md)
 - Your existing `botPolicies.yaml` and the `data/` directory next to it
 - About five minutes
 
@@ -36,10 +40,26 @@ make                      # the solver library: libanubis_solver.so
 cd betterAnusbis
 make                      # the gate: one cc invocation, one binary
 ./betterAnusbis --version
-# 1.50.1 "headslam"
+# 1.50.3 "headslam"
 ```
 
 That is the whole build. No Go toolchain, no container, no `go mod download`.
+
+On Windows you take a release artifact instead — same version string, same
+flags, no compiler:
+
+```powershell
+# the MSI installs under Program Files\betterAnusbis and adds it to PATH;
+# open a new terminal afterwards so PATH is picked up
+msiexec /i betterAnusbis-1.50.3-x86_64-windows.msi
+
+# or unzip and run from the folder (keep the .exe and the .dll together)
+.\betterAnusbis.exe --version
+# 1.50.3 "headslam"
+```
+
+The Windows pair comes from the same `betterAnusbis.c`; what it leaves out and
+why is in [Running it on Windows](#running-it-on-windows) below.
 
 ## 2. Start it next to Anubis, not instead of it
 
@@ -60,7 +80,9 @@ policy file**:
 `--web` is where the browser's WASM kernels live (`sha256_pow_batch.wasm` and
 friends, built by `wasm/make`). Point it at the repository's `wasm/` directory
 or wherever you installed them. Without it, `sha256` still works but the browser
-falls back to plain JavaScript, and `argon2id`/`hashx` cannot run at all.
+falls back to plain JavaScript, and `argon2id`/`hashx` cannot run at all. The
+release archives do not bundle the kernels: on Windows, point `--web` at a
+source checkout's `wasm/` directory (or copy its files next to the binary).
 
 The startup log tells you exactly what it understood:
 
@@ -84,7 +106,8 @@ enterprise feature (`botstopper`). It will not fail silently.
 curl -i http://127.0.0.1:8081/
 
 # a browser is the real test: open it and watch yourself land on the backend
-xdg-open http://127.0.0.1:8081/     # or just click it
+xdg-open http://127.0.0.1:8081/   # Linux
+start http://127.0.0.1:8081/      # Windows (Command Prompt or PowerShell)
 
 # metrics and the health endpoint
 curl -s http://127.0.0.1:9091/healthz     # ok
@@ -133,9 +156,69 @@ load per client, once.
 Point the upstream back at Anubis's port and reload. The two gates do not share
 state, so nothing about the rollback is delicate.
 
+## Running it on Windows
+
+The same gate, the same flags, the same policy file. What changes is the
+packaging and a handful of things Win32 does not have:
+
+- **The pair must stay together.** `betterAnusbis.exe` imports
+  `anubis_solver.dll` by name, so both files have to be in the same directory.
+  The MSI puts them under `Program Files\betterAnusbis` and adds that directory
+  to the machine `PATH`; the zip is enough if you would rather not install.
+- **No Visual C++ runtime needed.** Everything except `anubis_solver.dll` is
+  linked statically, and that DLL only needs the system libraries.
+- **Windows 10/11 x86-64.** `--bind-network unix` additionally needs Windows 10
+  1803+ for AF_UNIX; the normal TCP listener does not.
+- **The WASM kernels are not in the zip/MSI.** The browser-side files
+  (`sha256_pow_batch.wasm`, `argon2id_pow.wasm`, `hashx_pow.wasm`) live in the
+  repository's `wasm/` directory; point `--web` there. Without them `sha256`
+  falls back to JavaScript and `argon2id`/`hashx` cannot be solved in the
+  browser — which is the same rule as on Linux, the archives just do not carry
+  the files.
+- **HTTP/1.1 only in the release build.** nghttp2 and nghttp3/QUIC are optional
+  at build time everywhere and are not linked into the shipped Windows pair;
+  `--http2` says so at startup. Build from source with those libraries if you
+  need h2/h3.
+- **HashX runs the interpreter, and the SHA-NI/AVX2 kernels are not linked.**
+  The Windows build takes the portable C paths (the hand-written kernels are
+  ELF assembly and the HashX JIT is System V ABI), so a `hashx` challenge costs
+  noticeably more CPU there. `sha256`, `fast` and `slow` are the cheap choices
+  on both platforms; raise `hashx` difficulty with that in mind.
+- **TLS trusts the Windows certificate store** through OpenSSL's winstore
+  support. Set `SSL_CERT_FILE` to a PEM bundle to point the backend hop at one
+  explicitly; `--tls-cert`/`--tls-key` for the listener are unchanged.
+- **No SIGHUP.** The settings dump that `kill -HUP` prints on Linux has no
+  Windows equivalent; scrape `/metrics` (with `--metrics-bind`) or restart.
+  Ctrl+C / Ctrl+Break take the place of SIGINT/SIGTERM and flush a `file:` or
+  `bbolt:` store on the way out.
+
+Start it by hand:
+
+```powershell
+# from an MSI install (already on PATH) or the unzipped folder
+betterAnusbis.exe --listen 127.0.0.1:8081 --target http://127.0.0.1:3000 `
+  --policy C:\ProgramData\anubis\botPolicies.yaml `
+  --data-dir C:\ProgramData\anubis\data `
+  --secret-file C:\ProgramData\betterAnusbis\secret.key `
+  --web C:\anubis-solver\wasm `
+  --metrics-bind 127.0.0.1:9091
+```
+
+For a real service, Task Scheduler (run at startup, restart on failure) or NSSM
+both work: give them the full path to `betterAnusbis.exe`, a working directory,
+and `stderr` redirected to a file or a logging agent — Windows has no syslog for
+the gate to write to. The first time the TCP listener opens, Windows Firewall
+may ask; if the reverse proxy runs on the same host, loopback access is all it
+needs.
+
+Paths with spaces need quotes. `--secret-file` is created if it is missing, as
+on Linux; keep it out of a synchronised profile, because two machines sharing
+one signing key is fine but two instances fighting over one file-backed
+challenge store is not.
+
 ## The config file already travels
 
-As of 1.50.1 the policy file configures the gate, not just the rules. These
+Since 1.50.1 the policy file configures the gate, not just the rules. These
 blocks are read from the same document:
 
 | block | what it sets |
@@ -234,7 +317,8 @@ JavaScript is the fallback and is several times slower on a phone.
   `--challenge-extension css-load` impossible (the gate refuses to start with
   both, rather than pretending to check). Use it only if you know that.
 - **Unix sockets** for both listeners: `--bind-network unix --listen
-  /run/anubis.sock --socket-mode 0770`.
+  /run/anubis.sock --socket-mode 0770`. On Windows that needs Windows 10 1803+
+  (AF_UNIX); on older versions keep the TCP listener.
 - **Metrics are off unless you bind them.** Anubis binds `:9090` for you, which
   hands your traffic numbers to anyone who can reach it; this gate makes you ask.
 
@@ -248,7 +332,12 @@ JavaScript is the fallback and is several times slower on a phone.
 | a policy edit logs everyone out | by design: the token names the policy it was minted under, so a changed policy invalidates it. Anubis invalidates per rule; this gate does it wholesale, in the safe direction. |
 | `/metrics` 404s | metrics are off until `--metrics-bind` (or the `metrics.bind` block) says where to put them. |
 | the gate says a rule "will never match" | the expression uses something outside the CEL subset; the message names the rule. |
-| `--bind-network unix` fails | the socket's directory must exist and be writable; the mode comes from `--socket-mode`. |
+| `--bind-network unix` fails | the socket's directory must exist and be writable; the mode comes from `--socket-mode`. On Windows this also needs Windows 10 1803+ for AF_UNIX. |
+| `anubis_solver.dll was not found` (Windows) | the .exe and the .dll were separated. Keep them in one directory, or install the MSI. |
+| no `kill -HUP` on Windows | there is no SIGHUP; scrape `/metrics` (`--metrics-bind`) or restart. Ctrl+C flushes a `file:`/`bbolt:` store. |
+| browser cannot solve `argon2id`/`hashx` | `--web` does not point at the WASM kernels; the release archives do not include them, use a source checkout's `wasm/` directory. |
+| HTTPS target certificate fails (Windows) | point `SSL_CERT_FILE` at a PEM bundle, or rely on the Windows certificate store where OpenSSL's winstore support is available. |
+| Windows Firewall prompts on first start | expected: the listener binds a TCP port. Allow loopback (or the proxy's address) only. |
 
 ## Known differences
 
