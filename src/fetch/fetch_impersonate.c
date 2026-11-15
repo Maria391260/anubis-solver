@@ -14,6 +14,9 @@
  * (libcurl never renumbers them); each is followed by the curl.h expression it
  * corresponds to, for review.
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE  /* strcasestr, strdup, readlink */
+#endif
 #include "fetch_impersonate.h"
 
 #include <dlfcn.h>

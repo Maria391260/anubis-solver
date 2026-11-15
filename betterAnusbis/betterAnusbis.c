@@ -72,7 +72,7 @@
 
 /* ----------------------------------------------------------------- config */
 
-#define VERSION "2.0.0"
+#define VERSION "2.0.1"
 #define CODENAME "shaoogle"
 #define API_PREFIX "/.within.website/x/cmd/anubis/api/"
 #define DEFAULT_COOKIE_PREFIX "techaro.lol-anubis"

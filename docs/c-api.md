@@ -136,7 +136,7 @@ implementation and the search falls back to the CPU on a mismatch.
 
 ## Fetching protected pages
 
-Since 2.0.0 the library also exports the client that the C services use, so a C
+Since 2.0.1 the library also exports the client that the C services use, so a C
 program can fetch an Anubis-protected URL without spawning anything. The
 prototypes are in [`src/fetch/anubis_fetch.h`](../src/fetch/anubis_fetch.h) —
 that header is not part of `anubis-solver.h` because the layer is optional

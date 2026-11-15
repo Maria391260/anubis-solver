@@ -12,6 +12,14 @@
 
 # Moving from Anubis to betterAnusbis
 
+> **2.0.1 "shaoogle"** is the version this guide describes. Since 2.0.0 the C
+> services moved the fetch layer into `libanubis_solver.so`, the fetch layer can
+> present a browser TLS fingerprint through a `dlopen()`ed libcurl-impersonate,
+> and `LICENSE` section 4 requires the DeepSeek logo and credit line on the die
+> and package marking of any chip built from `beyond/`. The binaries in the
+> 2.0.1 release are rebuilt with those changes, and the MSI licence page shows
+> the new text.
+
 You are not rewriting anything. Your Anubis config file is the config file. Your
 reverse proxy changes one line. Your users notice that the challenge page is
 prettier and nothing else.
@@ -40,7 +48,7 @@ make                      # the solver library: libanubis_solver.so
 cd betterAnusbis
 make                      # the gate: one cc invocation, one binary
 ./betterAnusbis --version
-# 2.0.0 "shaoogle"
+# 2.0.1 "shaoogle"
 ```
 
 That is the whole build. No Go toolchain, no container, no `go mod download`.
@@ -51,11 +59,11 @@ flags, no compiler:
 ```powershell
 # the MSI installs under Program Files\betterAnusbis and adds it to PATH;
 # open a new terminal afterwards so PATH is picked up
-msiexec /i betterAnusbis-2.0.0-x86_64-windows.msi
+msiexec /i betterAnusbis-2.0.1-x86_64-windows.msi
 
 # or unzip and run from the folder (keep the .exe and the .dll together)
 .\betterAnusbis.exe --version
-# 2.0.0 "shaoogle"
+# 2.0.1 "shaoogle"
 ```
 
 The Windows pair comes from the same `betterAnusbis.c`; what it leaves out and
@@ -345,7 +353,7 @@ URL forces it (the fragment is never sent to the server).
 | the gate says a rule "will never match" | the expression uses something outside the CEL subset; the message names the rule. |
 | `--bind-network unix` fails | the socket's directory must exist and be writable; the mode comes from `--socket-mode`. On Windows this also needs Windows 10 1803+ for AF_UNIX. |
 | `anubis_solver.dll was not found` (Windows) | the .exe and the .dll were separated. Keep them in one directory, or install the MSI. |
-| `fixme:msi:internal_ui_handler` when installing under Wine | Wine's MSI UI is incomplete, the install finishes anyway. `wine msiexec /i betterAnusbis-2.0.0-x86_64-windows.msi /qn` does the same quietly; on real Windows, double-clicking the MSI shows the normal progress UI. |
+| `fixme:msi:internal_ui_handler` when installing under Wine | Wine's MSI UI is incomplete, the install finishes anyway. `wine msiexec /i betterAnusbis-2.0.1-x86_64-windows.msi /qn` does the same quietly; on real Windows, double-clicking the MSI shows the normal progress UI. |
 | no `kill -HUP` on Windows | there is no SIGHUP; scrape `/metrics` (`--metrics-bind`) or restart. Ctrl+C flushes a `file:`/`bbolt:` store. |
 | browser cannot solve `argon2id`/`hashx` | `--web` does not point at the WASM kernels; the release archives do not include them, use a source checkout's `wasm/` directory. |
 | HTTPS target certificate fails (Windows) | point `SSL_CERT_FILE` at a PEM bundle, or rely on the Windows certificate store where OpenSSL's winstore support is available. |

@@ -26,7 +26,7 @@
 #include "anubis_fetch.h"
 
 #define SERVER_NAME "anubis"
-#define SERVER_VERSION "2.0.0"
+#define SERVER_VERSION "2.0.1"
 
 /* ------------------------------------------------------------------ strings */
 

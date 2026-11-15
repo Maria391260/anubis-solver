@@ -3,7 +3,7 @@
 Anubis is a proof-of-work gate that many sites put in front of their pages.
 `anubis-solver` solves that proof of work for you: a small C core (SHA-256,
 Argon2id, HashX and the `tensor` GEMM proof, with optional GPU backends), a
-Python library that wraps it and handles the HTTP dance, and — since 2.0.0
+Python library that wraps it and handles the HTTP dance, and — since 2.0.1
 `"shaoogle"` — two C services over the same library: an MCP server and an HTTP
 JSON API.
 
@@ -20,7 +20,7 @@ You need a C compiler and `make`. Python 3.9+ for the library.
 git clone https://github.com/celikfana-lab/anubis-solver.git
 cd anubis-solver
 make                 # builds ./libanubis_solver.so
-python3 -c "import anubis_solver; print(anubis_solver.__version__)"   # 2.0.0
+python3 -c "import anubis_solver; print(anubis_solver.__version__)"   # 2.0.1
 ```
 
 `make` detects what your machine offers:
@@ -205,7 +205,7 @@ curl -s localhost:8088/v1/solve -d '{
 
 ```bash
 curl -s localhost:8088/v1/version
-# {"version":"2.0.0","codename":"shaoogle","algorithms":[...]}
+# {"version":"2.0.1","codename":"shaoogle","algorithms":[...]}
 ```
 
 **There is no authentication.** Bind it to loopback, or put it behind auth you

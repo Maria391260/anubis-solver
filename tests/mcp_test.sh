@@ -150,7 +150,7 @@ def main():
         assert inner["algorithm"] == "tensor"
     elif mode == "version":
         inner = json.loads(tool_text(ids[5]))
-        assert inner["version"] == "2.0.0", inner["version"]
+        assert inner["version"] == "2.0.1", inner["version"]
         assert inner["codename"] == "shaoogle", inner["codename"]
         for alg in ("fast", "slow", "sha256", "wasm-sha256", "argon2id", "hashx",
                     "tensor"):
@@ -211,7 +211,7 @@ check init "initialize returns protocolVersion 2024-11-05 and serverInfo.name an
 check tools "tools/list lists exactly anubis_fetch, anubis_solve, anubis_version"
 check solve_sha256 "anubis_solve sha256 difficulty 4 returns nonce and 64-hex response"
 check solve_tensor "anubis_solve tensor difficulty 2 returns nonce and 64-hex response"
-check version "anubis_version returns version 2.0.0 and codename shaoogle"
+check version "anubis_version returns version 2.0.1 and codename shaoogle"
 check unknown "unknown method returns JSON-RPC error -32601"
 check ping "ping returns an empty result"
 check one_response_per_request "notifications get no response (7 responses for 8 requests)"

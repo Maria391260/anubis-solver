@@ -36,7 +36,7 @@ extern "C" {
  * Introspection
  * ------------------------------------------------------------------ */
 
-/* Library version, e.g. "2.0.0". */
+/* Library version, e.g. "2.0.1". */
 ANUBIS_API const char *anubis_solver_version(void);
 
 /* Release codename, e.g. "shaoogle". */

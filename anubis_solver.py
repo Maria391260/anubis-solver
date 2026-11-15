@@ -69,7 +69,7 @@ REQUEST_ERRORS: tuple[type[BaseException], ...] = (
     else (requests.RequestException,)
 )
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 __all__ = [
     "AnubisClient",
     "make_session",

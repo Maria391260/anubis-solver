@@ -13,7 +13,7 @@ make anubis_api
 ./anubis_api --listen 127.0.0.1:8088
 ```
 
-The fetch layer is part of `libanubis_solver.so` (2.0.0 and later), so the
+The fetch layer is part of `libanubis_solver.so` (2.0.1 and later), so the
 service is one source file plus that library.
 
 It binds localhost by default in the documented command. It has **no
@@ -25,13 +25,13 @@ can reach it can spend your CPU on proofs of work.
 ### `GET /healthz`
 
 ```json
-{"ok":true,"version":"2.0.0","codename":"shaoogle"}
+{"ok":true,"version":"2.0.1","codename":"shaoogle"}
 ```
 
 ### `GET /v1/version`
 
 ```json
-{"version":"2.0.0","codename":"shaoogle",
+{"version":"2.0.1","codename":"shaoogle",
  "algorithms":["fast","slow","sha256","wasm-sha256","argon2id","hashx","tensor"],
  "impersonate":"chrome116","impersonate_available":true}
 ```
