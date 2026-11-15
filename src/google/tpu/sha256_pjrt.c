@@ -160,7 +160,8 @@ static char *build_module(int lanes, const uint32_t words[16], int nonce_off,
     /* 16 message words: constants with the four nonce bytes spliced in. */
     for (int j = 0; j < 16; j++) {
         char *cj = nv("c");
-        bprintf(&b, "    %s = stablehlo.constant dense<%uu> : tensor<i32>\n", cj, words[j]);
+        bprintf(&b, "    %s = stablehlo.constant dense<%d> : tensor<i32>\n",
+                cj, (int32_t)words[j]);
         w[j] = nv("w");
         bprintf(&b, "    %s = stablehlo.broadcast_in_dim %s, dims = [] "
                     ": (tensor<i32>) -> tensor<%dxi32>\n", w[j], cj, lanes);
