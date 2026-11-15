@@ -11018,14 +11018,15 @@ static const char *CHALLENGE_JS = R"JS(
   const hex2bytes=(h)=>{const a=new Uint8Array(h.length/2);for(let i=0;i<a.length;i++)a[i]=parseInt(h.substr(2*i,2),16);return a;};
   const tohex=(b)=>{let s="";for(const x of b)s+=x.toString(16).padStart(2,"0");return s;};
 
-  // compact SHA-256, enough for the fast/slow/sha256 algorithms
+  // compact SHA-256: the fast/slow challenges hash a text message, the sha256
+  // challenge hashes raw bytes plus the nonce (sha256padded is shared by both)
   const K=new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
   const rotr=(x,n)=>(x>>>n)|(x<<(32-n));
-  function sha256bytes(data){
+  // The compressor works on an already-padded message: the caller fills in the
+  // 0x80 byte and the 64-bit length. The pure-JS sha256 solver reuses one
+  // padded buffer and only rewrites the four nonce bytes per attempt.
+  function sha256padded(padded){
     const H=new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
-    const len=data.length, bits=len*8;
-    const padded=new Uint8Array(((len+9+63)/64|0)*64); padded.set(data); padded[len]=0x80;
-    for(let i=0;i<8;i++) padded[padded.length-1-i]=(bits>>>(8*i))&0xff;
     const w=new Uint32Array(64);
     for(let off=0;off<padded.length;off+=64){
       for(let i=0;i<16;i++) w[i]=(padded[off+4*i]<<24)|(padded[off+4*i+1]<<16)|(padded[off+4*i+2]<<8)|padded[off+4*i+3];
@@ -11044,6 +11045,22 @@ static const char *CHALLENGE_JS = R"JS(
     const out=new Uint8Array(32);
     for(let i=0;i<8;i++){out[4*i]=H[i]>>>24;out[4*i+1]=(H[i]>>>16)&255;out[4*i+2]=(H[i]>>>8)&255;out[4*i+3]=H[i]&255;}
     return out;
+  }
+  function sha256bytes(data){
+    const len=data.length;
+    const padded=new Uint8Array(((len+9+63)/64|0)*64); padded.set(data); padded[len]=0x80;
+    sha256length(padded,len*8);
+    return sha256padded(padded);
+  }
+  // Write the 64-bit message length into the padding as two 32-bit halves.
+  // `bits>>>(8*i)` alone is wrong for i>=4: JavaScript masks shift counts to 5
+  // bits, so the high half would repeat the low word and every digest breaks.
+  function sha256length(padded,bits){
+    const hi=Math.floor(bits/4294967296)>>>0, lo=bits>>>0;
+    for(let i=0;i<4;i++){
+      padded[padded.length-1-i]=(lo>>>(8*i))&0xff;
+      padded[padded.length-5-i]=(hi>>>(8*i))&0xff;
+    }
   }
   const lz=(b)=>{let n=0;for(const x of b){if(x===0){n+=8;continue;}n+=Math.clz32(x)-24;break;}return n;};
   /* HASHX-JIT-BEGIN */
@@ -12191,13 +12208,21 @@ function buildModule(challenge) {
     return run(instance.exports);
   }
 
+  const shaAlgo=algo==="sha256"||algo==="wasm-sha256";
+  // A URL ending in #pure-js asks for the JavaScript solver explicitly; it is
+  // also the automatic fallback when WebAssembly is not available at all.
+  const forcedJs=location.hash.toLowerCase().replace(/^#\/?/,"")==="pure-js";
+  if(shaAlgo && (forcedJs || typeof WebAssembly!=="object")){
+    solveSha256InJs();
+    return;
+  }
   if(algo==="sha256"||algo==="wasm-sha256"||algo==="argon2id"||algo==="hashx"){
     solveWithWasm().then(r=>{
       if(r){ say("solved with nonce "+r.nonce+" in "+r.ms.toFixed(0)+" ms"); pass(r.hash,r.nonce,r.ms); }
-      else if(algo==="sha256"||algo==="wasm-sha256"){ solveInJs(); }
+      else if(shaAlgo){ solveSha256InJs(); }
       else { say(algo+" could not load its kernel, use the anubis_fetch CLI or the Firefox extension"); }
     }).catch(e=>{
-      if(algo==="sha256"||algo==="wasm-sha256"){ solveInJs(); }
+      if(shaAlgo){ solveSha256InJs(); }
       else { say(algo+" kernel failed to load: "+e); }
     });
     return;
@@ -12215,6 +12240,44 @@ function buildModule(challenge) {
       const d=sha256bytes(enc.encode(ch.randomData+nonce));
       if(lz(d)>=diff*4){ say("solved with nonce "+nonce); pass(tohex(d),nonce,performance.now()-t0); return; }
       if((nonce&8191)===0) say("trying nonce "+nonce);
+    }
+  }
+
+  // Pure-JavaScript solver for the wasm sha256 challenge, for browsers where
+  // WebAssembly is disabled, missing, or refused. It is the same proof the
+  // wasm kernel computes: the raw challenge bytes followed by a 32-bit nonce,
+  // little-endian when the last challenge byte has its high bit set and
+  // big-endian otherwise, accepted on `difficulty` leading zero *bits* of the
+  // raw digest. The message is fixed apart from the nonce, so the padded block
+  // is built once and its four nonce bytes are rewritten per attempt; the loop
+  // yields every 8192 tries so a high difficulty cannot freeze the tab.
+  async function solveSha256InJs(){
+    const t0=performance.now();
+    const data=hex2bytes(ch.randomData);
+    const little=data.length!==0 && (data[data.length-1]&0x80)!==0;
+    const total=data.length+4;
+    const padded=new Uint8Array(((total+9+63)/64|0)*64);
+    padded.set(data,0);
+    padded[total]=0x80;
+    sha256length(padded,total*8);
+    const p=data.length;
+    say("solving sha256 in pure JavaScript (no WebAssembly)");
+    for(let nonce=0;;nonce++){
+      const v=nonce>>>0;
+      if(little){
+        padded[p]=v&255; padded[p+1]=(v>>>8)&255;
+        padded[p+2]=(v>>>16)&255; padded[p+3]=(v>>>24)&255;
+      }else{
+        padded[p]=(v>>>24)&255; padded[p+1]=(v>>>16)&255;
+        padded[p+2]=(v>>>8)&255; padded[p+3]=v&255;
+      }
+      const d=sha256padded(padded);
+      if(lz(d)>=diff){
+        say("solved with nonce "+nonce+" in JavaScript");
+        pass(tohex(d),nonce,performance.now()-t0);
+        return;
+      }
+      if((nonce&8191)===8191) await new Promise(r=>setTimeout(r,0));
     }
   }
 })();

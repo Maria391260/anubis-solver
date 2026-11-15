@@ -296,6 +296,16 @@ challenge bytes and only falls back to fetching the interpreter.
 | `argon2id` | `argon2id_pow.wasm` (our register-resident fill, m=19456 t=2 p=1) | 13.9 KB | **exact, and 1.02-1.05x faster** |
 | `hashx` | compiled in the page from the challenge (`hashx_jit.mjs`), falling back to `hashx_pow.wasm` | 10.4 KB / 14.9 KB | **exact, and 7-8x faster** |
 
+`sha256` and the nibble challenges also have a **pure-JavaScript SHA-256**.
+If WebAssembly is missing or the module will not instantiate, the page computes
+the same proof itself: `sha256` hashes the raw challenge bytes plus the 32-bit
+nonce (little-endian when the challenge's last byte has the high bit set,
+big-endian otherwise), and `fast`/`slow` hash the hex string plus the decimal
+nonce. Append `#pure-js` to the challenge URL to force it even when wasm is
+available; the fragment never reaches the server or the redirect. It is slower
+than the four-wide wasm kernel, but a browser with wasm disabled still gets
+through instead of being locked out.
+
 `hashx` also shows what it costs. The page compiles the challenge's program,
 then scans nonces in windows of 262,144 and drives a progress bar that says
 **slowing you down!** with the measured MHash/s and an estimate of the time
@@ -615,6 +625,7 @@ a site owner actually configures. That is the point: `--target` and you are done
 
 ```bash
 ./test-all-algorithms.sh      # all six algorithms, needs a backend on :8002
+node tests_js_sha256.mjs      # the page's JavaScript SHA-256 and both JS solvers
 python3 test_parity.py        # the flags taken from cmd/anubis, checked on the wire
 python3 tests_http23.py -v    # HTTP/2 and HTTP/3, listener and backend hop
 python3 tests_valkey.py       # the Valkey store against an in-process RESP mock

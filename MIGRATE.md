@@ -304,7 +304,9 @@ databases are memory-mapped once at startup. Leave it on if you use it.
 inline CSS and JS, and its WASM kernels come from the gate's own static route
 (`--web`). There are no fonts, no images and no third-party requests, so the
 page cannot be slower than the gate. `sha256` in WASM is the fast path; pure
-JavaScript is the fallback and is several times slower on a phone.
+JavaScript is the fallback and is several times slower on a phone. The fallback
+is automatic when WebAssembly is unavailable, and `#pure-js` on the challenge
+URL forces it (the fragment is never sent to the server).
 
 ## Making the gate fast
 

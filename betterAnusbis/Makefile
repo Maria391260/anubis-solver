@@ -88,7 +88,13 @@ test-valkey: betterAnusbis
 test-s3: betterAnusbis
 	python3 tests_s3.py
 
+# The page's pure-JavaScript solvers: SHA-256 against node:crypto, plus the
+# sha256 (both nonce byte orders, with and without WebAssembly) and fast/slow
+# paths through the extracted page script. No browser, no gate.
+test-js:
+	node tests_js_sha256.mjs
+
 clean:
 	rm -f betterAnusbis
 
-.PHONY: clean wasm-kernels slow test-parity test-http23 test-valkey test-s3
+.PHONY: clean wasm-kernels slow test-parity test-http23 test-valkey test-s3 test-js
