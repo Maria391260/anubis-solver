@@ -1,0 +1,151 @@
+{
+  "date": "2026-11-15",
+  "host": "GPU 0: Tesla T4 (UUID: GPU-6de12512-60cb-22ef-15ce-e4d3fb1bd04a)\nGPU 1: Tesla T4 (UUID: GPU-403c96a7-a34e-96b3-f213-3e27550c0119)",
+  "nvcc": "Cuda compilation tools, release 13.0, V13.0.88\nBuild cuda_13.0.r13.0/compiler.36424714_0",
+  "commit": "19293d0 cuda: copy each device's rows from their real offset",
+  "source": "kaggle monktelv31/anubis-t4-tensor, kernel version 3",
+  "note": "wall-clock per solve via anubis_solve_tensor; +verify is the default (CPU re-check)",
+  "one_t4": {
+    "date": "2026-11-15",
+    "host": "77b7613921be",
+    "gpu": "CUDA: Tesla T4",
+    "cuda_tensor": true,
+    "cuda_visible_devices": "0",
+    "python": "3.13.16",
+    "challenge": "9f2c1b4a7e5d3c0b8a1f6e2d4c7b0a9f5e3d1c8b7a6f4e2d1c0b9a8f7e6d5c4b",
+    "rows": [
+      {
+        "difficulty": 2,
+        "n": 128,
+        "macs": 4194304,
+        "gpu_ms": 0.6007929999896078,
+        "gpu_gmacs": 6.981279742061827,
+        "gpu_verify_ms": 1.6756760000191662,
+        "cpu_ms": 1.0027214999865919,
+        "cpu_gmacs": 4.182920182778653,
+        "digest": "31f62ad34da2702253a4ca7934d71a0826ccad5858a1d7edc22c6183cf0b1dd5",
+        "speedup_vs_cpu": 1.6689966427770238
+      },
+      {
+        "difficulty": 4,
+        "n": 256,
+        "macs": 33554432,
+        "gpu_ms": 1.6981020000059743,
+        "gpu_gmacs": 19.759962593461378,
+        "gpu_verify_ms": 5.672717999999577,
+        "cpu_ms": 3.9417524999976195,
+        "cpu_gmacs": 8.51256693565115,
+        "digest": "c116914f2091934434ed98d9f291b918931575b6491dba1f3dbb32975b80617f",
+        "speedup_vs_cpu": 2.321269570369596
+      },
+      {
+        "difficulty": 8,
+        "n": 512,
+        "macs": 268435456,
+        "gpu_ms": 5.875838999997995,
+        "gpu_gmacs": 45.68461729466917,
+        "gpu_verify_ms": 23.9777150000009,
+        "cpu_ms": 17.416773500016802,
+        "cpu_gmacs": 15.412467527337427,
+        "digest": "bcf296aa0e7936bac81a5092d20ac155ed1ce7df86d90b33e45ad9e39d2c9b84",
+        "speedup_vs_cpu": 2.9641338879473627
+      },
+      {
+        "difficulty": 12,
+        "n": 768,
+        "macs": 905969664,
+        "gpu_ms": 15.938291999987086,
+        "gpu_gmacs": 56.84233065881426,
+        "gpu_verify_ms": 62.88780300002372,
+        "cpu_ms": 47.83430900000951,
+        "cpu_gmacs": 18.939746030402986,
+        "digest": "de7d881b8af1d5109a782d13c0855e189e492c086c7dd43931347704743724a1",
+        "speedup_vs_cpu": 3.001219264902931
+      },
+      {
+        "difficulty": 16,
+        "n": 1024,
+        "macs": 2147483648,
+        "gpu_ms": 29.640834000019822,
+        "gpu_gmacs": 72.45017626692163,
+        "gpu_verify_ms": 127.36456799999019,
+        "cpu_ms": 100.50189599999726,
+        "cpu_gmacs": 21.36759338351247,
+        "digest": "1c1ae7337bd5ec2d2709153fe8dc615aabe81dd6efd257b80d8c8c5d7f37a372",
+        "speedup_vs_cpu": 3.390656821597194
+      }
+    ]
+  },
+  "two_t4": {
+    "date": "2026-11-15",
+    "host": "77b7613921be",
+    "gpu": "CUDA: Tesla T4 x2",
+    "cuda_tensor": true,
+    "cuda_visible_devices": "0,1",
+    "python": "3.13.16",
+    "challenge": "9f2c1b4a7e5d3c0b8a1f6e2d4c7b0a9f5e3d1c8b7a6f4e2d1c0b9a8f7e6d5c4b",
+    "rows": [
+      {
+        "difficulty": 2,
+        "n": 128,
+        "macs": 4194304,
+        "gpu_ms": 0.9123510000108581,
+        "gpu_gmacs": 4.597248208145858,
+        "gpu_verify_ms": 2.0527690000164966,
+        "cpu_ms": 1.0863480000011805,
+        "cpu_gmacs": 3.860921178108159,
+        "digest": "31f62ad34da2702253a4ca7934d71a0826ccad5858a1d7edc22c6183cf0b1dd5",
+        "speedup_vs_cpu": 1.1907127848692571
+      },
+      {
+        "difficulty": 4,
+        "n": 256,
+        "macs": 33554432,
+        "gpu_ms": 1.986575000017865,
+        "gpu_gmacs": 16.890594112831508,
+        "gpu_verify_ms": 5.8817820000172105,
+        "cpu_ms": 4.126927000001501,
+        "cpu_gmacs": 8.130609531011281,
+        "digest": "c116914f2091934434ed98d9f291b918931575b6491dba1f3dbb32975b80617f",
+        "speedup_vs_cpu": 2.0774081018659696
+      },
+      {
+        "difficulty": 8,
+        "n": 512,
+        "macs": 268435456,
+        "gpu_ms": 6.060618000020668,
+        "gpu_gmacs": 44.29176298507588,
+        "gpu_verify_ms": 24.463710000020455,
+        "cpu_ms": 17.338694500011798,
+        "cpu_gmacs": 15.481872409702897,
+        "digest": "bcf296aa0e7936bac81a5092d20ac155ed1ce7df86d90b33e45ad9e39d2c9b84",
+        "speedup_vs_cpu": 2.8608789565606463
+      },
+      {
+        "difficulty": 12,
+        "n": 768,
+        "macs": 905969664,
+        "gpu_ms": 16.295793000011827,
+        "gpu_gmacs": 55.59531002875052,
+        "gpu_verify_ms": 63.86534300000335,
+        "cpu_ms": 49.62725699999737,
+        "cpu_gmacs": 18.25548536764883,
+        "digest": "de7d881b8af1d5109a782d13c0855e189e492c086c7dd43931347704743724a1",
+        "speedup_vs_cpu": 3.0454030067736717
+      },
+      {
+        "difficulty": 16,
+        "n": 1024,
+        "macs": 2147483648,
+        "gpu_ms": 29.059007000000747,
+        "gpu_gmacs": 73.90079254944757,
+        "gpu_verify_ms": 123.84570000000394,
+        "cpu_ms": 99.41669449999324,
+        "cpu_gmacs": 21.600835340589057,
+        "digest": "1c1ae7337bd5ec2d2709153fe8dc615aabe81dd6efd257b80d8c8c5d7f37a372",
+        "speedup_vs_cpu": 3.421200679706319
+      }
+    ]
+  },
+  "tests": "dent reference d=2\n\n36 passed, 0 failed\n"
+}

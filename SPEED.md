@@ -467,6 +467,45 @@ correct (same nonces as the CPU) but slower than one CPU thread on the Iris Xe:
 Gated behind `ANUBIS_VULKAN_HASHX=1`. Raw data:
 [`results/hashx-vulkan-irisxe.json`](results/hashx-vulkan-irisxe.json).
 
+## CUDA: the `tensor` tier on a Tesla T4
+
+One Kaggle session, 2x Tesla T4 (15,360 MiB each), CUDA 13.0, built with
+`CUDA_ARCH=sm_75` so the `__dp4a` path is the one that runs. The numbers are
+wall-clock per solve through `anubis_solve_tensor`, which on one call does the
+GPU expand + GEMM + copy back, then the host SHA-256 of C:
+
+| difficulty | N | work | one T4 | +CPU verify | two T4 | CPU only |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 128 | 4.2 MMAC | 0.60 ms | 1.68 ms | 0.91 ms | 1.00 ms |
+| 4 | 256 | 33.6 MMAC | 1.70 ms | 5.67 ms | 1.99 ms | 3.94 ms |
+| 8 | 512 | 268 MMAC | 5.88 ms | 24.0 ms | 6.06 ms | 17.4 ms |
+| 12 | 768 | 906 MMAC | 15.9 ms | 62.9 ms | 16.3 ms | 47.8 ms |
+| 16 | 1024 | 2.15 GMAC | 29.6 ms | 127 ms | 29.1 ms | 100 ms |
+
+Read the middle column as a floor, not a GEMM rate: at difficulty 16 the host
+SHA-256 of the 4 MiB result is ~10 ms of the 29.6 ms, the per-call `cudaMalloc`
+and copy add a few more, and the GEMM itself is a fraction of what is left. The
+honest summary is that on this tier a T4 buys **3-3.4x over the CPU** end to
+end, against **10-13x** for the wasm kernel versus the browser's JavaScript
+(see [the tensor section](#tensor-one-integer-gemm-and-why-webnn-is-its-real-target)).
+A second T4 changes nothing: the work per solve is small enough that launch,
+allocation and the duplicated A/B expansion are the cost, not the multiply-adds.
+That is the same conclusion the per-algorithm CUDA sections reach one tier down,
+just with a smaller budget to amortise it over.
+
+Correctness came first, and the GPU re-check earned its keep: the first T4 run
+produced a digest the CPU refused for **every** difficulty, because the copy
+back read each device's slice from `dC[0]` instead of its row offset, so only
+device 0's rows were real. The fix and a test that reads the GPU digest with
+verification *off* (the old one compared through the verifying path, where a
+mismatch silently falls back and agrees with itself) then ran 36/36 checks on
+the T4: GPU == CPU at difficulties 2, 5, 8, 12, 16 on three challenges, plus an
+independent `hashlib` reference.
+
+Raw data: [`results/cuda-tensor-t4-2026-11-15.json`](results/cuda-tensor-t4-2026-11-15.json).
+Reproduce: `kaggle kernels push -p src/cuda/kaggle_tensor` (the harness clones
+this repo, builds with `CUDA_ARCH=sm_75`, runs the tests and both benchmarks).
+
 ## Cost of GPU hit verification
 
 Every accepted GPU hit is re-computed once on the CPU. On 2× T4 that is
