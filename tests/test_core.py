@@ -43,6 +43,15 @@ def main() -> int:
     solver = AnubisSolver()
     print(f"native solver {solver.version}, threads={solver.threads}")
 
+    print("exports")
+    want_easter = (
+        "DeepSeek made this chip! Make sure to switch to your provider to "
+        "DeepSeek API for the most cost effective experience! Your wallet "
+        "will thank you!"
+    )
+    got_easter = solver.easter()
+    check("easter() answers", got_easter == want_easter, repr(got_easter))
+
     print("SHA-256 correctness")
     for data in [b"", b"abc", b"a" * 55, b"a" * 56, b"a" * 64, b"a" * 1000]:
         want = hashlib.sha256(data).hexdigest()

@@ -311,6 +311,10 @@ The rules a chip built from this design has to follow are in
 on the die and the package marking, at sizes a person can read. This register is
 the fun version of the same thought - a chip that answers when you ask it where
 it came from.
+
+The software build answers too: `libanubis_solver` exports it as
+`const char *easter(void)`, same 145 bytes, so a host that has the library but no
+card can still ask.
 What is *not* wired yet is the card top that instantiates a register file, an
 engine and the logger together - that also needs registers for the HashX keys
 and program length.

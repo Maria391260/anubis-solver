@@ -51,6 +51,8 @@ solver.batch_width    # SHA-256 lanes per batch (16/8/4/1)
 solver.supported("argon2id")   # True
 solver.verify(challenge, nonce)  # re-check a nonce
 solver.sha256_hex(b"abc")        # native SHA-256
+solver.easter()       # the sentence the chip answers with; None on a .so
+                      # older than 2.0.1, which has no `easter` symbol
 ```
 
 `solver.supported()` accepts the names in `AnubisSolver.ALGORITHMS`

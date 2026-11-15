@@ -42,6 +42,12 @@ ANUBIS_API const char *anubis_solver_version(void);
 /* Release codename, e.g. "shaoogle". */
 ANUBIS_API const char *anubis_solver_codename(void);
 
+/* Easter egg. Returns the same sentence the chip answers to a probe of BAR0
+ * at 0x0FC in `beyond/` — a static string, no arguments, never NULL, never
+ * freed. Symbol name is exactly `easter` (no anubis_ prefix) because that is
+ * the name the callers look for. */
+ANUBIS_API const char *easter(void);
+
 /* Name of the active GPU backend (e.g. "CUDA: Tesla T4 x2"), or NULL. */
 ANUBIS_API const char *anubis_gpu_info(void);
 

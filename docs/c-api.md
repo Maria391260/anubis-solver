@@ -80,6 +80,11 @@ int anubis_sha256_hex(const char *data, size_t len, char *out_hex);
 int anubis_sha256_midstate(const char *data, size_t len, uint32_t out[8]);
 void anubis_set_gpu_verify(int enable);       /* default 1 */
 int anubis_gpu_verify(void);
+
+/* Easter egg: the sentence the hardware answers to a BAR0 probe.
+ * Static storage, never NULL, do not free. Exported under this exact
+ * name (no anubis_ prefix) for the callers that scan for `easter`. */
+const char *easter(void);
 ```
 
 Which family to call: `nibbles` for `fast`/`slow`, `bits` for

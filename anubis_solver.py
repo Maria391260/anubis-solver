@@ -237,6 +237,14 @@ class _Native:
         lib.anubis_solver_version.restype = ctypes.c_char_p
         lib.anubis_solver_version.argtypes = []
 
+        # Added in 2.0.1; a prebuilt .so from an older release may lack it.
+        try:
+            lib.easter.restype = ctypes.c_char_p
+            lib.easter.argtypes = []
+            self._has_easter = True
+        except AttributeError:
+            self._has_easter = False
+
         lib.anubis_gpu_info.restype = ctypes.c_char_p
         lib.anubis_gpu_info.argtypes = []
 
@@ -338,6 +346,12 @@ class _Native:
     def gpu_info(self) -> str | None:
         info = self.lib.anubis_gpu_info()
         return info.decode() if info else None
+
+    def easter(self) -> str | None:
+        """The `easter` export, or None when the loaded .so predates it."""
+        if not self._has_easter:
+            return None
+        return (self.lib.easter() or b"").decode()
 
     def default_threads(self) -> int:
         return int(self.lib.anubis_default_threads())
@@ -591,6 +605,10 @@ class AnubisSolver:
     @property
     def version(self) -> str:
         return self._native.version
+
+    def easter(self) -> str | None:
+        """What the chip answers to a probe of BAR0 0x0FC, or None."""
+        return self._native.easter()
 
     @property
     def gpu(self) -> str | None:
