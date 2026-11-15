@@ -500,9 +500,9 @@ static double median(double *v, int n) {
     return v[n / 2];
 }
 
-static int bench_one(int difficulty, const char *challenge, int rounds,
-                     int verify, int json) {
-    int n = tensor_dim(difficulty);
+static int bench_one(int difficulty, int n_override, const char *challenge,
+                     int rounds, int verify, int json) {
+    int n = n_override > 0 ? n_override : tensor_dim(difficulty);
     size_t cells = (size_t)n * (size_t)n;
     uint8_t *a = malloc(cells);
     int8_t *b = malloc(cells);
@@ -544,6 +544,11 @@ static int bench_one(int difficulty, const char *challenge, int rounds,
 
     if (verify) {
         ref = malloc(cells * sizeof *ref);
+        if (ref == NULL) {
+            verify = 0;
+        }
+    }
+    if (verify) {
         cpu_gemm(a, b, ref, n);
         digest_of(ref, n, cpu_hex);
         ok = strcmp(gpu_hex, cpu_hex) == 0;
@@ -557,9 +562,11 @@ static int bench_one(int difficulty, const char *challenge, int rounds,
         if (json) {
             printf("{\"difficulty\":%d,\"n\":%d,\"macs\":%.0f,\"compile_ms\":%.2f,"
                    "\"upload_ms\":%.2f,\"execute_ms\":%.4f,\"e2e_ms\":%.4f,"
+                   "\"io_ms\":%.4f,"
                    "\"gmacs_execute\":%.2f,\"gmacs_e2e\":%.2f,\"digest_ok\":%s,"
                    "\"digest\":\"%s\"}\n",
                    difficulty, n, macs, compile_ms, upload_ms, exec_ms, t_e2e,
+                   t_e2e - exec_ms,
                    macs / (exec_ms / 1000.0) / 1e9,
                    macs / (t_e2e / 1000.0) / 1e9, ok ? "true" : "false", gpu_hex);
         } else {
@@ -592,7 +599,7 @@ static int bench_one(int difficulty, const char *challenge, int rounds,
 int main(int argc, char **argv) {
     const char *lib = getenv("LIBTPU");
     const char *challenge = DEFAULT_CHALLENGE;
-    int rounds = 5, verify = 1, json = 0;
+    int rounds = 5, verify = 1, json = 0, n_override = 0;
     int diffs[16], ndiffs = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -609,6 +616,12 @@ int main(int argc, char **argv) {
                 s = strchr(s, ',');
                 if (s != NULL) s++;
             }
+        } else if (strcmp(argv[i], "--n") == 0 && i + 1 < argc) {
+            n_override = atoi(argv[++i]);
+            if (n_override % 64 != 0 || n_override < 64) {
+                fprintf(stderr, "--n must be a positive multiple of 64\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--no-verify") == 0) {
             verify = 0;
         } else if (strcmp(argv[i], "--json") == 0) {
@@ -616,7 +629,7 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr,
                     "usage: %s --lib /path/libtpu.so [--difficulty 4,8,12,16] "
-                    "[--rounds 5] [--challenge HEX] [--no-verify] [--json]\n",
+                    "[--n N] [--rounds 5] [--challenge HEX] [--no-verify] [--json]\n",
                     argv[0]);
             return 2;
         }
@@ -640,7 +653,7 @@ int main(int argc, char **argv) {
     }
     int rc = 0;
     for (int i = 0; i < ndiffs; i++) {
-        int r = bench_one(diffs[i], challenge, rounds, verify, json);
+        int r = bench_one(diffs[i], n_override, challenge, rounds, verify, json);
         if (r != 0) {
             rc = r;
         }
