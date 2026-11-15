@@ -506,6 +506,60 @@ Raw data: [`results/cuda-tensor-t4-2026-11-15.json`](results/cuda-tensor-t4-2026
 Reproduce: `kaggle kernels push -p src/cuda/kaggle_tensor` (the harness clones
 this repo, builds with `CUDA_ARCH=sm_75`, runs the tests and both benchmarks).
 
+## TPU: the `tensor` tier through PJRT, no Python
+
+One Colab TPU v5e-1 (single chip), libtpu 0.0.50, PJRT API 0.116, driven by
+`src/google/tpu/tensor_pjrt.c`: plain C, `dlopen` the plugin, `GetPjrtApi`,
+`PJRT_Plugin_Initialize`, client, buffers, execute. No Python anywhere in the
+measurement path.
+
+The tier's dot is `stablehlo.dot_general` on `tensor<NxNxi8>` pairs producing
+`tensor<NxNxi32>`. That combination is legal in practice even though StableHLO's
+spec (C20) says the result element type must equal the operands': the TPU
+backend accepts the widening dot and runs it on the MXU. Two details cost real
+time to find and are worth writing down: the plugin must be initialized *before*
+`Client_Create` (otherwise libtpu aborts with `InitGoogle() has not finished
+yet`), and an empty `compile_options` means zero replicas, which the TPU backend
+refuses (`Requested total cores: 0`). The fix is six bytes of
+`CompileOptionsProto` with `num_replicas=1, num_partitions=1`.
+
+| difficulty | N | execute | execute rate | end-to-end | e2e rate |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 256 | 0.173 ms | 194 GMAC/s | 1.37 ms | 24 GMAC/s |
+| 8 | 512 | 0.217 ms | 1.24 TMAC/s | 4.74 ms | 57 GMAC/s |
+| 12 | 768 | 0.222 ms | 4.08 TMAC/s | 10.2 ms | 89 GMAC/s |
+| 16 | 1024 | 0.239 ms | 8.99 TMAC/s | 17.8 ms | 121 GMAC/s |
+
+Every one of those digests matched the plain-C i-k-j reference exactly, so the
+TPU's int32 accumulation and the copy-back layout agree with the engine.
+
+Execute is flat at ~0.2 ms while the work grows 64x across that table, which
+means the tier's sizes are launch-bound and the "execute rate" above is a
+ceiling implied by the overhead, not the chip. Two bigger dots, run separately
+and honestly marked unverified (the C reference at N=4096 is ~1 minute
+single-threaded), show the silicon:
+
+| N | work | execute | rate |
+|---:|---:|---:|---:|
+| 2048 | 17.2 GMAC | 0.421 ms | 40.8 TMAC/s |
+| 4096 | 137 GMAC | 0.763 ms | **180 TMAC/s** |
+
+180 TMAC/s is ~91% of a v5e chip's int8 spec, so the multiply-adds are not the
+constraint at any size the tier uses. What is, is the return path: at N=4096
+`e2e` is 294 ms of which 293 ms is copy back plus the host SHA-256 of a 64 MiB
+result (`io_ms` in the JSON). That is the same shape of result the T4 produced
+one order of magnitude down: the accelerated GEMM is no longer the cost, and a
+tier that wants to be proof-of-compute rather than proof-of-bandwidth has to
+hash on the device too.
+
+For scale, the same dot is 8.1 GMAC/s in the browser's wasm kernel, 72 GMAC/s
+end-to-end on a T4 and ~21 GMAC/s on the CPU reference, so the TPU's executed
+dot is about 22,000x the wasm kernel and about 8,500x the CPU.
+
+Raw data: [`results/tensor-tpu-2026-11-15.json`](results/tensor-tpu-2026-11-15.json).
+Reproduce: `cc -O2 -I. -o tensor_pjrt tensor_pjrt.c -ldl` then
+`./tensor_pjrt --lib /path/libtpu.so --difficulty 4,8,12,16 --rounds 5`.
+
 ## Cost of GPU hit verification
 
 Every accepted GPU hit is re-computed once on the CPU. On 2× T4 that is

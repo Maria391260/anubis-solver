@@ -1,0 +1,76 @@
+{
+  "date": "2026-11-15",
+  "platform": "Google Colab, TPU v5e-1 (1 chip), PJRT 0.116, libtpu 0.0.50",
+  "program": "src/google/tpu/tensor_pjrt.c (C, PJRT C API, StableHLO dot s8xs8->s32)",
+  "note": "tier rows ran with the CPU reference enabled and matched; peak rows used --no-verify because the reference at N=4096 is ~1 minute single-threaded, so those digests are printed for reproduction, not asserted",
+  "tier": [
+    {
+      "difficulty": 4,
+      "n": 256,
+      "execute_ms": 0.1728,
+      "e2e_ms": 1.3727,
+      "gmacs_execute": 194.2,
+      "gmacs_e2e": 24.4,
+      "verified": true
+    },
+    {
+      "difficulty": 8,
+      "n": 512,
+      "execute_ms": 0.2166,
+      "e2e_ms": 4.7361,
+      "gmacs_execute": 1239.1,
+      "gmacs_e2e": 56.7,
+      "verified": true
+    },
+    {
+      "difficulty": 12,
+      "n": 768,
+      "execute_ms": 0.2222,
+      "e2e_ms": 10.2241,
+      "gmacs_execute": 4077.1,
+      "gmacs_e2e": 88.6,
+      "verified": true
+    },
+    {
+      "difficulty": 16,
+      "n": 1024,
+      "execute_ms": 0.2388,
+      "e2e_ms": 17.7888,
+      "gmacs_execute": 8993.2,
+      "gmacs_e2e": 120.7,
+      "verified": true
+    }
+  ],
+  "peak": [
+    {
+      "difficulty": 8,
+      "n": 2048,
+      "macs": 17179869184,
+      "compile_ms": 870.54,
+      "upload_ms": 0.71,
+      "execute_ms": 0.4214,
+      "e2e_ms": 69.7661,
+      "io_ms": 69.3447,
+      "gmacs_execute": 40768.56,
+      "gmacs_e2e": 246.25,
+      "digest_ok": true,
+      "verified": false,
+      "digest": "9766d8861c9ba1d03c22eadc36f3dfbd9c83295774ada930747ed6e3ceea657e"
+    },
+    {
+      "difficulty": 8,
+      "n": 4096,
+      "macs": 137438953472,
+      "compile_ms": 1955.96,
+      "upload_ms": 2.31,
+      "execute_ms": 0.7629,
+      "e2e_ms": 293.8631,
+      "io_ms": 293.1002,
+      "gmacs_execute": 180162.75,
+      "gmacs_e2e": 467.7,
+      "digest_ok": true,
+      "verified": false,
+      "digest": "01dbb60629de73ec4fc0472506f30a18dc53f4414d02098b2a7d7424ff27faae"
+    }
+  ]
+}
