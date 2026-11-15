@@ -37,7 +37,8 @@ HASH  := $(B2) rtl/blake2b/h0.v rtl/blake2b/h_prime.v
 ARGON := rtl/argon2/argon2_fill.v rtl/argon2/argon2_index.v rtl/argon2/argon2_addr.v
 HASHX := rtl/hashx/sipround.v rtl/hashx/hashx_prf.v rtl/hashx/hashx_exec.v \
          rtl/hashx/hashx_top.v
-PERIPH := rtl/periph/uart_tx.v rtl/periph/uart_log.v rtl/periph/axil_regs.v
+PERIPH := rtl/periph/uart_tx.v rtl/periph/uart_log.v rtl/periph/axil_regs.v \
+          rtl/periph/deepseek_egg.v
 # serial host interface + the self-test engine
 SERIO  := rtl/periph/spi_slave.v rtl/periph/uart_rx.v
 # doctor.v itself plus the one real datapath it needs that TRI does not already
@@ -55,7 +56,8 @@ TRI := rtl/top/anubis_tri_chip.v rtl/argon2/argon2_mpipe.v \
 # the whole card: engine array + eight HBM3e stacks + BAR0 + UART
 CARD := rtl/top/anubis_argon2_card.v rtl/argon2/argon2_mpipe.v \
         rtl/mem/hbm3e_mem.v rtl/mem/hbm3_model.v \
-        rtl/periph/uart_tx.v rtl/periph/uart_log.v rtl/periph/axil_regs.v
+        rtl/periph/uart_tx.v rtl/periph/uart_log.v rtl/periph/axil_regs.v \
+        rtl/periph/deepseek_egg.v
 HASHX_REF := ../src/hashx
 ENGINE := rtl/argon2/argon2_engine.v $(ARGON) $(HASH)
 
@@ -64,15 +66,20 @@ ENGINE := rtl/argon2/argon2_engine.v $(ARGON) $(HASH)
 TBS := tb_sha256 tb_pow tb_lpddr6 tb_argon2_fill tb_blake2b tb_blake2b_stream \
        tb_h_prime tb_h0 tb_argon2_addr tb_argon2_index tb_argon2_engine \
        tb_hashx tb_uart tb_axil tb_argon2_card tb_tri_chip \
-       tb_spi tb_doctor tb_tri_chip_cmd
+       tb_spi tb_doctor tb_tri_chip_cmd tb_deepseek_egg
 
-  .PHONY: all sim $(TBS) run-all pow argon blake2b stream hprime h0 addr index engine \
+  .PHONY: all sim $(TBS) run-all egg pow argon blake2b stream hprime h0 addr index engine \
         hashx solve solve-hashx mpipe vectors vl64 vlreal synth area clean \
         sync hbm3e-capacity hbm3e-mpipe card-argon2 card-argon2-max tri-chip \
         spi spi-all doctor tri-chip-cmd bench
 .DEFAULT_GOAL := all
 
 all: sim
+
+# Regenerate the secret-call ROM and its test vector from the text in the
+# generator. The output is checked in, like every other generated file here.
+egg:
+	$(PY) tools/gen_deepseek_egg.py
 
 # one phony run target per testbench, so `make -jN sim` runs them concurrently
 sim: $(addprefix run-,$(TBS))
@@ -132,8 +139,15 @@ $(B)/gen_hashx_vectors: tools/gen_hashx_vectors.c $(HASHX_REF)/hashx.c | $(B)
 $(B)/tb_uart: tb/tb_uart.v $(PERIPH) | $(B)
 	$(IVERILOG) -g2012 -o $@ tb/tb_uart.v rtl/periph/uart_log.v rtl/periph/uart_tx.v
 
-$(B)/tb_axil: tb/tb_axil.v rtl/periph/axil_regs.v | $(B)
-	$(IVERILOG) -g2012 -o $@ tb/tb_axil.v rtl/periph/axil_regs.v
+$(B)/tb_axil: tb/tb_axil.v rtl/periph/axil_regs.v rtl/periph/deepseek_egg.v | $(B)
+	$(IVERILOG) -g2012 -o $@ tb/tb_axil.v rtl/periph/axil_regs.v \
+	    rtl/periph/deepseek_egg.v
+
+# the secret call on its own: every word, the padding, and the addresses it
+# must not capture
+$(B)/tb_deepseek_egg: tb/tb_deepseek_egg.v rtl/periph/deepseek_egg.v \
+                      vectors/deepseek_egg.txt | $(B)
+	$(IVERILOG) -g2012 -o $@ tb/tb_deepseek_egg.v rtl/periph/deepseek_egg.v
 
 # One target owns the file. Four recipes used to regenerate it in parallel and
 # tb_hashx would occasionally read a half-written vector file.

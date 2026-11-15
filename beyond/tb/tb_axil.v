@@ -128,6 +128,15 @@ module tb_axil;
         end
         $display("  8 digest words read back");
 
+        // ---- the secret call ----------------------------------------------
+        read_reg(32'h0FC, rd);
+        if (rd !== 32'hDEED5EED) begin $display("FAIL: egg SIG = %08x", rd); $finish; end
+        read_reg(32'h060, rd);
+        if (rd !== 32'h70656544) begin $display("FAIL: egg word0 = %08x", rd); $finish; end
+        read_reg(32'h100, rd);
+        if (rd !== 32'hDEAD0000) begin $display("FAIL: 0x100 = %08x", rd); $finish; end
+        $display("  secret call: SIG %08x, word0 \"%08x\" (\"Deep\")", 32'hDEED5EED, 32'h70656544);
+
         $display("tb_axil: BAR0 register block behaves");
         $finish;
     end

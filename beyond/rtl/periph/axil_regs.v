@@ -16,6 +16,8 @@
 //   0x018 W  CHALLENGE_DATA  word written at CH_INDEX*4, index auto-increments
 //   0x01C RW CH_INDEX
 //   0x040..0x05C R RESULT0..7   the 32-byte digest, little-endian words
+//   0x060..0x0F3 R EASTER EGG  see rtl/periph/deepseek_egg.v; the message and
+//                               its signature register at 0x0FC
 //
 // A write to CTRL with start set raises a one-cycle start pulse; the card's
 // engine uses that to begin a search.
@@ -79,9 +81,23 @@ module axil_regs (
     wire [31:0] tag_word = tag[s_axil_araddr[4:2] * 32 +: 32];
     wire        is_result = (s_axil_araddr >= 32'h40) && (s_axil_araddr < 32'h60);
 
+    // ---- the secret call --------------------------------------------------
+    // Reading 0x060..0x0F3 returns the message; 0x0FC returns DEED5EED. A plain
+    // BAR0 sweep finds it, which is the point. Generated from the text in
+    // beyond/tools/gen_deepseek_egg.py.
+    wire [31:0] egg_rdata;
+    wire        egg_hit;
+    deepseek_egg u_egg (
+        .addr  (s_axil_araddr),
+        .rdata (egg_rdata),
+        .hit   (egg_hit)
+    );
+
     reg [31:0] rdata;
     always @(*) begin
-        case (rword)
+        if (egg_hit)
+            rdata = egg_rdata;
+        else case (rword)
             9'h00:   rdata = ID;
             9'h01:   rdata = ctrl;
             9'h02:   rdata = {16'd0, lz, 5'd0, hit, done, busy};

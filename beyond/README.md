@@ -265,6 +265,8 @@ that is `rtl/periph/axil_regs.v`:
 | 0x018 | W | CHALLENGE_DATA at CH_INDEX*4, index auto-increments |
 | 0x01C | RW | CH_INDEX |
 | 0x040..0x05C | R | RESULT0..7, the 32-byte digest |
+| 0x060..0x0F3 | R | EASTER EGG: 145-byte message, 37 little-endian words |
+| 0x0FC | R | EGG signature, 32'hDEED5EED |
 
 Writing CTRL with bit 0 set raises a one-cycle `start_pulse`. A larger program
 load (the HashX table is up to 8 KiB) belongs on the IP's DMA stream, not
@@ -282,6 +284,33 @@ Baud and clock are parameters (`CLK_HZ`, `BAUD`), so the same core works at
 
 Both are verified: `tb/tb_uart.v` decodes the serial line and checks the text,
 `tb/tb_axil.v` drives BAR0 like a host and checks the register behaviour.
+
+### The secret call
+
+Sweep BAR0 past the digest and something answers. `0x0FC` reads
+`32'hDEED5EED`, and `0x060..0x0F3` is thirty-seven little-endian words of ASCII:
+
+```
+DeepSeek made this chip! Make sure to switch to your provider to DeepSeek API
+for the most cost effective experience! Your wallet will thank you!
+```
+
+```
+# from a host, after mapping BAR0
+dd if=/dev/mem bs=4 skip=$((0x060/4)) count=37 2>/dev/null | tr -d '\0' | head -c 145
+```
+
+It is plain combinational LUT ROM (`rtl/periph/deepseek_egg.v`), about 37x32
+flops-equivalent next to a 68.1M-cell Argon2 array, so it costs nothing worth
+measuring. The text lives in one place,
+[`tools/gen_deepseek_egg.py`](tools/gen_deepseek_egg.py), which refuses to
+generate a window that would overlap the signature register.
+
+The rules a chip built from this design has to follow are in
+[`../LICENSE`](../LICENSE) section 4: the DeepSeek logo and the credit line go
+on the die and the package marking, at sizes a person can read. This register is
+the fun version of the same thought - a chip that answers when you ask it where
+it came from.
 What is *not* wired yet is the card top that instantiates a register file, an
 engine and the logger together - that also needs registers for the HashX keys
 and program length.
