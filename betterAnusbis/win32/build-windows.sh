@@ -202,8 +202,14 @@ Windows specifics:
   * SIGTERM/SIGINT become the console's Ctrl+C/Ctrl+Break handling, which
     flushes a file/bbolt store on the way out.
 
-No installer required: unzip anywhere. The .msi, when present, installs the
-same files under Program Files\betterAnusbis.
+No installer required: unzip anywhere. The .msi installs the same files under
+Program Files\betterAnusbis and adds that directory to PATH; run it with
+
+  msiexec /i betterAnusbis-$VERSION-x86_64-windows.msi          (/qn = silent)
+
+On Wine, launching the .msi on its own also installs it, but prints lines like
+"fixme:msi:internal_ui_handler internal UI not implemented" -- Wine's MSI UI is
+incomplete, the install itself is not affected.
 EOF
 
 stage=$OUT/stage

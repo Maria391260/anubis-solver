@@ -334,6 +334,7 @@ JavaScript is the fallback and is several times slower on a phone.
 | the gate says a rule "will never match" | the expression uses something outside the CEL subset; the message names the rule. |
 | `--bind-network unix` fails | the socket's directory must exist and be writable; the mode comes from `--socket-mode`. On Windows this also needs Windows 10 1803+ for AF_UNIX. |
 | `anubis_solver.dll was not found` (Windows) | the .exe and the .dll were separated. Keep them in one directory, or install the MSI. |
+| `fixme:msi:internal_ui_handler` when installing under Wine | Wine's MSI UI is incomplete, the install finishes anyway. `wine msiexec /i betterAnusbis-1.50.3-x86_64-windows.msi /qn` does the same quietly; on real Windows, double-clicking the MSI shows the normal progress UI. |
 | no `kill -HUP` on Windows | there is no SIGHUP; scrape `/metrics` (`--metrics-bind`) or restart. Ctrl+C flushes a `file:`/`bbolt:` store. |
 | browser cannot solve `argon2id`/`hashx` | `--web` does not point at the WASM kernels; the release archives do not include them, use a source checkout's `wasm/` directory. |
 | HTTPS target certificate fails (Windows) | point `SSL_CERT_FILE` at a PEM bundle, or rely on the Windows certificate store where OpenSSL's winstore support is available. |
