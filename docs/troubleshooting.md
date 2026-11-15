@@ -10,7 +10,7 @@ make                       # see the compiler error
 export ANUBIS_SOLVER_LIB=/absolute/path/to/libanubis_solver.so
 ```
 
-## The build skips CUDA / Level Zero / Vulkan
+## The build skips CUDA / Level Zero / Vulkan / OpenCL / TPU
 
 It is by design — a backend is only compiled when its headers/toolchain are
 present:
@@ -20,8 +20,11 @@ present:
 | CUDA | CUDA toolkit (`nvcc`), then `make` again |
 | Level Zero | `libze-dev`; build with `make L0_INC=/usr/include` (or wherever `level_zero/ze_api.h` lives) |
 | Vulkan | `libvulkan-dev` |
+| OpenCL | `ocl-icd-opencl-dev opencl-headers` |
+| TPU | nothing at build time; install `libtpu` or point `ANUBIS_TPU_LIB` at it at run time |
 
-`make clean && make` after installing.
+`make universal` prints one row per backend with the reason it was skipped;
+`make universal STRICT=1` fails instead. `make clean && make` after installing.
 
 ## `ANUBIS_GPU_ARGON2=1` does not speed anything up
 

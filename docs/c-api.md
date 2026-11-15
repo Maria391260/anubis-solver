@@ -85,7 +85,25 @@ int anubis_gpu_verify(void);
  * Static storage, never NULL, do not free. Exported under this exact
  * name (no anubis_ prefix) for the callers that scan for `easter`. */
 const char *easter(void);
+
+/* Backend inventory. One .so can carry CUDA, Level Zero, Vulkan, OpenCL, TPU
+ * and the CPU at once; these say which are in it and which work here. */
+#define ANUBIS_BACKEND_CPU       0x01   /* always */
+#define ANUBIS_BACKEND_CUDA      0x02
+#define ANUBIS_BACKEND_LEVELZERO 0x04   /* Intel Xe */
+#define ANUBIS_BACKEND_VULKAN    0x08
+#define ANUBIS_BACKEND_OPENCL    0x10
+#define ANUBIS_BACKEND_TPU       0x20
+int anubis_backends_compiled(void);       /* bitmask, no probing */
+int anubis_backends_available(void);      /* bitmask, probes once and caches */
+const char *anubis_backend_name(int backend);  /* "cpu", "cuda", ... or NULL */
 ```
+
+`anubis_backends_available()` touches the drivers, so call it once and keep the
+mask; the first call can take a second on a cold Vulkan or OpenCL stack.
+`anubis_backend_name()` takes a **single** bit and returns NULL for anything
+else. `anubis_gpu_info()` is the one-line description of the backend that would
+be used first.
 
 Which family to call: `nibbles` for `fast`/`slow`, `bits` for
 `sha256`/`wasm-sha256`, `argon2id`, `hashx` respectively, plus

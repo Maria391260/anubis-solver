@@ -52,7 +52,10 @@ solver.supported("argon2id")   # True
 solver.verify(challenge, nonce)  # re-check a nonce
 solver.sha256_hex(b"abc")        # native SHA-256
 solver.easter()       # the sentence the chip answers with; None on a .so
-                      # older than 2.0.1, which has no `easter` symbol
+                      # older than 2.0.2, which has no `easter` symbol
+solver.backends()             # ["cpu", "vulkan", "opencl"] - usable right now
+solver.backends_compiled()    # everything built into the .so
+print(solver.backend_report())  # the table the CLI prints with --backends
 ```
 
 `solver.supported()` accepts the names in `AnubisSolver.ALGORITHMS`

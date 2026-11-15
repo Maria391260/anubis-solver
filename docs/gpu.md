@@ -5,7 +5,39 @@ implementation; on a mismatch the search silently falls back to the CPU. The
 CPU is always built.
 
 Detection order for a given algorithm: **CUDA → Level Zero → Vulkan → OpenCL →
-CPU** (only the backends compiled into the library and present at runtime).
+TPU → CPU** (only the backends compiled into the library and present at
+runtime).
+
+## One file, every machine
+
+`make universal` compiles every backend whose toolchain/headers exist into one
+`libanubis_solver.so`, and the file loads anywhere because every vendor library
+is `dlopen()`ed:
+
+- CUDA is linked with `-cudart=static` (`CUDA_RUNTIME=static`, the default), so
+  `libcudart` is not a `DT_NEEDED`; with no NVIDIA driver the backend reports
+  "no device" instead of the loader failing.
+- Level Zero, Vulkan, OpenCL and the PJRT TPU plugin are resolved with
+  `dlopen()` at first use, each cached.
+- The Level Zero API header is vendored
+  (`src/intel/levelzero/level_zero/ze_api.h`), so no `libze-dev` is needed to
+  build the Intel path.
+
+`make universal` prints a row per backend (`yes`, or `no` with the reason);
+`make universal STRICT=1` turns a skip into an error. `make report` prints what
+the `.so` on disk contains, and `python3 anubis_solver.py --backends` prints the
+same table including what this machine can use right now.
+
+| backend | build time | runtime |
+|---|---|---|
+| CUDA | `nvcc` (CUDA toolkit) | NVIDIA driver; cudart is embedded |
+| Level Zero | vendored `ze_api.h` (or `libze-dev`) | `libze_loader.so.1`, Intel GPU driver + IGC |
+| Vulkan | `vulkan/vulkan.h` | `libvulkan.so.1` and an ICD (`mesa-vulkan-drivers`, vendor driver) |
+| OpenCL | `CL/cl.h` | `libOpenCL.so.1` and an ICD |
+| TPU | nothing | `libtpu.so`, found via `ANUBIS_TPU_LIB` or the loader path |
+
+If the headers are missing the backend is simply not compiled; see
+[troubleshooting.md](troubleshooting.md).
 
 ## Which flag for which algorithm
 
@@ -20,18 +52,6 @@ CPU** (only the backends compiled into the library and present at runtime).
 The Level Zero and Vulkan HashX kernels are correct but slower than the CPU on
 an Iris Xe, hence their separate flags.
 
-## Requirements
-
-| backend | build time | runtime |
-|---|---|---|
-| CUDA | `nvcc` (CUDA toolkit) | NVIDIA driver + `libcudart` |
-| Level Zero | `level_zero/ze_api.h` (`libze-dev`) | `libze_loader.so.1`, Intel GPU driver + IGC |
-| Vulkan | `vulkan/vulkan.h` | `libvulkan.so.1` and an ICD (`mesa-vulkan-drivers`, vendor driver) |
-| OpenCL | nothing extra | `libOpenCL.so.1` and an ICD |
-
-If the headers are missing the backend is simply not compiled; see
-[troubleshooting.md](troubleshooting.md).
-
 ## Useful environment variables
 
 | variable | effect |
@@ -40,6 +60,10 @@ If the headers are missing the backend is simply not compiled; see
 | `ANUBIS_NO_LEVELZERO` | disable Level Zero |
 | `ANUBIS_NO_VULKAN` | disable Vulkan |
 | `ANUBIS_NO_OPENCL` | disable OpenCL |
+| `ANUBIS_NO_TPU` | disable the TPU backend |
+| `ANUBIS_TPU_LIB` | path or soname of the PJRT plugin (`libtpu.so`) |
+| `ANUBIS_TPU_WINDOW` | nonces per TPU window (default 131072, max 262144) |
+| `ANUBIS_TPU_MIN_WORK` | minimum expected nonces before a TPU window is worth it (default 2^28: every new challenge pays a ~1.3 s StableHLO compile, so 2^16 would buy 0.2 ms of search with it) |
 | `ANUBIS_CPU_AFFINITY` | `pcores` (default), `off`, or a mask (`0,2,4,6`) |
 | `ANUBIS_CUDA_MIN_WORK` | minimum nonces before a CUDA launch is worth it |
 | `ANUBIS_L0_CHUNK`, `ANUBIS_VULKAN_CHUNK` | SHA-256 nonces per dispatch |

@@ -130,7 +130,8 @@ def main():
     elif mode == "tools":
         tools = ids[2]["result"]["tools"]
         names = [t["name"] for t in tools]
-        assert sorted(names) == ["anubis_fetch", "anubis_solve", "anubis_version"], names
+        assert sorted(names) == ["anubis_backends", "anubis_fetch",
+                                 "anubis_solve", "anubis_version"], names
         for tool in tools:
             assert tool["description"], tool["name"]
             schema = tool["inputSchema"]
@@ -150,19 +151,24 @@ def main():
         assert inner["algorithm"] == "tensor"
     elif mode == "version":
         inner = json.loads(tool_text(ids[5]))
-        assert inner["version"] == "2.0.1", inner["version"]
+        assert inner["version"] == "2.0.2", inner["version"]
         assert inner["codename"] == "shaoogle", inner["codename"]
         for alg in ("fast", "slow", "sha256", "wasm-sha256", "argon2id", "hashx",
                     "tensor"):
             assert alg in inner["algorithms"], alg
+    elif mode == "backends":
+        inner = json.loads(tool_text(ids[8]))
+        assert "cpu" in inner["compiled"], inner
+        assert set(inner["available"]) <= set(inner["compiled"]), inner
+        assert "cpu" in inner["available"], inner
     elif mode == "unknown":
         assert ids[6]["error"]["code"] == -32601
         assert "result" not in ids[6]
     elif mode == "ping":
         assert ids[7]["result"] == {}
     elif mode == "one_response_per_request":
-        assert len(lines) == 7, [r.get("id") for r in lines]
-        assert sorted(ids) == [1, 2, 3, 4, 5, 6, 7]
+        assert len(lines) == 8, [r.get("id") for r in lines]
+        assert sorted(ids) == [1, 2, 3, 4, 5, 6, 7, 8]
     elif mode == "malformed":
         assert lines[0]["id"] is None
         assert lines[0]["error"]["code"] == -32700
@@ -200,6 +206,7 @@ run_requests "$OUT1" \
     '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"anubis_version","arguments":{}}}' \
     '{"jsonrpc":"2.0","id":6,"method":"does/not/exist"}' \
     '{"jsonrpc":"2.0","id":7,"method":"ping"}' \
+    '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"anubis_backends","arguments":{}}}' \
     ''
 
 check() { # mode description
@@ -208,13 +215,14 @@ check() { # mode description
 
 check valid "stdout lines are all JSON-RPC 2.0 objects"
 check init "initialize returns protocolVersion 2024-11-05 and serverInfo.name anubis"
-check tools "tools/list lists exactly anubis_fetch, anubis_solve, anubis_version"
+check tools "tools/list lists exactly anubis_backends, anubis_fetch, anubis_solve, anubis_version"
 check solve_sha256 "anubis_solve sha256 difficulty 4 returns nonce and 64-hex response"
 check solve_tensor "anubis_solve tensor difficulty 2 returns nonce and 64-hex response"
-check version "anubis_version returns version 2.0.1 and codename shaoogle"
+check version "anubis_version returns version 2.0.2 and codename shaoogle"
+check backends "anubis_backends agrees with the library inventory"
 check unknown "unknown method returns JSON-RPC error -32601"
 check ping "ping returns an empty result"
-check one_response_per_request "notifications get no response (7 responses for 8 requests)"
+check one_response_per_request "notifications get no response (8 responses for 9 requests)"
 
 # --------------------------------------------------------------- parse error batch
 OUT2=$TMP/out2.jsonl

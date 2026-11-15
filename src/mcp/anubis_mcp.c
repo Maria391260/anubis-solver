@@ -26,7 +26,7 @@
 #include "anubis_fetch.h"
 
 #define SERVER_NAME "anubis"
-#define SERVER_VERSION "2.0.1"
+#define SERVER_VERSION "2.0.2"
 
 /* ------------------------------------------------------------------ strings */
 
@@ -940,21 +940,61 @@ static const char TOOLS_JSON[] =
     "{\"name\":\"anubis_version\","
     "\"description\":\"Return the solver version, release codename and supported "
     "algorithms.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
+    "{\"name\":\"anubis_backends\","
+    "\"description\":\"List the compute backends compiled into the solver and "
+    "which of them this machine can use right now (probes the hardware; can "
+    "take a second on a cold driver).\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}"
     "]}";
+
+/* Append the names of `mask` as a JSON array. */
+static void backend_json(char *out, size_t cap, int mask) {
+    static const int bits[] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20};
+    size_t i, used = 0;
+    int first = 1;
+    out[0] = '\0';
+    for (i = 0; i < sizeof bits / sizeof bits[0] && used + 24 < cap; i++) {
+        const char *name;
+        if (!(mask & bits[i])) {
+            continue;
+        }
+        name = anubis_backend_name(bits[i]);
+        if (name == NULL) {
+            continue;
+        }
+        used += (size_t)snprintf(out + used, cap - used, "%s\"%s\"",
+                                 first ? "" : ",", name);
+        first = 0;
+    }
+}
 
 static void tool_version(const json_value *id) {
     const char *version = anubis_solver_version();
     const char *codename = anubis_solver_codename();
-    char text[512];
+    char text[1024];
+    char compiled[256];
     if (!version || !*version) version = SERVER_VERSION;
     if (!codename || !*codename) codename = "shaoogle";
+    backend_json(compiled, sizeof compiled, anubis_backends_compiled());
     snprintf(text, sizeof text,
              "{\"version\":\"%s\",\"codename\":\"%s\",\"algorithms\":[\"fast\","
              "\"slow\",\"sha256\",\"wasm-sha256\",\"argon2id\",\"hashx\",\"tensor\"],"
+             "\"backends_compiled\":[%s],"
              "\"impersonate\":\"%s\",\"impersonate_available\":%s}",
-             version, codename, anubis_fetch_impersonate(),
+             version, codename, compiled, anubis_fetch_impersonate(),
              anubis_fetch_impersonate_available() ? "true" : "false");
+    send_tool_text(id, text, strlen(text), 0);
+}
+
+static void tool_backends(const json_value *id) {
+    char text[1024];
+    char compiled[256];
+    char available[256];
+    backend_json(compiled, sizeof compiled, anubis_backends_compiled());
+    backend_json(available, sizeof available, anubis_backends_available());
+    snprintf(text, sizeof text, "{\"compiled\":[%s],\"available\":[%s]}",
+             compiled, available);
     send_tool_text(id, text, strlen(text), 0);
 }
 
@@ -1075,6 +1115,8 @@ static void tool_call(const json_value *id, const json_value *params) {
         tool_solve(id, args);
     } else if (strcmp(name, "anubis_version") == 0) {
         tool_version(id);
+    } else if (strcmp(name, "anubis_backends") == 0) {
+        tool_backends(id);
     } else {
         send_tool_error(id, "unknown tool: %s", name);
     }

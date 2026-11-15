@@ -96,6 +96,7 @@ static int anubis_cpu_count(void) {
 #endif
 #endif
 
+#include "anubis-solver.h"
 #include "argon2.h"
 #include "hashx.h"
 
@@ -129,6 +130,38 @@ static uint64_t vulkan_min_work(int bits_mode) {
         return strtoull(s, NULL, 0);
     }
     return bits_mode ? (1ull << 16) : (1ull << 20);
+}
+#endif
+
+/* Google TPU through the PJRT C API. The plugin (libtpu.so) is dlopen()ed by
+ * the backend itself; on a TPU VM there is no GPU, and on a GPU box there is
+ * no libtpu, so the two never fight over a device. */
+#if defined(ANUBIS_HAVE_TPU)
+#include "tpu_backend.h"
+
+/* Same escape hatch as ANUBIS_NO_CUDA and friends; a TPU VM is a shared
+ * resource and one process may own the chip, so being able to say "cpu only"
+ * matters more here than anywhere else. */
+static int tpu_enabled(void) {
+    const char *e = getenv("ANUBIS_NO_TPU");
+    return e == NULL || e[0] == '\0' || e[0] == '0';
+}
+
+/*
+ * The TPU has a cost the GPUs do not: the challenge bytes are baked into the
+ * StableHLO module, so every *new* challenge is a fresh compile (~1.3 s on a
+ * v5e, see results/sha256-tpu-2026-11-15.json) before the first nonce is
+ * tested. At the 343 MHash/s that client measured, 2^28 nonces is ~0.8 s of
+ * search on either side of that compile, which is the point where a TPU still
+ * beats a CPU core that would take seconds. The GPU default (2^16) would make
+ * every ordinary Anubis challenge pay a compile to do 0.2 ms of work.
+ */
+static uint64_t tpu_min_work(int bits_mode) {
+    const char *s = getenv("ANUBIS_TPU_MIN_WORK");
+    if (s != NULL && *s != '\0') {
+        return strtoull(s, NULL, 0);
+    }
+    return bits_mode ? (1ull << 28) : (1ull << 20);
 }
 #endif
 
@@ -1791,6 +1824,39 @@ int anubis_solve_bits(const char *challenge_hex, int difficulty, int threads,
     }
 #endif
 
+#if defined(ANUBIS_HAVE_TPU)
+    /* One 64-byte block per nonce is the shape the TPU is good at, so this
+     * path takes the raw challenge and has the same 51-byte limit as OpenCL. */
+    if (raw_len > 0 && raw_len + 4 <= 55 && tpu_enabled() &&
+        anubis_tpu_available()) {
+        uint64_t expected = 1;
+        int i;
+        for (i = 0; i < difficulty && i < 40; i++) {
+            expected *= 2;
+        }
+        if (expected >= tpu_min_work(1)) {
+            uint32_t gnonce = 0;
+            char ghex[65];
+            double gms = 0.0;
+            uint64_t cap = expected < (0xFFFFFFFFull / 8)
+                               ? expected * 8
+                               : 0xFFFFFFFFull;
+            int grc = anubis_tpu_solve(raw, (uint32_t)raw_len, difficulty,
+                                       ctx.use_le, cap, budget_ms, &gnonce,
+                                       ghex, &gms);
+            if (grc == 0 &&
+                gpu_hit_ok_bits(challenge_hex, gnonce, difficulty, ghex)) {
+                *out_nonce = gnonce;
+                memcpy(out_hex, ghex, 65);
+                if (out_ms != NULL) {
+                    *out_ms = gms;
+                }
+                return ANUBIS_OK;
+            }
+        }
+    }
+#endif
+
     rc = run_search(&job, &nonce64, out_hex, out_ms);
     if (rc == ANUBIS_OK) {
         *out_nonce = (uint32_t)nonce64;
@@ -2563,7 +2629,7 @@ int anubis_sha256_hex(const char *data, size_t len, char *out_hex) {
 
 ANUBIS_EXPORT
 const char *anubis_solver_version(void) {
-    return "2.0.1";
+    return "2.0.2";
 }
 
 ANUBIS_EXPORT
@@ -2608,7 +2674,8 @@ int anubis_batch_width(void) {
     return 0;
 }
 
-/* Active GPU backend name, or NULL when no GPU backend is available. */
+/* Active accelerator name, or NULL when none is available. The order is the
+ * dispatch order: NVIDIA, Intel, any Vulkan GPU, any OpenCL device, TPU. */
 ANUBIS_EXPORT
 const char *anubis_gpu_info(void) {
 #if defined(ANUBIS_HAVE_CUDA)
@@ -2628,8 +2695,104 @@ const char *anubis_gpu_info(void) {
     }
 #endif
 #if defined(ANUBIS_HAVE_VULKAN)
-    return anubis_vulkan_info();
-#else
-    return NULL;
+    {
+        const char *info = anubis_vulkan_info();
+        if (info != NULL) {
+            return info;
+        }
+    }
 #endif
+#if defined(ANUBIS_HAVE_OPENCL)
+    if (opencl_enabled() && anubis_opencl_available()) {
+        const char *info = anubis_opencl_info();
+        if (info != NULL) {
+            return info;
+        }
+    }
+#endif
+#if defined(ANUBIS_HAVE_TPU)
+    if (tpu_enabled() && anubis_tpu_available()) {
+        const char *info = anubis_tpu_info();
+        if (info != NULL) {
+            return info;
+        }
+    }
+#endif
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ *
+ * Backend inventory                                                   *
+ * ------------------------------------------------------------------ */
+
+ANUBIS_EXPORT
+int anubis_backends_compiled(void) {
+    int mask = ANUBIS_BACKEND_CPU;
+#if defined(ANUBIS_HAVE_CUDA)
+    mask |= ANUBIS_BACKEND_CUDA;
+#endif
+#if defined(ANUBIS_HAVE_LEVELZERO)
+    mask |= ANUBIS_BACKEND_LEVELZERO;
+#endif
+#if defined(ANUBIS_HAVE_VULKAN)
+    mask |= ANUBIS_BACKEND_VULKAN;
+#endif
+#if defined(ANUBIS_HAVE_OPENCL)
+    mask |= ANUBIS_BACKEND_OPENCL;
+#endif
+#if defined(ANUBIS_HAVE_TPU)
+    mask |= ANUBIS_BACKEND_TPU;
+#endif
+    return mask;
+}
+
+ANUBIS_EXPORT
+int anubis_backends_available(void) {
+    int mask = ANUBIS_BACKEND_CPU;
+#if defined(ANUBIS_HAVE_CUDA)
+    if (anubis_cuda_available()) {
+        mask |= ANUBIS_BACKEND_CUDA;
+    }
+#endif
+#if defined(ANUBIS_HAVE_LEVELZERO)
+    if (anubis_l0_available()) {
+        mask |= ANUBIS_BACKEND_LEVELZERO;
+    }
+#endif
+#if defined(ANUBIS_HAVE_VULKAN)
+    if (anubis_vulkan_available()) {
+        mask |= ANUBIS_BACKEND_VULKAN;
+    }
+#endif
+#if defined(ANUBIS_HAVE_OPENCL)
+    if (anubis_opencl_available()) {
+        mask |= ANUBIS_BACKEND_OPENCL;
+    }
+#endif
+#if defined(ANUBIS_HAVE_TPU)
+    if (tpu_enabled() && anubis_tpu_available()) {
+        mask |= ANUBIS_BACKEND_TPU;
+    }
+#endif
+    return mask;
+}
+
+ANUBIS_EXPORT
+const char *anubis_backend_name(int backend) {
+    switch (backend) {
+    case ANUBIS_BACKEND_CPU:
+        return "cpu";
+    case ANUBIS_BACKEND_CUDA:
+        return "cuda";
+    case ANUBIS_BACKEND_LEVELZERO:
+        return "levelzero";
+    case ANUBIS_BACKEND_VULKAN:
+        return "vulkan";
+    case ANUBIS_BACKEND_OPENCL:
+        return "opencl";
+    case ANUBIS_BACKEND_TPU:
+        return "tpu";
+    default:
+        return NULL;
+    }
 }

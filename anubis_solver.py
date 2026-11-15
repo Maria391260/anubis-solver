@@ -69,7 +69,7 @@ REQUEST_ERRORS: tuple[type[BaseException], ...] = (
     else (requests.RequestException,)
 )
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 __all__ = [
     "AnubisClient",
     "make_session",
@@ -91,6 +91,10 @@ ANUBIS_OK = 0
 ANUBIS_ERR_ARG = 1
 ANUBIS_ERR_UNSOLVED = 2
 ANUBIS_ERR_INTERNAL = 3
+
+# Backend bits, mirroring ANUBIS_BACKEND_* in include/anubis-solver.h.
+BACKEND_BITS = (0x01, 0x02, 0x04, 0x08, 0x10, 0x20)
+BACKEND_ORDER = ("cpu", "cuda", "levelzero", "vulkan", "opencl", "tpu")
 
 _RC_TEXT = {
     ANUBIS_ERR_ARG: "invalid argument",
@@ -237,13 +241,24 @@ class _Native:
         lib.anubis_solver_version.restype = ctypes.c_char_p
         lib.anubis_solver_version.argtypes = []
 
-        # Added in 2.0.1; a prebuilt .so from an older release may lack it.
+        # Added in 2.0.2; a prebuilt .so from an older release may lack it.
         try:
             lib.easter.restype = ctypes.c_char_p
             lib.easter.argtypes = []
             self._has_easter = True
         except AttributeError:
             self._has_easter = False
+
+        # Backend inventory, also 2.0.2. A .so from before it answers an empty
+        # list, which the caller can tell apart from "cpu only" by the mask.
+        self._has_backends = hasattr(lib, "anubis_backends_compiled")
+        if self._has_backends:
+            lib.anubis_backends_compiled.restype = ctypes.c_int
+            lib.anubis_backends_compiled.argtypes = []
+            lib.anubis_backends_available.restype = ctypes.c_int
+            lib.anubis_backends_available.argtypes = []
+            lib.anubis_backend_name.restype = ctypes.c_char_p
+            lib.anubis_backend_name.argtypes = [ctypes.c_int]
 
         lib.anubis_gpu_info.restype = ctypes.c_char_p
         lib.anubis_gpu_info.argtypes = []
@@ -352,6 +367,24 @@ class _Native:
         if not self._has_easter:
             return None
         return (self.lib.easter() or b"").decode()
+
+    def _backend_names(self, mask: int) -> list[str]:
+        names = []
+        for bit in BACKEND_BITS:
+            if mask & bit:
+                name = self.lib.anubis_backend_name(bit)
+                names.append(name.decode() if name else f"0x{bit:02x}")
+        return names
+
+    def backends_compiled(self) -> list[str]:
+        if not self._has_backends:
+            return []
+        return self._backend_names(int(self.lib.anubis_backends_compiled()))
+
+    def backends_available(self) -> list[str]:
+        if not self._has_backends:
+            return []
+        return self._backend_names(int(self.lib.anubis_backends_available()))
 
     def default_threads(self) -> int:
         return int(self.lib.anubis_default_threads())
@@ -609,6 +642,31 @@ class AnubisSolver:
     def easter(self) -> str | None:
         """What the chip answers to a probe of BAR0 0x0FC, or None."""
         return self._native.easter()
+
+    def backends(self) -> list[str]:
+        """Backends usable right now, best first ("cpu" is always last)."""
+        return self._native.backends_available()
+
+    def backends_compiled(self) -> list[str]:
+        """All backends compiled into this .so, usable here or not."""
+        return self._native.backends_compiled()
+
+    def backend_report(self) -> str:
+        """Human table of every backend, compiled or not, available or not."""
+        compiled = set(self.backends_compiled())
+        available = set(self.backends())
+        if not compiled:
+            return "this .so predates the backend inventory"
+        lines = [f"libanubis_solver {self.version}"]
+        for name in BACKEND_ORDER:
+            lines.append(
+                f"  {name:<10} compiled={'yes' if name in compiled else 'no':<3}"
+                f" available={'yes' if name in available else 'no'}"
+            )
+        gpu = self.gpu
+        if gpu:
+            lines.append(f"  active    {gpu}")
+        return "\n".join(lines)
 
     @property
     def gpu(self) -> str | None:
@@ -986,7 +1044,8 @@ def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description="Solve an anubis proof-of-work challenge and fetch a page"
     )
-    parser.add_argument("url", help="URL protected by anubis")
+    parser.add_argument("url", nargs="?", help="URL protected by anubis")
+    parser.add_argument("--backends", action="store_true", help="print the backend inventory and exit")
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--lib", default=None, help="path to libanubis_solver.so")
     parser.add_argument("--timeout", type=float, default=30.0)
@@ -1019,6 +1078,12 @@ def _main(argv: list[str]) -> int:
 
     if args.affinity is not None:
         os.environ["ANUBIS_CPU_AFFINITY"] = args.affinity
+
+    if args.backends:
+        print(AnubisSolver(lib_path=args.lib).backend_report())
+        return 0
+    if args.url is None:
+        parser.error("the url argument is required unless --backends is used")
 
     client = AnubisClient(
         args.url,

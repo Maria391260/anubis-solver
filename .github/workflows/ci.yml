@@ -43,5 +43,11 @@ jobs:
           # locally (make test-impersonate) against a bundled library.
           make test-impersonate
 
+      - name: TPU backend self-test (graceful path without libtpu)
+        run: make test-tpu
+
+      - name: One .so for every machine
+        run: make test-universal
+
       - name: tensor CUDA test (skips without a device)
         run: python3 tests/test_tensor_cuda.py

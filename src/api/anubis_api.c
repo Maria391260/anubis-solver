@@ -630,6 +630,31 @@ static void reply_error(int fd, int status, const char *message) {
 /* Endpoint handlers                                                   */
 /* ------------------------------------------------------------------ */
 
+static const int backend_bits[] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20};
+
+/* Append one JSON array of backend names. */
+static void sb_backend_list(strbuf *b, int mask) {
+    size_t i;
+    int first = 1;
+    sb_puts(b, "[");
+    for (i = 0; i < sizeof backend_bits / sizeof backend_bits[0]; i++) {
+        const char *name;
+        if (!(mask & backend_bits[i])) {
+            continue;
+        }
+        name = anubis_backend_name(backend_bits[i]);
+        if (name == NULL) {
+            continue;
+        }
+        if (!first) {
+            sb_puts(b, ",");
+        }
+        sb_json_string(b, name, strlen(name));
+        first = 0;
+    }
+    sb_puts(b, "]");
+}
+
 static void handle_healthz(int fd) {
     strbuf b = {0};
     sb_puts(&b, "{\"ok\":true,\"version\":");
@@ -653,11 +678,28 @@ static void handle_version(int fd) {
                    strlen(anubis_solver_codename()));
     sb_puts(&b, ",\"algorithms\":[\"fast\",\"slow\",\"sha256\","
                "\"wasm-sha256\",\"argon2id\",\"hashx\",\"tensor\"],"
-               "\"impersonate\":");
+               "\"backends_compiled\":");
+    sb_backend_list(&b, anubis_backends_compiled());
+    sb_puts(&b, ",\"impersonate\":");
     sb_json_string(&b, anubis_fetch_impersonate(),
                    strlen(anubis_fetch_impersonate()));
     sb_printf(&b, ",\"impersonate_available\":%s}",
               anubis_fetch_impersonate_available() ? "true" : "false");
+    http_reply(fd, 200, b.data);
+    sb_free(&b);
+}
+
+/* /v1/backends probes the hardware, so it is separate from /v1/version: it can
+ * take a second on a cold driver and the version endpoint must stay cheap. */
+static void handle_backends(int fd) {
+    strbuf b = {0};
+    int compiled = anubis_backends_compiled();
+    int available = anubis_backends_available();
+    sb_puts(&b, "{\"compiled\":");
+    sb_backend_list(&b, compiled);
+    sb_puts(&b, ",\"available\":");
+    sb_backend_list(&b, available);
+    sb_puts(&b, "}");
     http_reply(fd, 200, b.data);
     sb_free(&b);
 }
@@ -1080,6 +1122,8 @@ static void handle_client(int fd) {
         handle_healthz(fd);
     } else if (is_get && strcmp(path, "/v1/version") == 0) {
         handle_version(fd);
+    } else if (is_get && strcmp(path, "/v1/backends") == 0) {
+        handle_backends(fd);
     } else if (is_post &&
                (strcmp(path, "/v1/solve") == 0 ||
                 strcmp(path, "/v1/verify") == 0 ||

@@ -36,11 +36,37 @@ extern "C" {
  * Introspection
  * ------------------------------------------------------------------ */
 
-/* Library version, e.g. "2.0.1". */
+/* Library version, e.g. "2.0.2". */
 ANUBIS_API const char *anubis_solver_version(void);
 
 /* Release codename, e.g. "shaoogle". */
 ANUBIS_API const char *anubis_solver_codename(void);
+
+/* ------------------------------------------------------------------ *
+ * Backends
+ *
+ * One .so carries every backend that could be compiled in; at run time the
+ * library probes the machine and solves on whatever it finds. Vendor APIs are
+ * dlopen()ed, so a build with all of them loads on a machine with none.
+ * ------------------------------------------------------------------ */
+
+#define ANUBIS_BACKEND_CPU 0x01          /* always */
+#define ANUBIS_BACKEND_CUDA 0x02         /* NVIDIA, needs nvcc at build time */
+#define ANUBIS_BACKEND_LEVELZERO 0x04    /* Intel Xe */
+#define ANUBIS_BACKEND_VULKAN 0x08       /* any Vulkan ICD */
+#define ANUBIS_BACKEND_OPENCL 0x10       /* any OpenCL ICD */
+#define ANUBIS_BACKEND_TPU 0x20          /* Google, PJRT / libtpu */
+
+/* Bitmask of the backends compiled into this .so. */
+ANUBIS_API int anubis_backends_compiled(void);
+
+/* Bitmask of those that are usable right now. Probes the hardware once per
+ * backend and caches; a missing driver or device is not an error here. */
+ANUBIS_API int anubis_backends_available(void);
+
+/* Name of one backend bit ("cpu", "cuda", "levelzero", "vulkan", "opencl",
+ * "tpu"), or NULL when the argument is not a single backend bit. */
+ANUBIS_API const char *anubis_backend_name(int backend);
 
 /* Easter egg. Returns the same sentence the chip answers to a probe of BAR0
  * at 0x0FC in `beyond/` — a static string, no arguments, never NULL, never

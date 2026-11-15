@@ -15,7 +15,10 @@ solving [TecharoHQ/anubis](https://github.com/TecharoHQ/anubis) challenges:
 ```bash
 make                      # build ./libanubis_solver.so
 make -j8
-make test                 # C core tests (needs argon2-cffi for the Python part)
+make test                 # C core tests (needs argon2-cffi for the Python part) + TPU self-test
+make test-universal       # the one .so: exports, DT_NEEDED, backend inventory, C API
+make test-tpu             # TPU backend: graceful path without libtpu, solves with it
+make test-api test-mcp    # the C services
 make clean
 make CUDA=0               # skip CUDA
 make VULKAN=0             # skip Vulkan
@@ -50,6 +53,8 @@ make xe-loader && ./build/xe-loader --text /tmp/intelXe_sha256.krn   # run the h
 | `src/nvidia/cuda/*.cu` | CUDA backends (SHA-256, Argon2id, HashX) |
 | `src/intel/xe/` | Intel Xe (gen12lp) assembly for the SHA-256 kernel: a hand-written listing from `tools/gen_xe_sha256.py`, and IGC's own code extracted from a Zebin that ran on the GPU |
 | `src/intel/levelzero/*.c` | Level Zero backends; kernels in `src/intel/levelzero/*.cl` |
+| `src/intel/levelzero/level_zero/` | vendored `ze_api.h`, so the one `.so` builds without `libze-dev` |
+| `src/google/tpu/` | Google TPU through the PJRT C API, `sha256` tier; `libtpu.so` is `dlopen`ed |
 | `src/vulkan/vulkan.c` | Vulkan backends; kernels in `src/vulkan/*.comp` |
 | `src/opencl/` | portable OpenCL host, wired for SHA-256; its own `sha256_pow.cl` |
 | `include/anubis-solver.h` | public C/C++ header — keep in sync with exports |

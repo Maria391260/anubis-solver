@@ -2,9 +2,10 @@
 
 `anubis_mcp` is a Model Context Protocol server written in C, with no Python
 and no Node in the loop. It speaks newline-delimited JSON-RPC 2.0 on stdio and
-exposes three tools: fetch a URL through an Anubis challenge, solve a challenge
-directly, and report the version. Both the solving and the HTTP work come from
-this repository: `libanubis_solver.so` and `src/fetch/anubis_fetch.c`.
+exposes four tools: fetch a URL through an Anubis challenge, solve a challenge
+directly, report the version, and describe the compute backends. Both the
+solving and the HTTP work come from this repository: `libanubis_solver.so` and
+`src/fetch/anubis_fetch.c`.
 
 ## Build
 
@@ -52,7 +53,8 @@ under `/usr/local/bin` + `/usr/local/lib`).
 |---|---|---|
 | `anubis_fetch` | `url` (required), `max_chars` (default 100000), `impersonate` optional | `status: <code>`, `url: <final>`, `transport: <openssl\|curl-impersonate/profile>`, then the page as text |
 | `anubis_solve` | `algorithm`, `challenge` (hex), `difficulty`, `threads` optional | JSON `{"nonce":n,"response":"<hex>","algorithm":"..."}` |
-| `anubis_version` | none | JSON `{"version":"2.0.1","codename":"shaoogle","algorithms":[...],"impersonate":"chrome116","impersonate_available":true}` |
+| `anubis_version` | none | JSON `{"version":"2.0.2","codename":"shaoogle","algorithms":[...],"impersonate":"chrome116","impersonate_available":true}` |
+| `anubis_backends` | none | JSON `{"compiled":["cpu","vulkan","opencl"],"available":["cpu","vulkan","opencl"]}`; `available` probes the drivers and can take a second on a cold stack |
 
 `anubis_fetch` follows the challenge the same way the browser does: it reads the
 `anubis_challenge` JSON, solves it with the algorithm it names (`fast`, `slow`,

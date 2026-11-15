@@ -15,6 +15,8 @@ src/nvidia/cuda/*.cu    CUDA backends (SHA-256, Argon2id, HashX, tensor)
 src/nvidia/sass/        hand-measured T4 SASS listings, the kernels that produced them,
                         and the Kaggle notebooks that ran them
 src/intel/levelzero/    Level Zero backends (+ *.cl kernels, *.spv.h)
+src/intel/levelzero/level_zero/  vendored ze_api.h, so no libze-dev is needed
+src/google/tpu/         Google TPU (PJRT C API), the sha256 tier; plugin dlopen()ed
 src/intel/xe/           Intel Xe (gen12lp) SASS for the SHA-256 kernel
 
 portable backends:
@@ -46,6 +48,8 @@ python3 tests/test_core.py          # hashing, solve+verify for every algorithm
 python3 tests/test_local.py         # against a local Anubis instance
 python3 tests/test_versions.py      # every known Anubis git tag
 python3 tests/test_cve_2026_62314.py
+make test-universal                 # one .so: exports, DT_NEEDED, inventory, API
+make test-tpu                       # graceful path without libtpu; solves with it
 ```
 
 ## Regenerating kernels

@@ -40,6 +40,9 @@ bindings/rust/target/
 /3rd_party/curl_cffi/
 /betterAnusbis/3rd_party/
 
+# standalone TPU backend self-test binary (src/google/tpu/Makefile)
+/src/google/tpu/tpu_backend_selftest
+
 # personal images that are not part of the documentation site
 /meme/
 /mascot/JanusMadeDeepSeek.webp

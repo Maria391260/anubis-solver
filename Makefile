@@ -24,19 +24,60 @@ NVCC_ARCH := $(if $(CUDA_ARCH),-arch=$(CUDA_ARCH),)
 config:
 	$(PY) tools/configure.py $(CONFIG_ARGS)
 
+# ---- universal build -------------------------------------------------------
+# `make universal` is the one-file build: every backend whose toolchain and
+# headers exist is compiled into libanubis_solver.so, and the library picks one
+# at run time from what the machine actually has. Every vendor API is
+# dlopen()ed, so the same file runs on a box with none of them:
+#
+#   CPU     always, with every SIMD variant compiled in and chosen at runtime
+#   CUDA    NVIDIA      needs nvcc at build time (CUDA_RUNTIME=static)
+#   L0      Intel Xe    needs level_zero/ze_api.h
+#   Vulkan  AMD/Intel/NVIDIA/llvmpipe, needs vulkan.h
+#   OpenCL  any ICD      needs CL/cl.h
+#   TPU     Google       needs nothing at build time; libtpu is dlopen()ed
+#
+# `make universal STRICT=1` refuses to finish if a requested backend could not
+# be compiled in. Without it each skip is printed with the reason.
+UNIVERSAL ?= 0
+STRICT    ?= 0
+# A universal build *tries* every backend. `auto` is what makes a missing
+# toolchain a printed skip rather than the hard error the per-backend `=1`
+# path raises; STRICT=1 below turns the skip back into an error. Forcing `=1`
+# here made `make universal` fail on any machine without nvcc.
+ifeq ($(UNIVERSAL),1)
+CUDA   ?= auto
+VULKAN ?= auto
+OPENCL ?= auto
+L0     ?= auto
+TPU    ?= auto
+FETCH  ?= auto
+endif
+
 # Optional CUDA backend (NVIDIA). Built when nvcc is available; the library
-# then links libcudart and prefers CUDA over Vulkan at runtime.
+# then prefers CUDA over the other accelerators at runtime. cudart is linked
+# statically by default so the .so has no DT_NEEDED on libcudart: static cudart
+# opens libcuda.so.1 itself, lazily, and reports "no device" where the driver
+# is absent instead of failing at load time. That is what makes one universal
+# .so possible. CUDA_RUNTIME=shared restores a normal -lcudart link.
 CUDA ?= auto
+CUDA_RUNTIME ?= static
 NVCC ?= nvcc
 CUDA_SRC :=
+HAVE_CUDA :=
 ifneq ($(CUDA),0)
-ifneq ($(shell command -v $(NVCC) 2>/dev/null),)
+ifeq ($(shell command -v $(NVCC) 2>/dev/null),)
+ifeq ($(CUDA),1)
+$(error CUDA=1 but nvcc ($(NVCC)) is not on PATH; install the CUDA toolkit, or build with CUDA=0)
+endif
+else
 CUDA_SRC := src/nvidia/cuda/cuda_sha256.cu src/nvidia/cuda/cuda_argon2.cu src/nvidia/cuda/cuda_hashx.cu \
             src/nvidia/cuda/cuda_tensor.cu
 CFLAGS   += -DANUBIS_HAVE_CUDA
+HAVE_CUDA := 1
 # nvcc is the linker here; it rejects bare -pthread, so pass it to the host
 # compiler explicitly.
-LDFLAGS  := $(filter-out -pthread,$(LDFLAGS)) -Xcompiler -pthread -lcudart
+LDFLAGS  := $(filter-out -pthread,$(LDFLAGS)) -Xcompiler -pthread -cudart=$(CUDA_RUNTIME)
 NVCC_LINK_ARCH := $(NVCC_ARCH)
 LINK      = $(NVCC)
 endif
@@ -51,11 +92,15 @@ CORE_SRC := src/core/anubis_solver.c src/hashx/hashx.c
 # the library dlopen()s libvulkan.so.1 at runtime, so there is no hard
 # dependency on a Vulkan loader being present.
 VULKAN ?= auto
+HAVE_VULKAN :=
 ifneq ($(VULKAN),0)
 ifneq ($(wildcard /usr/include/vulkan/vulkan.h),)
 CORE_SRC += src/vulkan/vulkan.c
 CFLAGS  += -DANUBIS_HAVE_VULKAN
 LDFLAGS += -ldl
+HAVE_VULKAN := 1
+else ifeq ($(VULKAN),1)
+$(error VULKAN=1 but /usr/include/vulkan/vulkan.h is missing; install libvulkan-dev, or build with VULKAN=0)
 endif
 endif
 # Optional OpenCL backend (any GPU with an ICD: Intel, AMD, NVIDIA, Mesa).
@@ -63,24 +108,51 @@ endif
 # Vulkan is still the preferred path where it works; this one is used when no
 # other GPU backend answers, or when ANUBIS_OPENCL=1 asks for it by name.
 OPENCL ?= auto
+HAVE_OPENCL :=
 ifneq ($(OPENCL),0)
 ifneq ($(wildcard /usr/include/CL/cl.h),)
 CORE_SRC += src/opencl/opencl_backend.c
 CFLAGS   += -DANUBIS_HAVE_OPENCL
 LDFLAGS  += -ldl
+HAVE_OPENCL := 1
+else ifeq ($(OPENCL),1)
+$(error OPENCL=1 but /usr/include/CL/cl.h is missing; install ocl-icd-opencl-dev opencl-headers, or build with OPENCL=0)
 endif
 endif
-# Optional oneAPI Level Zero backend (Intel GPUs). Needs the Level Zero
-# headers; the loader is dlopen()ed at runtime, so there is no hard link.
+# Optional oneAPI Level Zero backend (Intel GPUs, "the Xe"). The API header is
+# vendored under src/intel/levelzero/level_zero/ so this builds without
+# libze-dev; the loader is dlopen()ed at runtime, so there is no hard link.
+# A system header wins if you point L0_INC at it.
 L0 ?= auto
-L0_INC ?= $(if $(wildcard /usr/include/level_zero/ze_api.h),/usr/include,\
-            $(if $(wildcard /usr/local/include/level_zero/ze_api.h),/usr/local/include,))
+L0_INC ?= $(if $(wildcard src/intel/levelzero/level_zero/ze_api.h),src/intel/levelzero,\
+            $(if $(wildcard /usr/include/level_zero/ze_api.h),/usr/include,\
+            $(if $(wildcard /usr/local/include/level_zero/ze_api.h),/usr/local/include,)))
+HAVE_L0 :=
 ifneq ($(L0),0)
 ifneq ($(wildcard $(L0_INC)/level_zero/ze_api.h),)
 CORE_SRC += src/intel/levelzero/levelzero_sha256.c src/intel/levelzero/levelzero_argon2.c \
              src/intel/levelzero/levelzero_hashx.c
 CFLAGS   += -DANUBIS_HAVE_LEVELZERO -I$(L0_INC)
 LDFLAGS  += -ldl
+HAVE_L0 := 1
+else ifeq ($(L0),1)
+$(error L0=1 but level_zero/ze_api.h was not found; install libze-dev, or build with L0=0)
+endif
+endif
+# Optional TPU backend (Google, PJRT C API). The plugin (libtpu.so) is
+# dlopen()ed at runtime, so this needs no headers beyond the vendored
+# pjrt_c_api.h and no library at build time. ANUBIS_TPU_LIB points the loader
+# at a specific libtpu.so.
+TPU ?= auto
+HAVE_TPU :=
+ifneq ($(TPU),0)
+ifneq ($(wildcard src/google/tpu/tpu_backend.c),)
+CORE_SRC += src/google/tpu/tpu_backend.c
+CFLAGS   += -DANUBIS_HAVE_TPU -Isrc/google/tpu
+LDFLAGS  += -ldl
+HAVE_TPU := 1
+else ifeq ($(TPU),1)
+$(error TPU=1 but src/google/tpu/tpu_backend.c is missing)
 endif
 endif
 
@@ -119,6 +191,51 @@ endif
 endif
 endif
 
+# ---- what a universal build actually contains -----------------------------
+# Each line is "yes" or the reason it is not. Kept next to the blocks so a new
+# backend has to add its own row and cannot be skipped silently.
+CUDA_ROW   := $(if $(HAVE_CUDA),yes,$(if $(filter 0,$(CUDA)),no (CUDA=0),no (nvcc not found; install the CUDA toolkit)))
+L0_ROW     := $(if $(HAVE_L0),yes,$(if $(filter 0,$(L0)),no (L0=0),no (level_zero/ze_api.h not found)))
+VULKAN_ROW := $(if $(HAVE_VULKAN),yes,$(if $(filter 0,$(VULKAN)),no (VULKAN=0),no (vulkan/vulkan.h not found)))
+OPENCL_ROW := $(if $(HAVE_OPENCL),yes,$(if $(filter 0,$(OPENCL)),no (OPENCL=0),no (CL/cl.h not found)))
+TPU_ROW    := $(if $(HAVE_TPU),yes,$(if $(filter 0,$(TPU)),no (TPU=0),no (src/google/tpu/tpu_backend.c not found)))
+FETCH_ROW  := $(if $(HAVE_FETCH),yes,$(if $(filter 0,$(FETCH)),no (FETCH=0),no (openssl/ssl.h not found)))
+BACKENDS_IN := $(strip $(if $(HAVE_CUDA),cuda) $(if $(HAVE_L0),levelzero) \
+                  $(if $(HAVE_VULKAN),vulkan) $(if $(HAVE_OPENCL),opencl) \
+                  $(if $(HAVE_TPU),tpu) $(if $(HAVE_FETCH),fetch) cpu)
+
+ifeq ($(UNIVERSAL),1)
+ifeq ($(STRICT),1)
+ifneq ($(CUDA),0)
+ifeq ($(HAVE_CUDA),)
+$(error STRICT=1: universal build could not compile CUDA in ($(CUDA_ROW)))
+endif
+endif
+ifneq ($(L0),0)
+ifeq ($(HAVE_L0),)
+$(error STRICT=1: universal build could not compile Level Zero in ($(L0_ROW)))
+endif
+endif
+ifneq ($(VULKAN),0)
+ifeq ($(HAVE_VULKAN),)
+$(error STRICT=1: universal build could not compile Vulkan in ($(VULKAN_ROW)))
+endif
+endif
+ifneq ($(OPENCL),0)
+ifeq ($(HAVE_OPENCL),)
+$(error STRICT=1: universal build could not compile OpenCL in ($(OPENCL_ROW)))
+endif
+endif
+ifneq ($(TPU),0)
+ifeq ($(HAVE_TPU),)
+$(error STRICT=1: universal build could not compile the TPU backend in ($(TPU_ROW)))
+endif
+endif
+endif
+$(info [anubis] universal build: $(BACKENDS_IN))
+$(foreach r,CUDA L0 VULKAN OPENCL TPU FETCH,$(if $(filter no%,$($(r)_ROW)),$(info [anubis]   $(r): $($(r)_ROW))))
+endif
+
 ARGON2_ALL := $(wildcard third_party/argon2/*.c third_party/argon2/blake2/*.c)
 # opt.c needs x86 SSE/AVX intrinsics; ref.c is the portable implementation.
 ifeq ($(ARCH),x86_64)
@@ -137,7 +254,8 @@ DEP := $(OBJ:.o=.d)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all test clean shader windows services test-api test-mcp test-impersonate impersonate-lib
+.PHONY: all test clean shader windows services test-api test-mcp test-impersonate impersonate-lib \
+        universal report test-universal test-tpu
 
 # The Windows pair and the release zip/msi: a mingw-w64 cross build, no Windows
 # needed. `make windows WIN_ARGS=--smoke` also runs a challenge/pass round trip
@@ -149,6 +267,20 @@ all: $(LIB)
 
 $(BUILD):
 	mkdir -p $(BUILD)/argon2/blake2
+
+# Object files depend on the flags they were compiled with, not only on their
+# sources: adding a backend changes -DANUBIS_HAVE_* and must rebuild the core.
+# Without this, a `make` that suddenly has the Level Zero or TPU headers would
+# link new objects into a core compiled without them, and the inventory would
+# quietly lie. The stamp is rewritten only when the flags actually change.
+FLAGS_STAMP := $(BUILD)/.cflags
+.PHONY: FORCE
+FORCE:
+$(FLAGS_STAMP): FORCE | $(BUILD)
+	@printf '%s\n' '$(CC) $(CFLAGS) $(NATIVE) $(INC) $(CUDAFLAGS)' > $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
+
+$(OBJ): $(FLAGS_STAMP)
 
 $(BUILD)/%.o: src/%.c | $(BUILD)
 	@mkdir -p $(dir $@)
@@ -169,7 +301,7 @@ $(LIB): $(OBJ)
 	$(LINK) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
 
 # ---------------------------------------------------------------------------
-# The C services (2.0.1 "shaoogle"): an MCP server and an HTTP API service,
+# The C services (2.0.2 "shaoogle"): an MCP server and an HTTP API service,
 # both thin layers over libanubis_solver.so plus the shared fetch client. They
 # are separate binaries on purpose - a gate operator should not have to install
 # a JSON-RPC server, and an agent should not have to run a gate.
@@ -227,7 +359,18 @@ test-mcp: anubis_mcp
 test-impersonate: $(LIB) anubis_mcp anubis_api
 	tests/impersonate_test.sh
 
-test: $(LIB)
+# The one-file build's own checks: exports, no accelerator in DT_NEEDED, the
+# Makefile flags against the compiled-in mask, and the C API's inventory.
+test-universal: $(LIB) anubis_api
+	tests/test_universal.sh
+
+# The TPU backend's own checks. Without libtpu they prove the graceful path
+# (unavailable, -1, outputs untouched); with ANUBIS_TPU_LIB set they solve.
+test-tpu:
+	$(MAKE) -C src/google/tpu selftest
+	src/google/tpu/tpu_backend_selftest
+
+test: $(LIB) test-tpu
 	python3 tests/test_core.py
 
 shader:
@@ -280,5 +423,34 @@ else
 	@false
 endif
 
+# ---------------------------------------------------------------------------
+# The universal .so: every backend that can be compiled in, is. Vendor driver
+# libraries are dlopen()ed at runtime, so the result runs everywhere; the
+# library then probes the machine and picks the best backend it finds.
+#
+#   make universal              build the one file
+#   make universal STRICT=1     fail instead of skipping a missing backend
+#   make report                 what is in the .so that is on disk now
+# ---------------------------------------------------------------------------
+universal:
+	@$(MAKE) --no-print-directory clean
+	@$(MAKE) --no-print-directory -j$$(nproc) UNIVERSAL=1 $(LIB)
+	@$(MAKE) --no-print-directory UNIVERSAL=1 report
+
+report:
+	@echo "libanubis_solver.so: $(BACKENDS_IN)"
+	@printf '  %-9s %s\n' cpu "yes" \
+	    cuda "$(CUDA_ROW)" levelzero "$(L0_ROW)" vulkan "$(VULKAN_ROW)" \
+	    opencl "$(OPENCL_ROW)" tpu "$(TPU_ROW)" fetch "$(FETCH_ROW)"
+	@if [ -f $(LIB) ]; then \
+	    echo "  deps:    $$(readelf -d $(LIB) 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | paste -sd' ')"; \
+	    echo "  run:     python3 -c \"import anubis_solver as a; print(a.AnubisSolver().backends())\""; \
+	else \
+	    echo "  $(LIB) not built yet"; \
+	fi
+
 clean:
 	rm -rf $(BUILD) $(LIB) anubis_api anubis_mcp
+	@if [ -f src/google/tpu/Makefile ]; then \
+	    $(MAKE) -C src/google/tpu clean >/dev/null 2>&1 || true; \
+	fi
