@@ -239,26 +239,29 @@ static char *build_module(int lanes, const uint32_t words[16], int nonce_off,
      * these window sizes the copy back was the whole cost. */
     {
         char *h0 = nv("h0");
-        char *th = NULL;
+        char *shr = nv("shr");
+        char *zero = nv("z");
         char *cmp = nv("ok");
         char *fl = nv("flag");
-        uint32_t threshold = (difficulty >= 32) ? 1u : (1u << (32 - difficulty));
+        unsigned shift = (unsigned)(32 - difficulty);
         bprintf(&b, "    %s = stablehlo.add %s, %s : tensor<%dxi32>\n",
                 h0, vars[0], bc(&b, iv[0]), lanes);
-        (void)th;
+        /* "the top `difficulty` bits are zero" as an equality against zero:
+         * shifting by 32-difficulty leaves the compared bits in place, and
+         * equality carries no signed/unsigned ambiguity - an unsigned LT
+         * against 2^(32-d) looked right but behaved signed on this plugin. */
+        bprintf(&b, "    %s = stablehlo.shift_right_logical %s, %s : tensor<%dxi32>\n",
+                shr, h0, bc(&b, shift), lanes);
+        bprintf(&b, "    %s = stablehlo.constant dense<0> : tensor<i32>\n", zero);
         {
-            char *tc = nv("tc");
-            char *ts = nv("ts");
-            bprintf(&b, "    %s = stablehlo.constant dense<%d> : tensor<i32>\n",
-                    tc, (int32_t)threshold);
+            char *zb = nv("zb");
             bprintf(&b, "    %s = stablehlo.broadcast_in_dim %s, dims = [] "
-                        ": (tensor<i32>) -> tensor<%dxi32>\n", ts, tc, lanes);
-            /* unsigned: the threshold for a 1-bit difficulty is 0x80000000 */
+                        ": (tensor<i32>) -> tensor<%dxi32>\n", zb, zero, lanes);
             bprintf(&b, "    %s = \"stablehlo.compare\"(%s, %s) "
-                        "{comparison_direction = #stablehlo<comparison_direction LT>, "
-                        "compare_type = #stablehlo<comparison_type UNSIGNED>} "
+                        "{comparison_direction = #stablehlo<comparison_direction EQ>, "
+                        "compare_type = #stablehlo<comparison_type SIGNED>} "
                         ": (tensor<%dxi32>, tensor<%dxi32>) -> tensor<%dxi1>\n",
-                    cmp, h0, ts, lanes, lanes, lanes);
+                    cmp, shr, zb, lanes, lanes, lanes);
             bprintf(&b, "    %s = \"stablehlo.convert\"(%s) "
                         ": (tensor<%dxi1>) -> tensor<%dxi8>\n", fl, cmp, lanes, lanes);
             bprintf(&b, "    return %s : tensor<%dxi8>\n", fl, lanes);
