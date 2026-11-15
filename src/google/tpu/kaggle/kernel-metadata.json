@@ -10,5 +10,6 @@
   "keywords": [],
   "dataset_sources": [],
   "competition_sources": [],
-  "kernel_sources": []
+  "kernel_sources": [],
+  "accelerator": "TpuV5E8"
 }

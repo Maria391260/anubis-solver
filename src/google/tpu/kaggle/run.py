@@ -35,6 +35,20 @@ def main():
     candidates = sorted(set(glob.glob("/usr/local/lib/python3*/dist-packages/libtpu/libtpu.so") +
                             glob.glob("/usr/local/lib/python3*/site-packages/libtpu/libtpu.so") +
                             glob.glob("/opt/**/libtpu/libtpu.so", recursive=True)))
+    # the image may not ship the wheel at all: ask the filesystem, the package
+    # manager and the kernel driver, and say what each answered
+    rc, jaxdev = sh("python3 -c \"import jax; print(jax.default_backend()); print(jax.devices())\" 2>&1")
+    RESULT["jax"] = jaxdev.strip()
+    rc, found = sh("find / -name 'libtpu*' 2>/dev/null | head -20", timeout=240)
+    RESULT["find_libtpu"] = found.strip()
+    rc, pip = sh("python3 -m pip list 2>/dev/null | grep -i -E 'tpu|jax' || true")
+    RESULT["pip"] = pip.strip()
+    for line in found.splitlines():
+        line = line.strip()
+        if line.endswith(".so") and line not in candidates:
+            candidates.append(line)
+    rc, devs = sh("ls -la /dev | grep -i -E 'tpu|vfio' || true; ls -la /dev/vfio 2>/dev/null || true")
+    RESULT["dev"] = devs.strip()
     if os.path.exists(os.path.join(RESULT["libtpu_dir"], "libtpu.so")):
         candidates.insert(0, os.path.join(RESULT["libtpu_dir"], "libtpu.so"))
     RESULT["candidates"] = candidates

@@ -64,9 +64,22 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Documented PJRT lifecycle: the plugin is initialized before any other
+     * call. Without this libtpu reaches Client_Create with InitGoogle still
+     * pending and aborts with "InitGoogle() has not finished yet". */
+    PJRT_Plugin_Initialize_Args ia = {0};
+    PJRT_Error *e = NULL;
+    ia.struct_size = sizeof ia;
+    e = api->PJRT_Plugin_Initialize(&ia);
+    if (e != NULL) {
+        show_error(api, e, "plugin initialize");
+        return 1;
+    }
+    printf("plugin: initialized\n");
+
     PJRT_Client_Create_Args ca = {0};
     ca.struct_size = sizeof ca;
-    PJRT_Error *e = api->PJRT_Client_Create(&ca);
+    e = api->PJRT_Client_Create(&ca);
     if (e != NULL) {
         show_error(api, e, "client create");
         return 1;
@@ -85,5 +98,37 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < da.num_addressable_devices; i++) {
         printf("  device %zu: %p\n", i, (void *)da.addressable_devices[i]);
     }
+
+    /* Can the plugin compile the shape we need? HLO text is the one format the
+     * C API accepts as text, and a dot whose result element type is wider than
+     * its operands is exactly how XLA spells an int8 matmul that accumulates in
+     * int32 (the instruction's shape *is* the preferred element type). */
+    static const char hlo_text[] =
+        "HloModule tensor\n"
+        "\n"
+        "ENTRY %main (a: s8[128,128], b: s8[128,128]) -> s32[128,128] {\n"
+        "  %a = s8[128,128]{1,0} parameter(0)\n"
+        "  %b = s8[128,128]{1,0} parameter(1)\n"
+        "  ROOT %d = s32[128,128]{1,0} dot(%a, %b), "
+        "lhs_contracting_dims={1}, rhs_contracting_dims={0}\n"
+        "}\n";
+
+    PJRT_Program prog = {0};
+    prog.struct_size = sizeof prog;
+    prog.code = (char *)hlo_text;
+    prog.code_size = sizeof hlo_text - 1;
+    prog.format = "hlo_text";
+    prog.format_size = 8;
+
+    PJRT_Client_Compile_Args cc = {0};
+    cc.struct_size = sizeof cc;
+    cc.client = ca.client;
+    cc.program = &prog;
+    e = api->PJRT_Client_Compile(&cc);
+    if (e != NULL) {
+        show_error(api, e, "compile hlo_text dot");
+        return 1;
+    }
+    printf("compiled: executable=%p\n", (void *)cc.executable);
     return 0;
 }
