@@ -9,7 +9,7 @@ HASHES  ?= 2000000
 OFFICIAL ?= /media/miku6/kubuntu_2404/home/miku/DOWN/pyani/anubis/web/static/wasm
 
 all: hashx_jit.wasm demo/hashx_jit.wasm argon2_fill.wasm argon2_fill_simd.wasm argon2_fill_c.wasm sha256_pow.wasm
-all: argon2id_pow.wasm hashx_pow.wasm
+all: argon2id_pow.wasm hashx_pow.wasm tensor_pow.wasm
 
 # Two flags bite the Argon2id module, and both were measured before they were
 # believed:
@@ -88,6 +88,25 @@ sha256_pow.wasm: sha256_pow.c
 	      -Wl,--export=anubis_work -o sha256_pow.wasm sha256_pow.c
 	@ls -l sha256_pow.wasm
 
+# the `tensor` PoW: A@B of two N*N int8/uint8 matrices, N = 64*clamp(difficulty,2,16).
+# SIMD=1 (default) builds the hand-written i8x16 kernel in tensor_pow.c, which is
+# ~4x the scalar kernel and needs a wasm-SIMD-capable engine (all current
+# browsers). `make tensor_pow.wasm SIMD=0` builds the scalar-only fallback; it is
+# byte-for-byte the same digest, just slower.
+SIMD ?= 1
+TENSOR_SIMD = $(if $(filter 1,$(SIMD)),-msimd128)
+tensor_pow.wasm: tensor_pow.c
+	clang --target=wasm32 -O3 -nostdlib -Wl,--no-entry $(TENSOR_SIMD) \
+	      -Wl,--export-memory -Wl,--export=data_ptr -Wl,--export=set_data_length \
+	      -Wl,--export=result_hash_ptr -Wl,--export=result_hash_size \
+	      -Wl,--export=anubis_work -Wl,--export=a_ptr -Wl,--export=b_ptr \
+	      -Wl,--export=c_ptr -Wl,--export=kernel_mode -Wl,--export=tensor_matmul \
+	      -Wl,--export=has_simd -o tensor_pow.wasm tensor_pow.c
+	@ls -l tensor_pow.wasm
+
+verify-tensor: tensor_pow.wasm
+	node verify-tensor.mjs
+
 # needs a running Anubis: anubis -bind 127.0.0.1:8923 \
 #   -target http://127.0.0.1:8001 -policy-fname policy.yaml \
 #   -cookie-secure=false -use-remote-address
@@ -152,4 +171,4 @@ clean:
 	      argon2_fill.wasm argon2_fill.wat argon2_fill_simd.wasm argon2_fill_simd.wat \
 	      argon2_fill_c.wasm
 
-.PHONY: all bench a2i vectors compare live serve clean
+.PHONY: all bench a2i vectors compare live serve clean verify-tensor
