@@ -1,0 +1,44 @@
+{
+  "date": "2026-11-15",
+  "platform": "Google Colab, TPU v5e-1 (1 chip), libtpu 0.0.50, PJRT 0.116",
+  "program": "src/google/tpu/sha256_pjrt.c (C, PJRT C API, StableHLO batched SHA-256)",
+  "challenge": "9f3c1a7b24d5e8061c2b3a495867f0e1d2c3b4a5968778695a4b3c2d1e0f1a2b",
+  "difficulty": 20,
+  "nonce": 740876,
+  "digest": "00000328e06fbf8b02957e2801edba68868c2dcf87203c632c90fb71445c5dae",
+  "note": "each row re-derived the winning nonce on the CPU (verified=true); the digest is identical across windows because the scan order is deterministic",
+  "rows": [
+    {
+      "window": 8192,
+      "hashes": 4005888,
+      "ms": 105.464,
+      "mhash_s": 37.983,
+      "compile_ms": 1535,
+      "verified": true
+    },
+    {
+      "window": 32768,
+      "hashes": 4030464,
+      "ms": 36.019,
+      "mhash_s": 111.899,
+      "compile_ms": 1247,
+      "verified": true
+    },
+    {
+      "window": 131072,
+      "hashes": 4063232,
+      "ms": 16.169,
+      "mhash_s": 251.305,
+      "compile_ms": 1569,
+      "verified": true
+    },
+    {
+      "window": 262144,
+      "hashes": 4194304,
+      "ms": 12.234,
+      "mhash_s": 342.846,
+      "compile_ms": 1560,
+      "verified": true
+    }
+  ]
+}

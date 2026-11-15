@@ -560,6 +560,58 @@ Raw data: [`results/tensor-tpu-2026-11-15.json`](results/tensor-tpu-2026-11-15.j
 Reproduce: `cc -O2 -I. -o tensor_pjrt tensor_pjrt.c -ldl` then
 `./tensor_pjrt --lib /path/libtpu.so --difficulty 4,8,12,16 --rounds 5`.
 
+## TPU: the `sha256` tier, 343 MHash/s
+
+The same PJRT client (`src/google/tpu/sha256_pjrt.c`) also runs the `sha256`
+tier, and this is the one it is genuinely good at. A `sha256` challenge is many
+independent 64-byte messages - one per nonce - so there is no chaining: iota
+gives each lane its nonce, four byte-splices patch it into the 16 message words,
+64 rounds of add/xor/rotate run over `tensor<Nxi32>`, and the device answers one
+question per lane: is `H0 >> (32-difficulty)` zero? The host gets one byte per
+lane, and re-derives the digest of the winning nonce on the CPU.
+
+Window size is the whole tuning story, because the fixed cost per execute is a
+launch plus a copy:
+
+| window (lanes/execute) | rate | per window |
+|---:|---:|---:|
+| 8,192 | 38.0 MHash/s | 0.216 ms |
+| 32,768 | 111.9 MHash/s | 0.293 ms |
+| 131,072 | 251.3 MHash/s | 0.522 ms |
+| 262,144 | **342.8 MHash/s** | 0.765 ms |
+
+Every row was verified: the program prints the winning nonce's digest and the
+CPU recomputes it, and the same nonce (`740876`, digest `00000328…`) came out at
+every window size because the scan order is deterministic. The knee is not
+reached yet - the rate nearly doubled again between 131k and 262k - so 343 M/s
+is a floor for this configuration, not a ceiling.
+
+For scale: the browser's four-wide wasm kernel is ~8 MHash/s and the engine's
+AVX2 path ~8.3 MHash/s per core, so a single v5e chip is **~41-43x** either of
+them. Compile is ~1.5 s once per challenge, the same trade the page makes when it
+compiles a HashX program.
+
+**What that means for the tier.** At 343 MHash/s, difficulty 24 (16.7M expected
+hashes) is ~0.05 s on one chip, and difficulty 32 is ~12.5 s. `sha256` is
+therefore a speed bump, not a wall, against anyone with TPU time - and unlike
+the memory-hard tiers, the work is embarrassingly parallel on exactly the
+hardware clouds sell cheaply. This is the argument for raising `sha256`'s
+default difficulty on exposed sites, or steering high-value deployments to
+`argon2id` (19,456 KiB per hash, so the same axis does not apply) or `hashx`
+(program generation per challenge, which a batch compressor does not amortise).
+It is also a reason to treat "the browser takes 2 s" as a statement about honest
+browsers, not about attackers.
+
+Limits, stated plainly: the device-side test looks at `H0` only, so difficulty
+is capped at 32 bits; the client handles single-block messages (decoded
+challenge up to 51 bytes, which is what Anubis issues); and the compile is per
+challenge, so a solver that meets a fresh challenge every request pays 1.5 s
+before it can start hashing.
+
+Raw data: [`results/sha256-tpu-2026-11-15.json`](results/sha256-tpu-2026-11-15.json).
+Reproduce: `make sha256_pjrt` then
+`./sha256_pjrt --lib /path/libtpu.so --bench-hashes 4000000 --window 262144 --json`.
+
 ## Cost of GPU hit verification
 
 Every accepted GPU hit is re-computed once on the CPU. On 2× T4 that is

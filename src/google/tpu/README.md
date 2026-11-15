@@ -10,6 +10,8 @@ client for libtpu.
 | `pjrt_c_api.h` | vendored from `openxla/xla` (API 0.118); TPU images ship the plugin but not the header |
 | `pjrt_probe.c` | first contact: `dlopen`, `GetPjrtApi`, plugin init, client, devices, compile a dot |
 | `tensor_pjrt.c` | the real thing: derive A/B, upload as S8, execute, copy back, digest, benchmark |
+| `sha256_pjrt.c` | the `sha256` tier: batched nonces, 343 MHash/s at 262,144 lanes |
+| `pjrt_common.h` | host SHA-256, hex and clock, shared by the clients |
 | `kaggle/` | a Kaggle TPU kernel that builds and runs the probe (Kaggle's CLI accepted the TPU accelerator but attached no TPU; Colab did) |
 
 ## What it produces
@@ -38,10 +40,34 @@ The dot itself is `stablehlo.dot_general` from `tensor<NxNxi8>` to
 operands, but the TPU backend accepts the widening form and runs it on the MXU;
 that is what makes an int8 tier measurable here at all.
 
+## The sha256 tier
+
+`sha256_pjrt` is the tier this hardware is actually good at: independent
+one-block messages, no chaining. Window size dominates everything (see
+[`SPEED.md`](../../../SPEED.md#tpu-the-sha256-tier-343-mhashs)); at 262,144
+lanes it measures 343 MHash/s, ~43x the browser's wasm kernel. Three bugs cost
+real Colab round trips and are worth recording because each was invisible in a
+different way:
+
+1. **Nonce byte position inside a big-endian word.** The block words are
+   `b0<<24 | b1<<16 | b2<<8 | b3`, so the first nonce byte is the most
+   significant one. Writing it to the least significant byte produced digests
+   for a different message - caught by the CPU re-check, not by the device.
+2. **`PJRT_Buffer_ToHostBuffer` copies the physical layout.** With
+   `host_layout = NULL` it does not mean "row-major": the TPU had chosen
+   dim-0-fastest for `tensor<Nx8xi32>`, so 32 bytes per lane arrived
+   transposed. Returning a flat `tensor<N*8xi32>>` removed the choice.
+3. **`comparison_type UNSIGNED` did not compare unsigned on this plugin.**
+   `H0 < 2^(32-d)` therefore treated every negative word as a pass. The test is
+   now `shift_right_logical(H0, 32-d) == 0`, where signedness cannot enter.
+
 ## Build and run
 
 ```bash
 cc -O2 -I. -o tensor_pjrt tensor_pjrt.c -ldl
 ./tensor_pjrt --lib /path/to/libtpu.so --difficulty 4,8,12,16 --rounds 5
 ./tensor_pjrt --lib /path/to/libtpu.so --n 4096 --rounds 5 --no-verify --json
+
+make sha256_pjrt
+./sha256_pjrt --lib /path/to/libtpu.so --difficulty 20 --window 262144 --json
 ```
