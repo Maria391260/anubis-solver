@@ -36,8 +36,11 @@ extern "C" {
  * Introspection
  * ------------------------------------------------------------------ */
 
-/* Library version, e.g. "1.0.0". */
+/* Library version, e.g. "2.0.0". */
 ANUBIS_API const char *anubis_solver_version(void);
+
+/* Release codename, e.g. "shaoogle". */
+ANUBIS_API const char *anubis_solver_codename(void);
 
 /* Name of the active GPU backend (e.g. "CUDA: Tesla T4 x2"), or NULL. */
 ANUBIS_API const char *anubis_gpu_info(void);

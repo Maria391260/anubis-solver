@@ -2563,7 +2563,12 @@ int anubis_sha256_hex(const char *data, size_t len, char *out_hex) {
 
 ANUBIS_EXPORT
 const char *anubis_solver_version(void) {
-    return "1.10.0";
+    return "2.0.0";
+}
+
+ANUBIS_EXPORT
+const char *anubis_solver_codename(void) {
+    return "shaoogle";
 }
 
 /* SHA-256 midstate after `len` bytes (len must be a multiple of 64). */

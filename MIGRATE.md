@@ -40,7 +40,7 @@ make                      # the solver library: libanubis_solver.so
 cd betterAnusbis
 make                      # the gate: one cc invocation, one binary
 ./betterAnusbis --version
-# 1.50.3 "headslam"
+# 2.0.0 "shaoogle"
 ```
 
 That is the whole build. No Go toolchain, no container, no `go mod download`.
@@ -51,11 +51,11 @@ flags, no compiler:
 ```powershell
 # the MSI installs under Program Files\betterAnusbis and adds it to PATH;
 # open a new terminal afterwards so PATH is picked up
-msiexec /i betterAnusbis-1.50.3-x86_64-windows.msi
+msiexec /i betterAnusbis-2.0.0-x86_64-windows.msi
 
 # or unzip and run from the folder (keep the .exe and the .dll together)
 .\betterAnusbis.exe --version
-# 1.50.3 "headslam"
+# 2.0.0 "shaoogle"
 ```
 
 The Windows pair comes from the same `betterAnusbis.c`; what it leaves out and
@@ -345,7 +345,7 @@ URL forces it (the fragment is never sent to the server).
 | the gate says a rule "will never match" | the expression uses something outside the CEL subset; the message names the rule. |
 | `--bind-network unix` fails | the socket's directory must exist and be writable; the mode comes from `--socket-mode`. On Windows this also needs Windows 10 1803+ for AF_UNIX. |
 | `anubis_solver.dll was not found` (Windows) | the .exe and the .dll were separated. Keep them in one directory, or install the MSI. |
-| `fixme:msi:internal_ui_handler` when installing under Wine | Wine's MSI UI is incomplete, the install finishes anyway. `wine msiexec /i betterAnusbis-1.50.3-x86_64-windows.msi /qn` does the same quietly; on real Windows, double-clicking the MSI shows the normal progress UI. |
+| `fixme:msi:internal_ui_handler` when installing under Wine | Wine's MSI UI is incomplete, the install finishes anyway. `wine msiexec /i betterAnusbis-2.0.0-x86_64-windows.msi /qn` does the same quietly; on real Windows, double-clicking the MSI shows the normal progress UI. |
 | no `kill -HUP` on Windows | there is no SIGHUP; scrape `/metrics` (`--metrics-bind`) or restart. Ctrl+C flushes a `file:`/`bbolt:` store. |
 | browser cannot solve `argon2id`/`hashx` | `--web` does not point at the WASM kernels; the release archives do not include them, use a source checkout's `wasm/` directory. |
 | HTTPS target certificate fails (Windows) | point `SSL_CERT_FILE` at a PEM bundle, or rely on the Windows certificate store where OpenSSL's winstore support is available. |

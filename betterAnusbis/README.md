@@ -1,6 +1,6 @@
 # betterAnusbis
 
-**1.50.3 "headslam"** — coming from a running Anubis? [../MIGRATE.md](../MIGRATE.md)
+**2.0.0 "shaoogle"** — coming from a running Anubis? [../MIGRATE.md](../MIGRATE.md)
 is the step-by-step.
 
 An Anubis-compatible proof-of-work gate in **one C file**. It issues the same
@@ -18,7 +18,7 @@ solves itself and you land on your backend.
 
 ```
 $ ./betterAnusbis --target http://127.0.0.1:3000 --algorithm sha256 --difficulty 12
-[betterAnusbis] betterAnusbis 1.50.3 listening on :8080 -> http://127.0.0.1:3000 (sha256, difficulty 12)
+[betterAnusbis] betterAnusbis 2.0.0 listening on :8080 -> http://127.0.0.1:3000 (sha256, difficulty 12)
 [betterAnusbis] open http://127.0.0.1:8080/ and the challenge page solves it for you
 ```
 

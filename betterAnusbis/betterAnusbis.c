@@ -72,8 +72,8 @@
 
 /* ----------------------------------------------------------------- config */
 
-#define VERSION "1.50.3"
-#define CODENAME "headslam"
+#define VERSION "2.0.0"
+#define CODENAME "shaoogle"
 #define API_PREFIX "/.within.website/x/cmd/anubis/api/"
 #define DEFAULT_COOKIE_PREFIX "techaro.lol-anubis"
 #define MAX_HEADER 32768

@@ -75,7 +75,7 @@ Replies (host → extension):
 
 ```json
 {"ok": true, "pong": true}
-{"ok": true, "version": "1.10.0", "threads": 4, "batchWidth": 8, "gpu": null, "algorithms": [...]}
+{"ok": true, "version": "2.0.0", "threads": 4, "batchWidth": 8, "gpu": null, "algorithms": [...]}
 {"ok": true, "algorithm": "sha256", "nonce": 587, "response": "000a…", "elapsedMs": 0.54}
 {"ok": true, "valid": true, "response": "000a…"}
 {"ok": false, "error": "ValueError: unsupported algorithm 'sha512'"}
@@ -102,7 +102,7 @@ page comes back. Current output:
 
 ```
   ok   ping
-  ok   info  libanubis_solver 1.10.0, 4 threads, sha256 batch 8, gpu None
+  ok   info  libanubis_solver 2.0.0, 4 threads, sha256 batch 8, gpu None
   ok   unknown command is an error, not a crash
   ok   live solve (sha256 difficulty 12)  nonce 9195 in 0.86 ms
   ok   the engine agrees the nonce is valid
