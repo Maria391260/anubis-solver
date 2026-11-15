@@ -93,6 +93,7 @@ test-s3: betterAnusbis
 # paths through the extracted page script. No browser, no gate.
 test-js:
 	node tests_js_sha256.mjs
+	node tests_js_hashx.mjs
 
 clean:
 	rm -f betterAnusbis

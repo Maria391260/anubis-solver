@@ -12209,20 +12209,21 @@ function buildModule(challenge) {
   }
 
   const shaAlgo=algo==="sha256"||algo==="wasm-sha256";
-  // A URL ending in #pure-js asks for the JavaScript solver explicitly; it is
-  // also the automatic fallback when WebAssembly is not available at all.
+  // A URL ending in #pure-js asks for the JavaScript solvers explicitly; they
+  // are also the automatic fallback when WebAssembly is not available at all.
   const forcedJs=location.hash.toLowerCase().replace(/^#\/?/,"")==="pure-js";
-  if(shaAlgo && (forcedJs || typeof WebAssembly!=="object")){
-    solveSha256InJs();
-    return;
-  }
+  const noWasm=forcedJs || typeof WebAssembly!=="object";
+  if(shaAlgo && noWasm){ solveSha256InJs(); return; }
+  if(algo==="hashx" && noWasm){ solveHashxInJs(); return; }
   if(algo==="sha256"||algo==="wasm-sha256"||algo==="argon2id"||algo==="hashx"){
     solveWithWasm().then(r=>{
       if(r){ say("solved with nonce "+r.nonce+" in "+r.ms.toFixed(0)+" ms"); pass(r.hash,r.nonce,r.ms); }
       else if(shaAlgo){ solveSha256InJs(); }
+      else if(algo==="hashx"){ solveHashxInJs(); }
       else { say(algo+" could not load its kernel, use the anubis_fetch CLI or the Firefox extension"); }
     }).catch(e=>{
       if(shaAlgo){ solveSha256InJs(); }
+      else if(algo==="hashx"){ solveHashxInJs(); }
       else { say(algo+" kernel failed to load: "+e); }
     });
     return;
@@ -12278,6 +12279,93 @@ function buildModule(challenge) {
         return;
       }
       if((nonce&8191)===8191) await new Promise(r=>setTimeout(r,0));
+    }
+  }
+
+  // Pure-JavaScript HashX, for browsers where WebAssembly is disabled, missing,
+  // or refused. The program generator is the same one the wasm path uses
+  // (HASHX_JIT.deriveProgram, above); this interprets its 512 instructions
+  // instead of emitting a module. The semantics are hashx_hash() in
+  // src/hashx/hashx.c: SipHash-2-4 counter-mode register fill, the program with
+  // its single guarded backward branch, the finalising SipRounds, then
+  // r[i] ^ r[4+i] as little-endian 64-bit words (32 bytes).
+  // Function declarations, not const arrows: the dispatch above can start
+  // solving before this block has executed, and only hoisted functions are
+  // usable at that point. Keep the 64-bit mask inline for the same reason.
+  function hxU64(x){ return x & ((1n<<64n)-1n); }
+  function hxRotl(x,n){ n&=63; if(n===0) return hxU64(x);
+    return hxU64((x<<BigInt(n))|(x>>BigInt(64-n))); }
+  function hxRotr(x,n){ n&=63; if(n===0) return hxU64(x);
+    return hxU64((x>>BigInt(n))|(x<<BigInt(64-n))); }
+  function hxSipRound(v,a,b,c,d){
+    v[a]=hxU64(v[a]+v[b]); v[c]=hxU64(v[c]+v[d]);
+    v[b]=hxRotl(v[b],13); v[d]=hxRotl(v[d],16);
+    v[b]^=v[a]; v[d]^=v[c];
+    v[a]=hxRotl(v[a],32); v[c]=hxU64(v[c]+v[b]); v[a]=hxU64(v[a]+v[d]);
+    v[b]=hxRotl(v[b],17); v[d]=hxRotl(v[d],21);
+    v[b]^=v[c]; v[d]^=v[a]; v[c]=hxRotl(v[c],32);
+  }
+  function hashxInit(raw){
+    const derived=HASHX_JIT.deriveProgram(raw);
+    return {key:derived.registerKey,code:derived.program};
+  }
+  function hashxHash(init,nonce,out){
+    const k=init.key, n=BigInt(nonce>>>0), v=[k[0],k[1],k[2],k[3]];
+    v[1]^=238n; v[3]^=n;
+    hxSipRound(v,0,1,2,3); hxSipRound(v,0,1,2,3);
+    v[0]^=n; v[2]^=238n;
+    for(let i=0;i<4;i++) hxSipRound(v,0,1,2,3);
+    const r=[v[0],v[1],v[2],v[3],0n,0n,0n,0n];
+    v[1]^=221n;
+    for(let i=0;i<4;i++) hxSipRound(v,0,1,2,3);
+    r[4]=v[0]; r[5]=v[1]; r[6]=v[2]; r[7]=v[3];
+
+    const code=init.code;
+    let target=0, be=true, result=0n;
+    for(let i=0;i<code.length;i++){
+      const ins=code[i], d=ins.dst&7, s=ins.src&7;
+      switch(ins.op){
+        case 0: r[d]=hxU64((hxU64(r[d])*hxU64(r[s]))>>64n); result=r[d]; break;
+        case 1: { const a=BigInt.asIntN(64,r[d]), b=BigInt.asIntN(64,r[s]);
+                  r[d]=hxU64((a*b)>>64n); result=r[d]; break; }
+        case 2: r[d]=hxU64(r[d]*r[s]); break;
+        case 3: r[d]=hxU64(r[d]-r[s]); break;
+        case 4: r[d]=hxU64(r[d]^r[s]); break;
+        case 5: r[d]=hxU64(r[d]+hxU64(r[s]<<BigInt(ins.imm&63))); break;
+        case 6: r[d]=hxRotr(r[d],ins.imm&63); break;
+        case 7: r[d]=hxU64(r[d]+BigInt(ins.imm|0)); break;
+        case 8: r[d]=hxU64(r[d]^BigInt(ins.imm|0)); break;
+        case 9: target=i; break;
+        case 10:
+          if(be && (result & BigInt(ins.imm>>>0))===0n){ i=target; be=false; }
+          break;
+        default: throw new Error("unknown HashX opcode "+ins.op);
+      }
+    }
+
+    r[0]=hxU64(r[0]+k[0]); r[1]=hxU64(r[1]+k[1]);
+    r[6]=hxU64(r[6]+k[2]); r[7]=hxU64(r[7]+k[3]);
+    hxSipRound(r,0,1,2,3); hxSipRound(r,4,5,6,7);
+    for(let i=0;i<4;i++){
+      let w=hxU64(r[i]^r[4+i]);
+      for(let b=0;b<8;b++){ out[i*8+b]=Number(w&255n); w>>=8n; }
+    }
+  }
+  async function solveHashxInJs(){
+    const raw=hex2bytes(ch.randomData);
+    say("deriving the HashX program in JavaScript");
+    const init=hashxInit(raw);
+    const out=new Uint8Array(32);
+    const t0=performance.now();
+    say("solving hashx in pure JavaScript (no WebAssembly)");
+    for(let nonce=0;;nonce++){
+      hashxHash(init,nonce,out);
+      if(lz(out)>=diff){
+        say("solved with nonce "+nonce+" in JavaScript");
+        pass(tohex(out),nonce,performance.now()-t0);
+        return;
+      }
+      if((nonce&255)===255) await new Promise(r=>setTimeout(r,0));
     }
   }
 })();

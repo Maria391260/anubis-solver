@@ -306,6 +306,15 @@ available; the fragment never reaches the server or the redirect. It is slower
 than the four-wide wasm kernel, but a browser with wasm disabled still gets
 through instead of being locked out.
 
+`hashx` has a JavaScript fallback too. The page derives the challenge's program
+with the same generator the wasm path uses and interprets its 512 instructions
+with 64-bit BigInt arithmetic — no wasm, no WebGPU. It runs when WebAssembly is
+unavailable and `#pure-js` forces it; the rate is ~13-15k hashes/s, about 34x
+slower than `hashx_pow.wasm` and 240x the compiled program, so it is a
+light-tier fallback (medium is a couple of seconds, hard over a minute). The
+interpreter is checked against both the wasm module and the C engine by
+`node tests_js_hashx.mjs`.
+
 `hashx` also shows what it costs. The page compiles the challenge's program,
 then scans nonces in windows of 262,144 and drives a progress bar that says
 **slowing you down!** with the measured MHash/s and an estimate of the time
@@ -626,6 +635,7 @@ a site owner actually configures. That is the point: `--target` and you are done
 ```bash
 ./test-all-algorithms.sh      # all six algorithms, needs a backend on :8002
 node tests_js_sha256.mjs      # the page's JavaScript SHA-256 and both JS solvers
+node tests_js_hashx.mjs       # the JS HashX interpreter vs hashx_pow.wasm and the C engine
 python3 test_parity.py        # the flags taken from cmd/anubis, checked on the wire
 python3 tests_http23.py -v    # HTTP/2 and HTTP/3, listener and backend hop
 python3 tests_valkey.py       # the Valkey store against an in-process RESP mock

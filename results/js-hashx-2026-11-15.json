@@ -1,0 +1,41 @@
+{
+  "host": "Intel i7-1260P (Alder Lake), 16 threads, powersave governor, laptop",
+  "config": "Chrome 154.0.8037.97 headless and Node 26.13.0; fixed challenge 9f2c1b4a...5c4b; 500 hashes after one program derivation, warm, best of 3; pure JS, no WebAssembly",
+  "date": "2026-11-15",
+  "challenge_hex": "9f2c1b4a7e5d3c0b8a1f6e2d4c7b0a9f5e3d1c8b7a6f4e2d1c0b9a8f7e6d5c4b",
+  "node": {
+    "derive_ms": 14.11,
+    "hashes_per_second": 15300,
+    "us_per_hash": 65.36,
+    "best_ms_for_500": 32.7
+  },
+  "chrome": [
+    {
+      "derive_ms": 16.6,
+      "hashes_per_second": 15337,
+      "us_per_hash": 65.2,
+      "best_ms_for_500": 32.6
+    },
+    {
+      "derive_ms": 9.4,
+      "hashes_per_second": 13158,
+      "us_per_hash": 76.0,
+      "best_ms_for_500": 38.0
+    }
+  ],
+  "comparison": {
+    "wasm_compiled_hashes_per_second": 3200000,
+    "wasm_interpreter_hashes_per_second": 460000,
+    "tier_seconds_js": {
+      "7": 0.024,
+      "15": 2.44,
+      "20": 78
+    }
+  },
+  "notes": [
+    "The JS interpreter is the page's hx* functions and hashxHash, extracted from betterAnusbis.c.",
+    "The wasm comparison numbers are the hashx rows already in SPEED.md.",
+    "tests_js_hashx.mjs checks solved nonces against hashx_pow.wasm and the C engine's anubis_verify_hashx."
+  ],
+  "reproduce": "node betterAnusbis/bench-js-hashx.mjs --json"
+}

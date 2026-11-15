@@ -24,5 +24,7 @@ jobs:
       - name: Unit tests (cross-checked against hashlib and argon2-cffi)
         run: python3 tests/test_core.py
 
-      - name: The gate's pure-JavaScript SHA-256 and solvers
-        run: node betterAnusbis/tests_js_sha256.mjs
+      - name: The gate's pure-JavaScript solvers
+        run: |
+          node betterAnusbis/tests_js_sha256.mjs
+          node betterAnusbis/tests_js_hashx.mjs

@@ -35,6 +35,7 @@ between algorithms is what matters.
 | `hashx` (WASM, interpreted) | ~0.46 M/s | fallback when the compile cannot run |
 | `argon2id` (WASM) | ~15/s | 19,456 KiB and ~65 ms per hash |
 | `sha256` (pure JS, browser fallback) | ~0.89 M/s | one nonce per hash, reused padding; ~9x slower than the wasm kernel |
+| `hashx` (pure JS, browser fallback) | ~13-15 k/s | BigInt interpreter of the challenge's program; no wasm/WebGPU |
 | `fast`, `slow` (pure JS, browser) | ~0.36 M/s | a fresh padded block per candidate; the nibble challenges have no wasm module |
 
 Correcting an earlier row here: this table used to say `hashx` was 3.6 M/s
@@ -78,6 +79,9 @@ these are the compiled numbers with the interpreter in brackets:
 | light | 7 | 128 | 40 µs (281 µs) |
 | medium | 15 | 32,768 | 10.3 ms (72 ms) |
 | hard | 20 | 1,048,576 | 330 ms (2.3 s) |
+
+The pure-JavaScript fallback is ~13-15k hashes/s, or about 24 ms / 2.44 s /
+78 s at these tiers; see [HashX in pure JavaScript](#hashx-in-pure-javascript).
 
 ### `argon2id` (WASM)
 
@@ -848,6 +852,42 @@ gate does not use).
 Reproduce: `node betterAnusbis/bench-js-sha256.mjs --wasm` for the Node numbers;
 the browser column is the challenge page loaded with `#pure-js`. Raw data:
 [`results/js-sha256-2026-11-15.json`](results/js-sha256-2026-11-15.json).
+
+### HashX in pure JavaScript
+
+`hashx` has a JavaScript fallback too. When WebAssembly is unavailable, or
+`#pure-js` is set, the page derives the challenge's program with the same
+generator the wasm path uses and interprets its 512 instructions with 64-bit
+BigInt arithmetic: the same opcodes, guarded backward branch and finalisation
+as `hashx.c`. No wasm, no WebGPU.
+
+Method: one fixed challenge, 500 hashes after one program derivation, warm,
+best of three, Chrome 154 headless and Node 26 on the same i7-1260P. Derivation
+is a per-challenge cost, so the tier table below adds it.
+
+| path | hashes/s | per hash | note |
+|---|---:|---:|---|
+| program compiled to wasm in the page | ~3.2 M | 0.31 us | the fast path |
+| `hashx_pow.wasm` interpreter | ~0.46 M | 2.2 us | the wasm fallback |
+| **pure JS interpreter (BigInt)** | **12.8-15.3 k** | 65-78 us | no wasm; derivation 9-17 ms once |
+
+At the tiers, derivation included:
+
+| tier | difficulty | expected hashes | wasm (compiled) | pure JS |
+|---|---:|---:|---:|---:|
+| light | 7 | 128 | 0.04 ms | ~24 ms |
+| medium | 15 | 32,768 | 10.3 ms | 2.44 s |
+| hard | 20 | 1,048,576 | 330 ms | 78 s |
+
+That is ~34x the wasm interpreter and ~240x the compiled program, which is what
+512 instructions of 64-bit BigInt work per hash costs. The fallback is a
+light-tier solution; medium is a couple of seconds and hard is over a minute.
+Correctness is not assumed: `betterAnusbis/tests_js_hashx.mjs` runs solved
+challenges through `hashx_pow.wasm` and the C engine's `anubis_verify_hashx`
+and requires identical digests.
+
+Reproduce: `node betterAnusbis/bench-js-hashx.mjs`; raw data:
+[`results/js-hashx-2026-11-15.json`](results/js-hashx-2026-11-15.json).
 
 ### WebGPU: three algorithms, three different verdicts
 
