@@ -148,7 +148,7 @@ static char *build_module(int lanes, const uint32_t words[16], int nonce_off,
     bprintf(&b,
             "module {\n"
             "  func.func @main(%%n: tensor<i32>) -> tensor<%dxi32> {\n"
-            "    %%lane = stablehlo.iota dim = 0 : tensor<%dxi32>\n", lanes, lanes);
+            "    %%lane = stablehlo.iota dim = 0 : tensor<%dxi32>\n", lanes * 8, lanes);
     {
         char *base = nv("nb");
         bprintf(&b, "    %s = stablehlo.broadcast_in_dim %%n, dims = [] "
