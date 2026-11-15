@@ -26,8 +26,9 @@ def sh(cmd, timeout=2400, env=None, cwd=None):
     if env:
         e.update(env)
     try:
+        workdir = cwd or (str(REPO) if REPO.exists() else str(OUT))
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                           timeout=timeout, env=e, cwd=cwd or str(REPO))
+                           timeout=timeout, env=e, cwd=workdir)
         out = (r.stdout or "") + (r.stderr or "")
         print(out[-4000:], flush=True)
         return r.returncode, out
@@ -81,7 +82,8 @@ def main():
     RESULT["gate_build"] = rc
     if rc == 0:
         sh("./betterAnusbis --listen 127.0.0.1:%d --target http://127.0.0.1:%d "
-           "--algorithm tensor --difficulty 8 >/tmp/gate.log 2>&1 &" % (PORT, BACKEND_PORT))
+           "--algorithm tensor --difficulty 8 >/tmp/gate.log 2>&1 &" % (PORT, BACKEND_PORT),
+           cwd=str(REPO / "betterAnusbis"))
         time.sleep(1)
         rc, out = sh("cd %s && python3 anubis_solver.py http://127.0.0.1:%d/" % (REPO, PORT), timeout=300)
         RESULT["gate_tensor"] = {"rc": rc, "passed": "PAST THE WALL" in out, "tail": out[-800:]}
