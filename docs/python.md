@@ -20,7 +20,7 @@ challenge = a.AnubisChallenge.from_payload(payload)   # from the JSON dict
 |---|---|
 | `id` | challenge id (the `id` query parameter) |
 | `random_data` | the challenge string that is hashed |
-| `algorithm` | `fast`, `slow`, `sha256`, `wasm-sha256`, `argon2id`, `hashx` |
+| `algorithm` | `fast`, `slow`, `sha256`, `wasm-sha256`, `argon2id`, `hashx`, `tensor` |
 | `difficulty` | leading zero nibbles (fast/slow) or bits (the rest) |
 | `method` | HTTP method the site expects (`POST` by default) |
 | `raw` | the original payload |
@@ -54,7 +54,7 @@ solver.sha256_hex(b"abc")        # native SHA-256
 ```
 
 `solver.supported()` accepts the names in `AnubisSolver.ALGORITHMS`
-(`fast`, `slow`, `sha256`, `wasm-sha256`, `argon2id`, `hashx`).
+(`fast`, `slow`, `sha256`, `wasm-sha256`, `argon2id`, `hashx`, `tensor`).
 
 ## Errors
 

@@ -61,7 +61,7 @@ falls back to the CPU.
 ## `UnsupportedAlgorithm`
 
 The challenge uses an algorithm the build does not know. Supported:
-`fast`, `slow`, `sha256`, `wasm-sha256`, `argon2id`, `hashx`.
+`fast`, `slow`, `sha256`, `wasm-sha256`, `argon2id`, `hashx`, plus `tensor` in the C API and the clients.
 
 ## The search seems slow
 

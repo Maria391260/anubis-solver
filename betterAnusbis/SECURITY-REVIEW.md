@@ -161,6 +161,27 @@ policy path, and a request with no headers at all.
 Result: no ASan or UBSan report, process alive afterwards, and the answers stayed right
 (CRLF in `redir` rejected, dot segments 400, both bogus lengths 200 with no body read).
 
+## `tensor`: verification costs a GEMM
+
+The `tensor` tier verifies by recomputing the same integer GEMM the client
+computed, so one accepted pass costs the server 3.7 ms at difficulty 4, 20 ms at
+8, 54 ms at 12 and 130 ms at 16 (16 threads). Three things keep that bounded:
+
+- the nonce is always 0 and the response must be a 64-hex digest, so a request
+  that cannot possibly be an answer is refused before any GEMM runs;
+- a challenge is only verifiable after the client has fetched it, and with
+  `--stateful` it is retired on first use, so retries are bounded per challenge;
+- the cheapest difficulty is the default the policy gives you, and the same GEMM
+  that the attacker pays for is the one the server pays for, so the ratio is 1:1
+  rather than the hash tiers' 1:2^difficulty.
+
+What it does *not* do is rate limit: a client that keeps fetching fresh
+challenges and posting made-up 64-hex answers can make the gate spend one GEMM
+per attempt. That is the inherent cost of a proof-of-compute tier and is the
+reason `tensor` ships with difficulty 8 as the documented default rather than
+16. Deployments that need a hard cap should put a per-IP request limit in front
+of the gate, or use `--stateful` so each challenge can be spent once.
+
 ## Known open items
 
 - **`policyRule` is hardcoded to `"rule-0"`.** Upstream puts a hash of the matched rule in the

@@ -41,6 +41,9 @@ assembly and optional GPU backends.
 
 - **All five Anubis algorithms**: `fast`, `slow`, `sha256` (WASM), `argon2id`
   (WASM) and `hashx` (WASM), byte-exact against every Anubis release.
+- **A sixth, ours: `tensor`** — one integer int8 GEMM whose digest is the
+  proof, run in the browser on WebNN, on a wasm kernel, or in plain JavaScript.
+  The one tier where acceleration is the point rather than a bonus.
 - **CPU kernels**: hand-written AVX2, SHA-NI, AVX-512 and AArch64 NEON/SHA-2
   assembly, with runtime dispatch down to a portable C fallback.
 - **GPU backends** (all opt-in except SHA-256): CUDA, oneAPI Level Zero,
@@ -203,9 +206,9 @@ It builds for Linux x86-64, Linux aarch64 and Windows x86-64; the Windows releas
 is a native mingw-w64 build that ships `betterAnusbis.exe` + `anubis_solver.dll`
 as a zip and an MSI installer (`betterAnusbis/win32/build-windows.sh`).
 
-All six algorithms are gated and verified (fast, slow, sha256, argon2id, hashx,
-metarefresh), `./test-all-algorithms.sh` asserts the protected page comes back for
-each, and tampering gets a 403.
+All seven algorithms are gated and verified (fast, slow, sha256, argon2id, hashx,
+tensor, metarefresh), `./test-all-algorithms.sh` asserts the protected page comes
+back for each, and tampering gets a 403.
 
 It also has the pieces a real deployment asks for: a **policy file** (allow /
 deny / challenge on user agent, path, header or IPv4 CIDR, with per-rule

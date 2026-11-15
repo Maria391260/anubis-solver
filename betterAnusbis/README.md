@@ -295,6 +295,7 @@ challenge bytes and only falls back to fetching the interpreter.
 | `sha256` | `sha256_pow_batch.wasm` (four nonces wide) | 38.7 KB | exact, and **1.8-2.1x faster** |
 | `argon2id` | `argon2id_pow.wasm` (our register-resident fill, m=19456 t=2 p=1) | 13.9 KB | **exact, and 1.02-1.05x faster** |
 | `hashx` | compiled in the page from the challenge (`hashx_jit.mjs`), falling back to `hashx_pow.wasm` | 10.4 KB / 14.9 KB | **exact, and 7-8x faster** |
+| `tensor` | `tensor_pow.wasm` (int8 GEMM, SIMD dot) | 44.9 KB | not comparable: Anubis has no such tier. Exact against the C engine and the page's JavaScript |
 
 `sha256` and the nibble challenges also have a **pure-JavaScript SHA-256**.
 If WebAssembly is missing or the module will not instantiate, the page computes
@@ -321,6 +322,36 @@ and ~0.7-1.5 s per hash — 9-16x the wasm module. Light is a few seconds, mediu
 ~11-20 s, hard ~45-90 s, so it is the last resort of the three, but it keeps a
 wasm-less browser able to solve. Checked against `argon2id_pow.wasm` and the C
 engine by `node tests_js_argon2id.mjs`.
+
+`tensor` is the one tier that is not a hash, and the one where acceleration is
+the point instead of a bonus. The proof is a single integer matrix product:
+
+```
+raw    = hex_decode(randomData)              seed = SHA256(raw)
+stream = concat SHA256(seed || u32le(counter)) for counter = 0, 1, 2, ...
+A[i]   = stream[i] & 0x7f                    uint8, N x N
+B[i]   = int8(stream[N*N + i])               int8,  N x N
+C      = A * B, exact int32
+proof  = SHA256(C as N*N little-endian int32)     N = 64 * clamp(difficulty, 2, 16)
+```
+
+There is no nonce to search: the digest is the whole proof, and the server
+recomputes one GEMM to check it. The page tries **WebNN** first (an int8 `gemm`
+in a graph, which reaches NPUs and integrated GPUs), then `tensor_pow.wasm`,
+then a pure-JavaScript GEMM; `#pure-js` forces the last one. WebNN results are
+never trusted blindly: the page recomputes two output rows in JavaScript and
+falls through if they disagree, because backend int8 support is uneven and a
+wrong GEMM would only produce a rejected digest.
+
+Everything is integer on purpose. Float addition reassociates, so a float GEMM
+would give a different digest per tiling or backend and the server could never
+check it; int32 accumulation in a fixed order is identical in wasm, JavaScript,
+WebNN and the C verifier. Measured on one i7-1260P core (see
+[SPEED.md](../SPEED.md#tensor-one-integer-gemm-and-why-webnn-is-its-real-target)):
+difficulty 8 is a 512x512x512 product, about 40 ms in the wasm kernel and
+0.4-0.7 s in JavaScript; the server's C verifier takes 20 ms. Checked by
+`node tests_js_tensor.mjs`, `node wasm/verify-tensor.mjs` and the C engine's
+`anubis_tensor_digest`.
 
 `hashx` also shows what it costs. The page compiles the challenge's program,
 then scans nonces in windows of 262,144 and drives a progress bar that says

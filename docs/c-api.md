@@ -83,7 +83,9 @@ int anubis_gpu_verify(void);
 ```
 
 Which family to call: `nibbles` for `fast`/`slow`, `bits` for
-`sha256`/`wasm-sha256`, `argon2id`, `hashx` respectively.
+`sha256`/`wasm-sha256`, `argon2id`, `hashx` respectively, plus
+`anubis_verify_tensor` and `anubis_tensor_digest` for the deterministic
+`tensor` tier (one int8 GEMM; the nonce is always 0).
 
 Argument encoding matters:
 

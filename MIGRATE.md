@@ -173,7 +173,8 @@ packaging and a handful of things Win32 does not have:
 - **Windows 10/11 x86-64.** `--bind-network unix` additionally needs Windows 10
   1803+ for AF_UNIX; the normal TCP listener does not.
 - **The WASM kernels are not in the zip/MSI.** The browser-side files
-  (`sha256_pow_batch.wasm`, `argon2id_pow.wasm`, `hashx_pow.wasm`) live in the
+  (`sha256_pow_batch.wasm`, `argon2id_pow.wasm`, `hashx_pow.wasm`,
+  `tensor_pow.wasm`) live in the
   repository's `wasm/` directory; point `--web` there. Without them `sha256`
   falls back to JavaScript and `argon2id`/`hashx` cannot be solved in the
   browser — which is the same rule as on Linux, the archives just do not carry
@@ -273,7 +274,12 @@ difficulty 12 is a joke that stops being funny on battery.
 **Pick the cheapest algorithm that stops your bots.** `sha256` is the lightest
 on a browser: one WASM hash loop, no memory. `argon2id` and `hashx` are much
 heavier on purpose; they cost mobile CPUs and battery, so raise them only when
-you have a reason.
+you have a reason. `tensor` is the fourth option and the only one that is not a
+hash: difficulty *d* means a matrix of `N = 64*clamp(d,2,16)`, so `--difficulty 8`
+is a 512x512x512 int8 product (about 40 ms in wasm, 0.4-0.7 s in JavaScript,
+20 ms to verify). It is the tier to reach for when you specifically want a
+browser that can run WebNN or wasm SIMD, and the only one whose proof is
+deterministic rather than a nonce search.
 
 **Keep the cookie settings stable.** `--dynamic-cookie-suffix` (on by default)
 puts a hash of your cookie settings in the cookie's *name*. Change a cookie flag

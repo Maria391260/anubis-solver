@@ -37,6 +37,8 @@ between algorithms is what matters.
 | `sha256` (pure JS, browser fallback) | ~0.89 M/s | one nonce per hash, reused padding; ~9x slower than the wasm kernel |
 | `hashx` (pure JS, browser fallback) | ~13-15 k/s | BigInt interpreter of the challenge's program; no wasm/WebGPU |
 | `argon2id` (pure JS, browser fallback) | ~0.7-1.4/s | ~0.7-1.5 s/hash, 19 MiB; ~9-16x the wasm module |
+| `tensor` (WASM, browser) | ~4.2-8.1 GMAC/s | int8 GEMM, SIMD dot; not a hash rate, see below |
+| `tensor` (pure JS, browser fallback) | ~0.4-0.7 GMAC/s | same GEMM in JavaScript; ~10-13x slower |
 | `fast`, `slow` (pure JS, browser) | ~0.36 M/s | a fresh padded block per candidate; the nibble challenges have no wasm module |
 
 Correcting an earlier row here: this table used to say `hashx` was 3.6 M/s
@@ -98,6 +100,29 @@ The pure-JavaScript fallback is ~13-15k hashes/s, or about 24 ms / 2.44 s /
 45 s at these tiers; see
 [Argon2id in pure JavaScript](#argon2id-in-pure-javascript). These numbers were 30% faster than reality before the module was
 rebuilt; see [the wasm section](#argon2id-in-wasm-why-it-was-2x-slower-and-what-fixed-it).
+
+### `tensor` (WASM, WebNN, pure JS) — difficulty selects the matrix
+
+`tensor` is not a hash tier, so its difficulty is not a bit count. It is the
+matrix size: `N = 64 * clamp(difficulty, 2, 16)`, so difficulty 8 is a
+512x512x512 int8 product. One challenge is one GEMM and there is no nonce to
+search: the digest of the result is the answer, and the server recomputes that
+same GEMM to check it.
+
+| difficulty | N | work | wasm kernel | pure JS | C verifier (16 threads) |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 256 | 0.034 GMAC | 7.9 ms | 82 ms | 3.7 ms |
+| 8 | 512 | 0.27 GMAC | 41 ms | 408 ms | 20 ms |
+| 12 | 768 | 0.91 GMAC | 112 ms | 1.46 s | 54 ms |
+| 16 | 1024 | 2.15 GMAC | 281 ms | 3.44 s | 130 ms |
+
+The wasm kernel runs 4.2-8.1 GMAC/s depending on size (it is memory-bound at
+N=256 and compute-bound above 512), the JavaScript GEMM 0.4-0.7 GMAC/s, and
+the C verifier is one GEMM on the server, not `2^difficulty` of them. WebNN,
+when the browser has it, is a single int8 `gemm` in a graph and is the reason
+the tier exists; it is not in the table because this box has no browser that
+exposes `navigator.ml`, so any number for it would be invented. See
+[the section below](#tensor-one-integer-gemm-and-why-webnn-is-its-real-target).
 
 ## Per-version table
 
@@ -932,6 +957,69 @@ checked against `argon2id_pow.wasm` and the C engine's
 Reproduce: `node betterAnusbis/bench-js-argon2id.mjs`; the wasm comparison is
 `node wasm/bench-a2i.mjs`. Raw data:
 [`results/js-argon2id-2026-11-15.json`](results/js-argon2id-2026-11-15.json).
+
+### `tensor`: one integer GEMM, and why WebNN is its real target
+
+The three Anubis tiers all scale with integer/bit throughput, which is the axis
+a CPU with wide SIMD is already good at and a GPU is often *worse* at. The
+natural accelerated primitive is a matrix product, so `tensor` makes the work
+exactly that:
+
+```
+raw    = hex_decode(randomData)
+seed   = SHA256(raw)
+stream = concat SHA256(seed || u32le(counter)) for counter = 0, 1, 2, ...
+A[i]   = stream[i] & 0x7f                  uint8, N x N, row-major
+B[i]   = int8(stream[N*N + i])             int8,  N x N, row-major
+C      = A * B, exact int32
+proof  = SHA256(C as N*N little-endian int32)
+N      = 64 * clamp(difficulty, 2, 16)
+```
+
+Three details are load-bearing.
+
+**It has to be integer.** Float addition reassociates, so a float GEMM gives a
+different sum for every tiling, vector width and backend. The digest would then
+depend on which kernel computed it and the server could not verify anything.
+Integer accumulation in a fixed order is exact everywhere: the wasm kernel, the
+JavaScript GEMM, WebNN and the C verifier produce identical bytes, and a digest
+mismatch is a real failure, not rounding.
+
+**A is masked to seven bits.** A pair of products then always fits an i16
+(2 x 127 x 127 = 32,258 < 32,767), which is what allows the wasm
+`i16x8` dot and the x86 `maddubs`/`madd` kernels to use widening multiply-add
+without saturation. Seven bits per byte is still 7/8 of the entropy, and the
+stream is expanded from a SHA-256 seed, so nothing is lost.
+
+**Verification costs one solve, not a search.** The digest covers every output
+element, so a client cannot produce it without producing `C`, and the server
+recomputes one GEMM per accepted pass: 20 ms at difficulty 8, 130 ms at 16.
+That is a different cost model from the hash tiers, where verification is one
+hash and the client pays `2^difficulty`; it is the price of making the tier a
+real proof of compute rather than a lottery.
+
+The page runs a **WebNN** int8 `gemm` when `navigator.ml` exists, then the
+wasm kernel, then the pure-JavaScript GEMM (also forced by `#pure-js`). WebNN
+is the tier's real target: it is a JavaScript API that reaches NPUs and
+integrated GPUs where a WebGPU dispatch is either slow or absent, and its
+result is checked before it is trusted — the page recomputes two output rows in
+JavaScript (0.4% of the work) and rejects the whole path if they disagree.
+That check exists because backend int8 support is uneven; a backend that
+returns floats, saturates, or silently drops to a wrong quantisation must not
+be able to produce a digest the server would reject anyway.
+
+Correctness: the wasm kernel is checked in 48 cases against an independent
+Node reference (`wasm/verify-tensor.mjs`, including all-127 and all--128
+inputs), the page's JavaScript against `node:crypto` and an independent GEMM
+(`betterAnusbis/tests_js_tensor.mjs`, including the WebNN reject path), and the
+C verifier against a NumPy reference at every difficulty
+(`anubis_tensor_digest`). The three implementations agree on the same
+cross-check vectors.
+
+Reproduce: `node betterAnusbis/bench-js-tensor.mjs --wasm` for the JS-vs-wasm
+comparison on the same challenge, `node wasm/bench-tensor.mjs` for kernel-only
+rates. Raw data:
+[`results/js-tensor-2026-11-15.json`](results/js-tensor-2026-11-15.json).
 
 ### WebGPU: three algorithms, three different verdicts
 
