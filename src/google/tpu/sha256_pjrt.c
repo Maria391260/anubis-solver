@@ -494,7 +494,7 @@ static void reference_digest(const uint8_t *raw, size_t raw_len, uint32_t nonce,
 int main(int argc, char **argv) {
     const char *lib = getenv("LIBTPU");
     const char *challenge = DEFAULT_CHALLENGE;
-    int difficulty = 20, lanes = 8192, json = 0;
+    int difficulty = 20, lanes = 8192, json = 0, selftest = 0;
     long long bench_hashes = 0;
     uint8_t raw[4096];
     size_t raw_len;
@@ -515,6 +515,8 @@ int main(int argc, char **argv) {
             lanes = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--bench-hashes") == 0 && i + 1 < argc) {
             bench_hashes = atoll(argv[++i]);
+        } else if (strcmp(argv[i], "--selftest") == 0) {
+            selftest = 1;
         } else if (strcmp(argv[i], "--json") == 0) {
             json = 1;
         } else {
@@ -564,6 +566,32 @@ int main(int argc, char **argv) {
             read_back(res, out, (size_t)lanes * 32);
             buffer_destroy(arg);
             buffer_destroy(res);
+        }
+        if (selftest) {
+            /* Lane 0 is nonce 0. Print the raw i32 words the device returned
+             * next to the CPU digest, so a readback/layout problem can be told
+             * apart from a wrong message. */
+            uint8_t ref0[32];
+            char hex0[65], rawhex[129];
+            const uint8_t *w0 = out; /* [lanes,8] i32, little-endian in memory */
+            uint8_t be[32], le[32];
+            for (int wi = 0; wi < 8; wi++) {
+                for (int k = 0; k < 4; k++) {
+                    be[4 * wi + k] = w0[4 * wi + 3 - k];
+                    le[4 * wi + k] = w0[4 * wi + k];
+                }
+            }
+            reference_digest(raw, raw_len, 0, use_le, ref0);
+            pjrt_to_hex((const uint8_t *)w0, 32, rawhex);
+            pjrt_to_hex(be, 32, hex0);
+            printf("selftest: nonce 0, use_le=%d\n", use_le);
+            printf("  tpu bytes   %s\n", rawhex);
+            printf("  tpu BE/word %s\n", hex0);
+            printf("  tpu LE/word %s\n", le[0] ? "see bytes" : "");
+            pjrt_to_hex(ref0, 32, hex0);
+            printf("  cpu digest  %s\n", hex0);
+            fflush(stdout);
+            return 0;
         }
         t0 = pjrt_now_s();
 
