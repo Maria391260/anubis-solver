@@ -9,11 +9,12 @@ linking C.
 
 ```bash
 make -j8 libanubis_solver.so
-cc -O2 -Isrc/fetch -Iinclude -o anubis_api \
-   src/api/anubis_api.c src/fetch/anubis_fetch.c \
-   -L. -lanubis_solver -Wl,-rpath,'$ORIGIN' -lssl -lcrypto -lpthread
+make anubis_api
 ./anubis_api --listen 127.0.0.1:8088
 ```
+
+The fetch layer is part of `libanubis_solver.so` (2.0.0 and later), so the
+service is one source file plus that library.
 
 It binds localhost by default in the documented command. It has **no
 authentication**: bind it to loopback or put it behind your own auth. Anyone who
@@ -31,7 +32,8 @@ can reach it can spend your CPU on proofs of work.
 
 ```json
 {"version":"2.0.0","codename":"shaoogle",
- "algorithms":["fast","slow","sha256","wasm-sha256","argon2id","hashx","tensor"]}
+ "algorithms":["fast","slow","sha256","wasm-sha256","argon2id","hashx","tensor"],
+ "impersonate":"chrome116","impersonate_available":true}
 ```
 
 ### `POST /v1/solve`
@@ -70,12 +72,29 @@ curl -s localhost:8088/v1/fetch -d '{"url":"https://example.com/"}'
 ```
 
 ```json
-{"status":200,"final_url":"https://example.com/","content":"<!doctype html>..."}
+{"status":200,"final_url":"https://example.com/",
+ "transport":"curl-impersonate/chrome116","content":"<!doctype html>..."}
 ```
 
 This is the same client the MCP server uses: it solves whatever challenge the
 site issues, keeps the cookies, and returns the final page. A failure to reach
 or solve the site is a 502 with `{"error":"..."}`.
+
+`transport` says which client actually made the request. `impersonate` picks a
+browser TLS fingerprint for this request only — the service is multi-threaded,
+so the profile is per call and never global:
+
+```bash
+curl -s localhost:8088/v1/fetch -d '{"url":"https://example.com/","impersonate":"chrome110"}'
+curl -s localhost:8088/v1/fetch -d '{"url":"https://example.com/","impersonate":"off"}'
+```
+
+Values are `chrome`, `edge`, `safari` (newest of each family), a concrete
+profile such as `chrome116`, `auto`, or `off` for the built-in OpenSSL client.
+Impersonation needs a [libcurl-impersonate](../3rd_party/curl-impersonate/README.md)
+installed; without it the default is OpenSSL and an explicit profile is a 502
+rather than a silent downgrade. `ANUBIS_IMPERSONATE` sets the default profile
+for the process.
 
 ## Limits
 

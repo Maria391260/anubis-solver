@@ -132,3 +132,19 @@ storage over HTTP with AWS Signature Version 4.
   protocol; no AWS SDK source is copied here.
 - Tests: `tests_s3.py` runs an in-process S3 mock that independently verifies
   SigV4, so no AWS account or MinIO is required.
+
+## curl-impersonate (optional, runtime only)
+
+The C fetch layer in [`src/fetch/`](src/fetch/) can present a browser TLS
+fingerprint by loading a **libcurl-impersonate** with `dlopen()`.
+
+- Upstream: https://github.com/lwthiker/curl-impersonate
+- License: MIT (the wrapped curl, BoringSSL, nghttp2 and brotli keep their own
+  licenses, and a build embeds them)
+- Vendored: **no**, and not linked. `libanubis_solver.so` builds and runs
+  without it; the library is only opened at runtime when it is installed (see
+  [`3rd_party/curl-impersonate/README.md`](3rd_party/curl-impersonate/README.md)).
+  Nothing built here redistributes it, so the terms of your curl-impersonate
+  build apply to that file.
+- Tests: `tests/impersonate_test.sh` starts a local `openssl s_server` and checks
+  the ClientHello for GREASE, so it needs no network.

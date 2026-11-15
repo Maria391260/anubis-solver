@@ -133,3 +133,40 @@ int main(void) {
 GPU use is opt-in through the environment (see [gpu.md](gpu.md)); the C API
 takes no GPU argument. Every GPU result is re-verified with the reference
 implementation and the search falls back to the CPU on a mismatch.
+
+## Fetching protected pages
+
+Since 2.0.0 the library also exports the client that the C services use, so a C
+program can fetch an Anubis-protected URL without spawning anything. The
+prototypes are in [`src/fetch/anubis_fetch.h`](../src/fetch/anubis_fetch.h) —
+that header is not part of `anubis-solver.h` because the layer is optional
+(`make FETCH=0` builds a library without it, and without the OpenSSL
+dependency).
+
+```c
+#include "anubis_fetch.h"
+
+anubis_page page;
+if (anubis_fetch_get_with("https://example.com/", "chrome", &page) == 0) {
+    printf("%d %s (%s)\n", page.status, page.final_url,
+           anubis_fetch_transport());          /* curl-impersonate/chrome116 */
+    fwrite(page.body, 1, page.body_len, stdout);
+    anubis_page_free(&page);
+}
+```
+
+| function | purpose |
+|---|---|
+| `anubis_fetch_get(url, &page)` | fetch, solving any challenge; default transport |
+| `anubis_fetch_get_with(url, target, &page)` | same, with a per-call TLS profile |
+| `anubis_fetch_set_impersonate(target)` | process default: `auto`, `off`, `chrome`, `chrome116`, … |
+| `anubis_fetch_impersonate()` | the configured profile, `""` when off |
+| `anubis_fetch_impersonate_available()` | 1 when libcurl-impersonate is installed |
+| `anubis_fetch_transport()` | transport of this thread's last fetch |
+| `anubis_fetch_version()` | version of the layer |
+
+Impersonation is a runtime `dlopen()` of a libcurl-impersonate, searched for in
+`$ANUBIS_IMPERSONATE_LIB`, `3rd_party/curl-impersonate/lib/`, next to the
+executable, then the system loader path. Without it the built-in OpenSSL client
+runs, and asking for a profile explicitly is an error instead of a silent
+downgrade.

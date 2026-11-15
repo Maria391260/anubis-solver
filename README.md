@@ -55,15 +55,28 @@ make services                 # anubis_api + anubis_mcp
 ./anubis_api --listen 127.0.0.1:8088
 ```
 
-Both are built on [`src/fetch/anubis_fetch.c`](src/fetch/anubis_fetch.c), which
-does the whole browser-equivalent flow in C: fetch the page, read the
-`anubis_challenge` JSON, solve it with the `.so` (every algorithm, including
-`tensor` and the time-based tiers), submit `pass-challenge` with the cookies the
-server set, and re-fetch. TLS is OpenSSL with verification on; HTTP/1.1 only,
-which is a deliberate scope limit for a tool client.
+Both are built on [`src/fetch/`](src/fetch/), which is part of the `.so` as of
+2.0.0: fetch the page, read the `anubis_challenge` JSON, solve it with the
+solver (every algorithm, including `tensor` and the time-based tiers), submit
+`pass-challenge` with the cookies the server set, and re-fetch. TLS is verified,
+with two clients:
+
+- **browser impersonation**, through
+  [curl-impersonate](3rd_party/curl-impersonate/README.md): Chrome's cipher
+  list, extension order, ALPN h2 and GREASE values. Loaded with `dlopen()` at
+  runtime, so it is optional and never a build dependency. Measured against
+  `tls.peet.ws`, the impersonated client presents
+  `ja4 t13d1516h2_8daaf6152771_e5627efa2ab1` and `ja3
+  fd09e6880f085c6348aecbfe10e30e8a` — Chrome 116's — while the fallback presents
+  OpenSSL's `http/1.1` handshake. Pick a profile per request
+  (`chrome`, `chrome116`, `edge101`, `safari15_5`), per process
+  (`ANUBIS_IMPERSONATE`), or turn it off;
+- **the built-in OpenSSL client**, HTTP/1.1 only, for when no such library is
+  installed or the target is local.
 
 ```bash
 make test-api test-mcp        # start a local gate, solve through both layers
+make test-impersonate         # local TLS server: GREASE present/absent per profile
 ```
 
 ## Highlights
@@ -81,6 +94,10 @@ make test-api test-mcp        # start a local gate, solve through both layers
   four CPU threads manage on the same challenge (see [docs/gpu.md](docs/gpu.md)).
 - **Three interfaces**: Python library + CLI, a public C/C++ header, and the
   shared library on its own.
+- **Browser TLS impersonation in C**: the fetch layer inside the `.so` speaks
+  Chrome's handshake (JA3/JA4-identical to Chrome 116, verified against
+  `tls.peet.ws`) using a `dlopen()`ed libcurl-impersonate, and falls back to its
+  own OpenSSL client when none is installed. No BoringSSL in the build.
 - **Two C services (new in 2.0.0)**: an **MCP server** over stdio (`anubis_mcp`)
   that lets an agent fetch Anubis-protected URLs and solve challenges, and an
   **HTTP API service** (`anubis_api`) exposing `/v1/solve`, `/v1/verify` and

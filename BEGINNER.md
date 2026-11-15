@@ -232,6 +232,30 @@ Any language with an HTTP client can use the API; anything that speaks MCP can
 use the server. Details: [`docs/api-service.md`](docs/api-service.md) and
 [`docs/mcp.md`](docs/mcp.md).
 
+### Looking like a browser (optional)
+
+A site that fingerprints TLS will still challenge you, because the built-in
+client's handshake is OpenSSL's. Install a libcurl-impersonate and the fetch
+layer sends Chrome's instead:
+
+```bash
+make impersonate-lib CURL_IMPERSONATE_LIB=/path/to/libcurl-impersonate-chrome.so.4
+```
+
+That is a runtime library the `.so` loads with `dlopen()` — it is never linked,
+and everything in this guide works without it. Then:
+
+```bash
+curl -s localhost:8088/v1/fetch -d '{"url":"https://example.com/","impersonate":"chrome"}'
+# {"status":200, ..., "transport":"curl-impersonate/chrome116","content":"..."}
+```
+
+`impersonate` also takes a concrete profile (`chrome110`, `edge101`,
+`safari15_5`) or `off`, and `ANUBIS_IMPERSONATE` pins the default for a whole
+process. `transport` in the answer tells you what was really used. To check it
+works on your machine, `make test-impersonate` starts a local TLS server and
+looks at the ClientHello it receives.
+
 ---
 
 ## 7. Where to go next
