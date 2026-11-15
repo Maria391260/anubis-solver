@@ -99,36 +99,87 @@ int main(int argc, char **argv) {
         printf("  device %zu: %p\n", i, (void *)da.addressable_devices[i]);
     }
 
-    /* Can the plugin compile the shape we need? HLO text is the one format the
-     * C API accepts as text, and a dot whose result element type is wider than
-     * its operands is exactly how XLA spells an int8 matmul that accumulates in
-     * int32 (the instruction's shape *is* the preferred element type). */
-    static const char hlo_text[] =
-        "HloModule tensor\n"
-        "\n"
-        "ENTRY %main (a: s8[128,128], b: s8[128,128]) -> s32[128,128] {\n"
-        "  %a = s8[128,128]{1,0} parameter(0)\n"
-        "  %b = s8[128,128]{1,0} parameter(1)\n"
-        "  ROOT %d = s32[128,128]{1,0} dot(%a, %b), "
-        "lhs_contracting_dims={1}, rhs_contracting_dims={0}\n"
+    /* Which program format does this plugin accept, and will it compile the
+     * int8 dot we need? The C API documents "hlo" (HloModuleProto) and
+     * "mlir"; libtpu rejected "hlo_text" outright, so try the MLIR spellings
+     * of the same operation and print each answer. One run, three facts:
+     *   - whether MLIR is accepted at all
+     *   - whether StableHLO accepts an s8 dot with an s32 result (its C20 says
+     *     the result element type must equal the operands', but implementations
+     *     can be ahead of the spec - this settles it)
+     *   - whether the legacy mhlo dialect is registered, as a fallback
+     */
+    static const char stablehlo_dot[] =
+        "module {\n"
+        "  func.func @main(%a: tensor<128x128xi8>, %b: tensor<128x128xi8>)\n"
+        "      -> tensor<128x128xi32> {\n"
+        "    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0],\n"
+        "        precision = [DEFAULT]\n"
+        "        : (tensor<128x128xi8>, tensor<128x128xi8>) -> tensor<128x128xi32>\n"
+        "    return %0 : tensor<128x128xi32>\n"
+        "  }\n"
+        "}\n";
+    static const char stablehlo_i8[] =
+        "module {\n"
+        "  func.func @main(%a: tensor<128x128xi8>, %b: tensor<128x128xi8>)\n"
+        "      -> tensor<128x128xi8> {\n"
+        "    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0],\n"
+        "        precision = [DEFAULT]\n"
+        "        : (tensor<128x128xi8>, tensor<128x128xi8>) -> tensor<128x128xi8>\n"
+        "    return %0 : tensor<128x128xi8>\n"
+        "  }\n"
+        "}\n";
+    static const char mhlo_dot[] =
+        "module {\n"
+        "  func.func @main(%a: tensor<128x128xi8>, %b: tensor<128x128xi8>)\n"
+        "      -> tensor<128x128xi32> {\n"
+        "    %0 = \"mhlo.dot_general\"(%a, %b)\n"
+        "        {dot_dimension_numbers = #mhlo.dot<\n"
+        "            lhs_contracting_dimensions = [1],\n"
+        "            rhs_contracting_dimensions = [0]>}\n"
+        "        : (tensor<128x128xi8>, tensor<128x128xi8>) -> tensor<128x128xi32>\n"
+        "    return %0 : tensor<128x128xi32>\n"
+        "  }\n"
         "}\n";
 
-    PJRT_Program prog = {0};
-    prog.struct_size = sizeof prog;
-    prog.code = (char *)hlo_text;
-    prog.code_size = sizeof hlo_text - 1;
-    prog.format = "hlo_text";
-    prog.format_size = 8;
+    struct {
+        const char *label;
+        const char *format;
+        const char *code;
+    } variants[] = {
+        {"stablehlo dot i8->i32", "mlir", stablehlo_dot},
+        {"stablehlo dot i8->i8", "mlir", stablehlo_i8},
+        {"mhlo dot_general i8->i32", "mlir", mhlo_dot},
+    };
 
-    PJRT_Client_Compile_Args cc = {0};
-    cc.struct_size = sizeof cc;
-    cc.client = ca.client;
-    cc.program = &prog;
-    e = api->PJRT_Client_Compile(&cc);
-    if (e != NULL) {
-        show_error(api, e, "compile hlo_text dot");
-        return 1;
+    for (size_t v = 0; v < sizeof variants / sizeof variants[0]; v++) {
+        PJRT_Program prog = {0};
+        prog.struct_size = sizeof prog;
+        prog.code = (char *)variants[v].code;
+        prog.code_size = strlen(variants[v].code);
+        prog.format = variants[v].format;
+        prog.format_size = strlen(variants[v].format);
+
+        PJRT_Client_Compile_Args cc = {0};
+        cc.struct_size = sizeof cc;
+        cc.client = ca.client;
+        cc.program = &prog;
+        PJRT_Error *ce = api->PJRT_Client_Compile(&cc);
+        if (ce != NULL) {
+            PJRT_Error_Message_Args ma = {0};
+            ma.struct_size = sizeof ma;
+            ma.error = ce;
+            api->PJRT_Error_Message(&ma);
+            printf("compile[%s]: FAIL %.*s\n", variants[v].label,
+                   (int)ma.message_size, ma.message);
+            PJRT_Error_Destroy_Args ed = {0};
+            ed.struct_size = sizeof ed;
+            ed.error = ce;
+            api->PJRT_Error_Destroy(&ed);
+        } else {
+            printf("compile[%s]: OK executable=%p\n", variants[v].label,
+                   (void *)cc.executable);
+        }
     }
-    printf("compiled: executable=%p\n", (void *)cc.executable);
     return 0;
 }
