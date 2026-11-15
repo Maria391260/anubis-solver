@@ -44,6 +44,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -307,7 +308,8 @@ class _Native:
                 ctypes.POINTER(ctypes.c_double),
             ]
 
-        for name in ("anubis_verify_argon2id", "anubis_verify_hashx"):
+        for name in ("anubis_verify_argon2id", "anubis_verify_hashx",
+                     "anubis_verify_tensor"):
             fn = getattr(lib, name)
             fn.restype = ctypes.c_int
             fn.argtypes = [
@@ -462,6 +464,31 @@ class _Native:
             "anubis_verify_hashx", challenge_hex, nonce, difficulty
         )
 
+    def solve_tensor(
+        self, challenge_hex: str, difficulty: int, threads: int, budget_ms: float
+    ) -> tuple[int, str, float]:
+        """The `tensor` proof is deterministic: one GEMM and its digest.
+
+        There is nothing to search, so threads and budget_ms do not apply; the
+        nonce is always 0. Kept in the same shape as the other solvers so the
+        caller does not need a second code path.
+        """
+        fn = self.lib.anubis_tensor_digest
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
+        out = ctypes.create_string_buffer(65)
+        started = time.perf_counter()
+        rc = fn(challenge_hex.encode(), int(difficulty), out)
+        elapsed = (time.perf_counter() - started) * 1000.0
+        if rc != ANUBIS_OK:
+            raise SolverError(f"tensor digest failed: {_RC_TEXT.get(rc, rc)}")
+        return 0, out.value.decode(), elapsed
+
+    def verify_tensor(self, challenge_hex: str, nonce: int, difficulty: int) -> tuple[bool, str]:
+        return self._verify_wasm_alg(
+            "anubis_verify_tensor", challenge_hex, nonce, difficulty
+        )
+
     def verify_bits(self, challenge_hex: str, nonce: int, difficulty: int) -> tuple[bool, str]:
         out = ctypes.create_string_buffer(65)
         rc = self.lib.anubis_verify_bits(
@@ -519,7 +546,7 @@ class AnubisSolver:
     """Solve anubis challenges using the native C engine."""
 
     ALGORITHMS = frozenset(
-        {"fast", "slow", "sha256", "wasm-sha256", "argon2id", "hashx"}
+        {"fast", "slow", "sha256", "wasm-sha256", "argon2id", "hashx", "tensor"}
     )
 
     def __init__(
@@ -583,6 +610,10 @@ class AnubisSolver:
             nonce, response, elapsed = self._native.solve_hashx(
                 challenge.random_data, difficulty, self.threads, self.budget_ms
             )
+        elif algorithm == "tensor":
+            nonce, response, elapsed = self._native.solve_tensor(
+                challenge.random_data, difficulty, self.threads, self.budget_ms
+            )
         else:
             raise UnsupportedAlgorithm(f"unknown challenge algorithm {algorithm!r}")
 
@@ -610,6 +641,10 @@ class AnubisSolver:
             )
         elif challenge.algorithm == "hashx":
             ok, _ = self._native.verify_hashx(
+                challenge.random_data, nonce, challenge.difficulty
+            )
+        elif challenge.algorithm == "tensor":
+            ok, _ = self._native.verify_tensor(
                 challenge.random_data, nonce, challenge.difficulty
             )
         else:

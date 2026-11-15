@@ -2192,6 +2192,254 @@ int anubis_verify_hashx(const char *challenge_hex, uint32_t nonce, int difficult
 }
 
 /* ------------------------------------------------------------------ */
+/* Public API: tensor challenge (one int8 GEMM, digest of the result)  */
+/* ------------------------------------------------------------------ */
+
+/* `tensor` is the tier where acceleration is the point rather than a
+ * bonus: the work is a single integer GEMM and nothing else.
+ *
+ *   N      = 64 * clamp(difficulty, 2, 16)     (512 at difficulty 8)
+ *   seed   = SHA256(raw challenge bytes)
+ *   stream = SHA256(seed || u32le(counter)) for counter = 0, 1, ...
+ *   A[i]   = stream[i] & 0x7f        uint8, row-major N x N
+ *   B[i]   = (int8)stream[N*N + i]   int8,  row-major N x N
+ *   C      = A * B, exact int32
+ *   digest = SHA256(C as N*N little-endian int32)
+ *
+ * There is no nonce search. The proof is the digest, so the client pays one
+ * GEMM per challenge and the server pays one GEMM per accepted pass instead
+ * of 2^difficulty of them. A client cannot shortcut the work either: the
+ * digest covers every output element, so producing it means producing C.
+ *
+ * A is masked to seven bits on purpose. A pair of products then always fits
+ * an i16 (2 * 127 * 127 = 32258 < 32767), which is what lets the wasm and
+ * x86 kernels use the widening multiply-add instructions without saturation.
+ * The accumulation cannot overflow int32: |C| <= 127 * 128 * N <= 16.6M at
+ * N = 1024.
+ *
+ * Everything here is integer, in a fixed order, so every implementation
+ * (this one, the wasm kernel, WebNN, the pure-JavaScript fallback) produces
+ * the same bytes. That is the whole reason the tier is verifiable at all: a
+ * float GEMM would reassociate and stop matching after the first kernel.
+ */
+
+#define ANUBIS_TENSOR_MIN_DIFFICULTY 2
+#define ANUBIS_TENSOR_MAX_DIFFICULTY 16
+
+static int tensor_dim(int difficulty) {
+    int d = difficulty;
+
+    if (d < ANUBIS_TENSOR_MIN_DIFFICULTY) {
+        d = ANUBIS_TENSOR_MIN_DIFFICULTY;
+    }
+    if (d > ANUBIS_TENSOR_MAX_DIFFICULTY) {
+        d = ANUBIS_TENSOR_MAX_DIFFICULTY;
+    }
+    return 64 * d;
+}
+
+/* Fill A and B from SHA256(seed || u32le(counter)), consuming the stream in
+ * order: the first N*N bytes are A, the next N*N are B. */
+static void tensor_expand(const uint8_t seed[32], uint8_t *a, int8_t *b,
+                          size_t count) {
+    sha256_ctx base;
+    size_t pos = 0;
+    uint32_t counter = 0;
+
+    sha256_init(&base);
+    sha256_update(&base, seed, 32);
+
+    while (pos < 2 * count) {
+        sha256_ctx c = base;
+        uint8_t ctr[4];
+        uint8_t block[32];
+        size_t i;
+
+        ctr[0] = (uint8_t)counter;
+        ctr[1] = (uint8_t)(counter >> 8);
+        ctr[2] = (uint8_t)(counter >> 16);
+        ctr[3] = (uint8_t)(counter >> 24);
+        sha256_update(&c, ctr, sizeof ctr);
+        sha256_final(&c, block);
+
+        for (i = 0; i < sizeof block && pos < 2 * count; i++, pos++) {
+            if (pos < count) {
+                a[pos] = (uint8_t)(block[i] & 0x7f);
+            } else {
+                b[pos - count] = (int8_t)block[i];
+            }
+        }
+        counter++;
+    }
+}
+
+typedef struct {
+    const uint8_t *a;
+    const int8_t *b;
+    int32_t *c;
+    int n;
+    int begin;
+    int end;
+} tensor_job;
+
+/* i-k-j: the inner loop walks one row of B and one row of C, so the only
+ * streams are sequential and the expression vectorises to widening
+ * multiply-adds on every target that has them. */
+static void tensor_gemm_rows(const tensor_job *job) {
+    const int n = job->n;
+    int i;
+
+    for (i = job->begin; i < job->end; i++) {
+        int32_t *row = job->c + (size_t)i * (size_t)n;
+        const uint8_t *arow = job->a + (size_t)i * (size_t)n;
+        int k;
+
+        memset(row, 0, (size_t)n * sizeof *row);
+        for (k = 0; k < n; k++) {
+            const int32_t av = (int32_t)arow[k];
+            const int8_t *brow = job->b + (size_t)k * (size_t)n;
+            int j;
+
+            for (j = 0; j < n; j++) {
+                row[j] += av * (int32_t)brow[j];
+            }
+        }
+    }
+}
+
+static void *tensor_gemm_thread(void *p) {
+    tensor_gemm_rows((const tensor_job *)p);
+    return NULL;
+}
+
+/* Rows are independent, so the Gemm splits cleanly. Verification is on the
+ * request path: one thread makes a difficulty-16 pass (N = 1024) take about a
+ * second, which is not acceptable for a gate. */
+static void tensor_gemm(const uint8_t *a, const int8_t *b, int32_t *c, int n) {
+    tensor_job jobs[16];
+    pthread_t tids[16];
+    int threads = anubis_default_threads();
+    int started = 0;
+    int t;
+
+    if (threads > n / 32) {
+        threads = n / 32;
+    }
+    if (threads > 16) {
+        threads = 16;
+    }
+    if (threads < 1) {
+        threads = 1;
+    }
+
+    for (t = 0; t < threads; t++) {
+        jobs[t].a = a;
+        jobs[t].b = b;
+        jobs[t].c = c;
+        jobs[t].n = n;
+        jobs[t].begin = n * t / threads;
+        jobs[t].end = n * (t + 1) / threads;
+    }
+
+    if (threads == 1) {
+        tensor_gemm_rows(&jobs[0]);
+        return;
+    }
+
+    for (t = 0; t < threads; t++) {
+        if (pthread_create(&tids[t], NULL, tensor_gemm_thread, &jobs[t]) != 0) {
+            break;
+        }
+        started++;
+    }
+    /* runs the slices whose thread never started, including after a failure */
+    for (t = started; t < threads; t++) {
+        tensor_gemm_rows(&jobs[t]);
+    }
+    for (t = 0; t < started; t++) {
+        pthread_join(tids[t], NULL);
+    }
+}
+
+ANUBIS_EXPORT
+int anubis_tensor_digest(const char *challenge_hex, int difficulty, char *out_hex) {
+    uint8_t seed[32];
+    uint8_t *a = NULL;
+    int8_t *b = NULL;
+    int32_t *c = NULL;
+    uint8_t *ser = NULL;
+    uint8_t digest[32];
+    sha256_ctx s;
+    uint8_t raw[4096];
+    size_t raw_len = 0;
+    int n;
+    int rc = ANUBIS_ERR_INTERNAL;
+    size_t cells;
+    size_t i;
+
+    if (challenge_hex == NULL || out_hex == NULL) {
+        return ANUBIS_ERR_ARG;
+    }
+    if (difficulty < 0) {
+        return ANUBIS_ERR_ARG;
+    }
+
+    rc = hex_decode(challenge_hex, raw, sizeof raw, &raw_len);
+    if (rc != ANUBIS_OK) {
+        return rc;
+    }
+
+    n = tensor_dim(difficulty);
+    cells = (size_t)n * (size_t)n;
+
+    a = malloc(cells);
+    b = malloc(cells);
+    c = malloc(cells * sizeof *c);
+    ser = malloc(cells * 4);
+    if (a == NULL || b == NULL || c == NULL || ser == NULL) {
+        goto out;
+    }
+
+    /* The seed is the *decoded* challenge bytes, not the hex text: the
+     * browser hands the wasm kernel exactly those bytes, and the page hashes
+     * the same array, so all three paths start from identical input. */
+    sha256_init(&s);
+    sha256_update(&s, raw, raw_len);
+    sha256_final(&s, seed);
+
+    tensor_expand(seed, a, b, cells);
+    tensor_gemm(a, b, c, n);
+
+    for (i = 0; i < cells; i++) {
+        uint32_t v = (uint32_t)c[i];
+        ser[4 * i + 0] = (uint8_t)v;
+        ser[4 * i + 1] = (uint8_t)(v >> 8);
+        ser[4 * i + 2] = (uint8_t)(v >> 16);
+        ser[4 * i + 3] = (uint8_t)(v >> 24);
+    }
+
+    sha256_init(&s);
+    sha256_update(&s, ser, cells * 4);
+    sha256_final(&s, digest);
+    to_hex(digest, 32, out_hex);
+    rc = ANUBIS_OK;
+
+out:
+    free(a);
+    free(b);
+    free(c);
+    free(ser);
+    return rc;
+}
+
+ANUBIS_EXPORT
+int anubis_verify_tensor(const char *challenge_hex, uint32_t nonce, int difficulty,
+                         char *out_hex) {
+    (void)nonce; /* the proof is deterministic: the nonce is always 0 */
+    return anubis_tensor_digest(challenge_hex, difficulty, out_hex);
+}
+
+/* ------------------------------------------------------------------ */
 /* Public API: helpers                                                 */
 /* ------------------------------------------------------------------ */
 

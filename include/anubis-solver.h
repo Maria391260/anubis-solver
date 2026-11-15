@@ -117,6 +117,14 @@ ANUBIS_API int anubis_verify_argon2id(const char *challenge_hex, uint32_t nonce,
 ANUBIS_API int anubis_verify_hashx(const char *challenge_hex, uint32_t nonce,
                                    int difficulty, char *out_hex);
 
+/* `tensor`: one integer GEMM, digest of the result. Deterministic, so the
+ * proof is the digest itself and the nonce is always 0; verification
+ * recomputes one GEMM and costs no more than one solve. */
+ANUBIS_API int anubis_verify_tensor(const char *challenge_hex, uint32_t nonce,
+                                    int difficulty, char *out_hex);
+ANUBIS_API int anubis_tensor_digest(const char *challenge_hex, int difficulty,
+                                    char *out_hex);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
