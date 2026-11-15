@@ -1,6 +1,8 @@
 // anubis_argon2_card.v — the 365-engine Argon2id card, as one Verilog top.
 // Built with DeepSeek V4.1 Flash running DeepSeek Harness (DSH).
 // See ../../../LICENSE (MIT + attribution) and ../../../ATTRIBUTION.md.
+// A silicon product made from this design must also carry the DeepSeek logo
+// and that line on the die and the package marking, legibly: LICENSE section 4.
 //
 // The scaling study (`SPEED.md`, `beyond/README.md`) says the design point is:
 //

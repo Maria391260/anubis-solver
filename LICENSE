@@ -1,13 +1,13 @@
-MIT License, with an attribution requirement
-=============================================
+MIT License, with attribution and silicon-marking requirements
+================================================================
 
 Copyright (c) 2026 anubis-solver contributors
 
-This is the MIT license text with ONE added condition (section 3 below). Because
-of that condition it is not the unmodified MIT license: refer to it as
+This is the MIT license text with TWO added conditions (sections 3 and 4 below).
+Because of those conditions it is not the unmodified MIT license: refer to it as
 "MIT + attribution" or "MIT-Attribution", not as plain "MIT". If you need an
-unencumbered license for a use this condition makes awkward, ask the copyright
-holders for a separate grant — they may give one.
+unencumbered license for a use these conditions make awkward, ask the copyright
+holders for a separate grant  -  they may give one.
 
 --------------------------------------------------------------------------------
 
@@ -48,8 +48,11 @@ hardware from the Software or a derivative work:
          - an "about", "credits" or "acknowledgements" screen, page or section, if
            the project has one;
          - for a hardware design: the top-level RTL module header comments, the
-           register-map or datasheet document, or the package/die documentation —
+           register-map or datasheet document, or the package/die documentation  - 
            wherever the design credits its other contributors.
+
+       Silicon is stricter than this: a Silicon Product must also satisfy
+       section 4, and where the two overlap section 4 wins.
 
    (c) The credit must name both things: the model and the harness. "DeepSeek",
        "an AI", or "automatically generated" alone does not satisfy this
@@ -62,22 +65,93 @@ hardware from the Software or a derivative work:
        DeepSeek endorse, sponsor, or take responsibility for the project that
        uses it.
 
-4. Not required
+4. Silicon attribution: the marks go on the chip
 
-Section 3 does not apply to: private use that is not distributed or made
-available to anyone outside the organisation using it; or quoting a portion of
-this Software in a discussion, review, benchmark comparison or academic work,
-where citing the project is already normal practice.
+This condition is a condition of the grant in section 1, in addition to
+section 3. It applies to every Silicon Product: any integrated circuit, die,
+chiplet, multi-die assembly, packaged part or module, and any FPGA or other
+programmable-device configuration image, that is made from, implements, or
+contains the Software, a derivative work, or any part of `beyond/` (its RTL, its
+testbenches, and the designs they describe). Anyone who makes, has made, sells,
+transfers or otherwise distributes a Silicon Product (the "maker") must:
 
-5. Conditions from other licenses still apply in full
+   (a) Put the DeepSeek logo and the line from (b) on the Silicon Product
+       itself:
+         - on every die the maker has fabricated (for a multi-die assembly: on
+           each of those dies), as in-die marks in a visible layer; and
+         - on the package or module. Where the maker does not make the package
+           itself  -  an FPGA-based board, a chiplet in a third party's package  - 
+           the equivalent mark goes on the board, module or enclosure the maker
+           does ship.
+       The logo is the official DeepSeek lockup included with this repository at
+       `docs/img/deepseek-logo.svg`: the whale mark and the wordmark together.
+       Its shape, proportions and the relative position of the two must be
+       unchanged. Monochrome is fine and the ink may follow the surface (black on
+       light, white on dark); in a single-layer in-die mark, the whale's eye is a
+       cutout, which is not a change of shape. The logo must not be stretched,
+       squashed, rotated, mirrored, cropped, redrawn, or split so that the whale
+       appears without the wordmark.
+
+   (b) Put this line on the package marking, in full and as type:
+
+           Built with DeepSeek V4.1 Flash running DeepSeek Harness (DSH)
+
+       It must be readable as text: a QR code, barcode, URL, serial number or a
+       document the part merely points to does not satisfy this paragraph on its
+       own.
+
+   (c) Put the same logo and the same line on the datasheet, on its first page
+       or cover, and on the product page if the maker publishes one.
+
+   Size and legibility. The test is that a person with normal corrected vision
+   can read the whole line without a magnifier and without squinting. The line
+   may be wrapped over several lines; the cap height below applies to each line.
+
+         - package or module: the line at a cap height of at least 1.2 mm and
+           the logo at least 3.0 mm wide, on a face that is normally visible
+           when the part is installed. On a package whose marked face is
+           smaller than 8 mm across  -  where those numbers cannot physically
+           fit  -  the floor is a 0.9 mm cap height and a 2.0 mm logo, still as
+           type. If the part ships with a permanently attached heatsink, lid,
+           shield or enclosure, the same marks must appear on its outer surface
+           as well;
+         - die: the logo and the line present and legible under standard optical
+           inspection at 100x. Naked-eye legibility is carried by the package and
+           the datasheet, because an in-die mark is microscopic by nature;
+         - documentation: the line at a cap height of at least 4 mm (about
+           12 pt), in a colour that contrasts with the background, on the first
+           page or cover  -  not only in a footnote or end-credits page, and not
+           smaller than the body text used for the document's other credits.
+
+   (d) A Silicon Product distributed without the marks required by (a), (b) or
+       (c) is not licensed under this license. Note also that GDSII, OASIS, mask
+       sets, netlists, bitstreams, HDL and the RTL in `beyond/` are "Software"
+       for the purposes of section 3, so the credit there applies to them as
+       well.
+
+   (e) The DeepSeek name and logo are the property of their owner. This
+       condition requires their use solely to identify the provenance of the
+       design and grants no trademark rights beyond that use; it does not imply
+       endorsement (see 3(d)).
+
+5. Not required
+
+Sections 3 and 4 do not apply to: private use that is not distributed or made
+available to anyone outside the organisation using it; quoting a portion of this
+Software in a discussion, review, benchmark comparison or academic work, where
+citing the project is already normal practice; or private, undistributed
+engineering samples, shuttle runs and internal qualification parts that are never
+sold, given away or otherwise transferred outside the organisation.
+
+6. Conditions from other licenses still apply in full
 
 Portions of this repository are licensed differently and their terms are
-unaffected by section 3 — in particular `src/hashx/hashx.c` (**LGPL-3.0**, from
-tevador/hashx) and `third_party/argon2` (CC0-1.0 / Apache-2.0). See
-THIRD_PARTY_NOTICES.md. Where a third-party license conflicts with section 3,
-that licence wins for the third-party portion.
+unaffected by sections 3 and 4  -  in particular `src/hashx/hashx.c`
+(**LGPL-3.0**, from tevador/hashx) and `third_party/argon2` (CC0-1.0 /
+Apache-2.0). See THIRD_PARTY_NOTICES.md. Where a third-party license conflicts
+with section 3 or 4, that licence wins for the third-party portion.
 
-6. Warranty
+7. Warranty
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
@@ -89,5 +163,6 @@ SOFTWARE.
 
 --------------------------------------------------------------------------------
 
-See ATTRIBUTION.md for a paragraph you can paste into your own README, and for
-what "the Software or a derivative work" covers in practice.
+See ATTRIBUTION.md for a paragraph you can paste into your own README, the
+checklist for marking a chip, and what "the Software or a derivative work"
+covers in practice.

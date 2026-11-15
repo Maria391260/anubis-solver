@@ -701,4 +701,6 @@ the real Anubis if you want to compare side by side.
 
 Built with [DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
 running [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness),
-per the repository's MIT + attribution license.
+per the repository's MIT + attribution license. A silicon implementation also
+owes the [logo](../docs/img/deepseek-logo.svg) and that line on the die and the
+package marking — see `LICENSE` section 4.

@@ -706,16 +706,28 @@ go build -o /tmp/anubis-build/anubis ./cmd/anubis
 ## License
 
 Original code is **MIT + attribution** (see [LICENSE](LICENSE)): the MIT grant,
-conditioned on one extra requirement — if you distribute the code, a binary built
-from it, or a design derived from `beyond/`, you must credit
+conditioned on two extra requirements.
+
+**Section 3 — the credit line.** If you distribute the code, a binary built from
+it, or a design derived from `beyond/`, you must credit
 
 > Built with [DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
 > running [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness).
 
-One line in your README, NOTICE file, about screen, or — for a chip — the
-top-level RTL header or datasheet. Because of that condition this is *not* plain
-MIT; call it "MIT + attribution". [ATTRIBUTION.md](ATTRIBUTION.md) has the
-paragraph to paste and spells out what counts as use.
+One line in your README, NOTICE file, or about screen.
+
+**Section 4 — the marks go on the chip.** If you make silicon from this design,
+a README line is not enough. The [DeepSeek logo](docs/img/deepseek-logo.svg) and
+that same line must be on the part: in the die, on the package marking (line cap
+height ≥ 1.2 mm, logo ≥ 3.0 mm wide; 0.9 mm and 2.0 mm on a face narrower than 8 mm) and on the datasheet's first page
+(≥ 4 mm) — sized so that nobody has to squint or reach for a magnifier. A
+heatsink that is permanently attached carries them too, and a part that ships
+without them is not licensed. The checklist is in
+[ATTRIBUTION.md](ATTRIBUTION.md).
+
+Because of those conditions this is *not* plain MIT; call it "MIT + attribution".
+[ATTRIBUTION.md](ATTRIBUTION.md) has the paragraph to paste, the chip-marking
+sizes, and spells out what counts as use.
 
 `src/hashx/hashx.c` is a port of tevador/hashx and remains **LGPL-3.0**;
 `third_party/argon2` is CC0-1.0 / Apache-2.0. Those terms are unaffected by the

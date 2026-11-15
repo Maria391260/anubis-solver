@@ -75,7 +75,10 @@ make xe-loader && ./build/xe-loader --text /tmp/intelXe_sha256.krn   # run the h
   `docs/*.md`, and `BEGINNER.md` if the quick start changes.
 - **Licensing**: the project is MIT + attribution, not plain MIT. Do not add a
   bare `"license": "MIT"` anywhere, and do not strip the credit line from the
-  top-level RTL headers — see `LICENSE` section 3 and `ATTRIBUTION.md`.
+  top-level RTL headers. Hardware is stricter: `LICENSE` section 4 requires the
+  logo (`docs/img/deepseek-logo.svg`) and the credit line on the die, the package
+  marking (line >= 1.2 mm cap height) and the datasheet (>= 4 mm) for any silicon
+  product made from `beyond/` — see `ATTRIBUTION.md`.
 
 ## Backend rules (important)
 
