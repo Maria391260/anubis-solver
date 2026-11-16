@@ -80,6 +80,8 @@ int anubis_sha256_hex(const char *data, size_t len, char *out_hex);
 int anubis_sha256_midstate(const char *data, size_t len, uint32_t out[8]);
 void anubis_set_gpu_verify(int enable);       /* default 1 */
 int anubis_gpu_verify(void);
+void anubis_set_tpu_verify(int enable);       /* default 1; -1 clears */
+int anubis_tpu_verify(void);                  /* call > env > gpu switch */
 
 /* Easter egg: the sentence the hardware answers to a BAR0 probe.
  * Static storage, never NULL, do not free. Exported under this exact
@@ -155,7 +157,35 @@ int main(void) {
 
 GPU use is opt-in through the environment (see [gpu.md](gpu.md)); the C API
 takes no GPU argument. Every GPU result is re-verified with the reference
-implementation and the search falls back to the CPU on a mismatch.
+implementation and the search falls back to the CPU on a mismatch. The one
+exception is the TPU, whose own switch (`anubis_set_tpu_verify`) skips a second
+redundant hash; `anubis_tpu_solve()` already derived the digest on the host.
+
+## TPU entry points
+
+The PJRT backend exports the same trio as the other accelerators, and the
+symbols exist in every build (libtpu is `dlopen()`ed):
+
+```c
+int anubis_tpu_available(void);        /* 0 without libtpu or a device */
+const char *anubis_tpu_info(void);     /* "TPU: PJRT 0.118, 8 devices", or NULL */
+int anubis_tpu_solve(const uint8_t *challenge, uint32_t challenge_len,
+                     int difficulty, int use_le, uint64_t max_nonce,
+                     double budget_ms, uint32_t *out_nonce,
+                     char *out_hex, double *out_ms);
+```
+
+`0` is a hit, `1` means the nonce range or the budget ran out, `-1` is a
+backend failure (no plugin, no device, compile or execute error). Outputs are
+untouched unless a hit is returned.
+
+A direct call owns the policy that `anubis_solve_bits()` would otherwise
+apply: the `ANUBIS_TPU_MIN_WORK` threshold (2^28 expected nonces by default,
+because a new challenge pays a ~1.3 s StableHLO compile), the CPU fallback on
+`-1`, and the nonce byte order. It also ignores `anubis_tpu_verify()` — that
+knob only controls the core's second reference hash, and `anubis_tpu_solve()`
+always derives the winning digest on the host (the device returns a lane flag,
+not a digest).
 
 ## Fetching protected pages
 

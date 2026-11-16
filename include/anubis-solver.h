@@ -90,6 +90,13 @@ ANUBIS_API int anubis_batch_width(void);
  * and skips one reference hash per hit; useful for benchmarking only. */
 ANUBIS_API void anubis_set_gpu_verify(int enable);
 ANUBIS_API int anubis_gpu_verify(void);
+/* TPU hit verification (default on). Resolves as: the value set here, then
+ * ANUBIS_TPU_NO_VERIFY=1, then anubis_gpu_verify(). Pass -1 to clear the
+ * override and fall back to the env / inherited switch. "Off" skips only the
+ * second reference hash in the core: anubis_tpu_solve() always derives the
+ * winning digest itself, since the device reports just a lane flag. */
+ANUBIS_API void anubis_set_tpu_verify(int enable);
+ANUBIS_API int anubis_tpu_verify(void);
 
 /* ------------------------------------------------------------------ *
  * SHA-256 helpers
@@ -168,6 +175,31 @@ ANUBIS_API int anubis_solve_tensor(const char *challenge_hex, int difficulty,
                                    int threads, double budget_ms,
                                    uint32_t *out_nonce, char *out_hex,
                                    double *out_ms);
+
+/* ------------------------------------------------------------------ *
+ * Google TPU (PJRT C API), the `sha256` tier
+ *
+ * libtpu.so is dlopen()ed, so these symbols exist in every build: without the
+ * plugin anubis_tpu_available() is 0 and anubis_tpu_solve() returns -1.
+ *
+ * anubis_solve_bits() is still the recommended entry point: it applies the
+ * ANUBIS_TPU_MIN_WORK threshold and falls back to the CPU. A direct caller
+ * owns both decisions. This call always re-derives the winning digest on the
+ * host, so anubis_tpu_verify() does not apply to it.
+ *
+ * challenge       raw bytes, 1..51 (one 64-byte block with the nonce)
+ * use_le          non-zero: little-endian nonce, else big-endian
+ * max_nonce       inclusive nonce bound, 0 = the whole 32-bit space
+ * budget_ms       wall clock for the call, compile included; <= 0 = none
+ * Returns 0 on a hit, 1 when the range/budget ran out, -1 on backend failure
+ * (no plugin, no device, compile or execute error).
+ * ------------------------------------------------------------------ */
+ANUBIS_API int anubis_tpu_available(void);
+ANUBIS_API const char *anubis_tpu_info(void);   /* NULL when unavailable */
+ANUBIS_API int anubis_tpu_solve(const uint8_t *challenge, uint32_t challenge_len,
+                                int difficulty, int use_le, uint64_t max_nonce,
+                                double budget_ms, uint32_t *out_nonce,
+                                char *out_hex, double *out_ms);
 
 #ifdef __cplusplus
 } /* extern "C" */

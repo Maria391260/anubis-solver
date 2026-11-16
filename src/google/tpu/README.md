@@ -13,6 +13,32 @@ client for libtpu.
 | `sha256_pjrt.c` | the `sha256` tier: batched nonces, 343 MHash/s at 262,144 lanes |
 | `pjrt_common.h` | host SHA-256, hex and clock, shared by the clients |
 | `kaggle/` | a Kaggle TPU kernel that builds and runs the probe (Kaggle's CLI accepted the TPU accelerator but attached no TPU; Colab did) |
+| `tpu_backend.c` | the same search as library code: no stdout, no `exit()`, one cached executable per challenge, `anubis_tpu_solve()` |
+| `tpu_backend_selftest.c` | the graceful path without libtpu (`make test-tpu`) |
+
+## Library ABI
+
+`tpu_backend.c` is linked into `libanubis_solver.so` and its three entry points
+are part of the public ABI, declared in `include/anubis-solver.h`:
+
+```c
+int anubis_tpu_available(void);
+const char *anubis_tpu_info(void);
+int anubis_tpu_solve(const uint8_t *challenge, uint32_t challenge_len,
+                     int difficulty, int use_le, uint64_t max_nonce,
+                     double budget_ms, uint32_t *out_nonce,
+                     char *out_hex, double *out_ms);
+```
+
+They exist in every build (a `TPU=0` build links stubs that report
+"unavailable"), matching `anubis_l0_solve` / `anubis_vulkan_solve`. Return
+codes: `0` hit, `1` exhausted, `-1` backend failure, outputs untouched on
+failure.
+
+The core's dispatch (`anubis_solve_bits()`) is still the recommended path: it
+applies `ANUBIS_TPU_MIN_WORK` (2^28 expected nonces by default) and falls back
+to the CPU. A direct caller owns both decisions, and `anubis_tpu_verify()` does
+not apply — `anubis_tpu_solve()` always derives the winning digest on the host.
 
 ## What it produces
 

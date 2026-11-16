@@ -603,6 +603,62 @@ int anubis_gpu_verify(void) {
     }
 }
 
+/* TPU hit verification. Independent knob so a TPU-only disable does not weaken
+ * the other backends; inherits ANUBIS_GPU_NO_VERIFY and anubis_set_gpu_verify().
+ * Defaults to -1 (unset) so the env / the inherited switch decides. */
+static int g_tpu_verify = -1;
+
+ANUBIS_EXPORT
+void anubis_set_tpu_verify(int enable) {
+    /* -1 resets to "unset", so the env var / inherited switch decides again. */
+    g_tpu_verify = (enable < 0) ? -1 : (enable ? 1 : 0);
+}
+
+ANUBIS_EXPORT
+int anubis_tpu_verify(void) {
+    const char *e;
+    if (g_tpu_verify >= 0) {
+        return g_tpu_verify;
+    }
+    e = getenv("ANUBIS_TPU_NO_VERIFY");
+    if (e != NULL && e[0] != '\0' && e[0] != '0') {
+        return 0;
+    }
+    return anubis_gpu_verify();
+}
+
+#if !defined(ANUBIS_HAVE_TPU)
+/* The public header declares the TPU entry points in every build; without the
+ * backend they report "unavailable" instead of failing to link. Same shape as
+ * the verify knobs above, which are unconditional too. */
+ANUBIS_EXPORT
+int anubis_tpu_available(void) {
+    return 0;
+}
+
+ANUBIS_EXPORT
+const char *anubis_tpu_info(void) {
+    return NULL;
+}
+
+ANUBIS_EXPORT
+int anubis_tpu_solve(const uint8_t *challenge, uint32_t challenge_len,
+                     int difficulty, int use_le, uint64_t max_nonce,
+                     double budget_ms, uint32_t *out_nonce, char *out_hex,
+                     double *out_ms) {
+    (void)challenge;
+    (void)challenge_len;
+    (void)difficulty;
+    (void)use_le;
+    (void)max_nonce;
+    (void)budget_ms;
+    (void)out_nonce;
+    (void)out_hex;
+    (void)out_ms;
+    return -1;
+}
+#endif
+
 #if defined(ANUBIS_HAVE_CUDA) || defined(ANUBIS_HAVE_LEVELZERO) || \
     defined(ANUBIS_HAVE_VULKAN) || defined(ANUBIS_HAVE_OPENCL)
 static int gpu_hit_ok_nibbles(const char *ch, uint64_t nonce, int diff,
@@ -631,6 +687,16 @@ static int gpu_hit_ok_hashx(const char *ch, uint32_t nonce, int diff,
     char v[65];
     if (!anubis_gpu_verify()) return 1;
     return anubis_verify_hashx(ch, nonce, diff, v) == ANUBIS_OK &&
+           memcmp(v, hex, 65) == 0;
+}
+#endif
+
+#if defined(ANUBIS_HAVE_TPU)
+static int tpu_hit_ok_bits(const char *ch, uint32_t nonce, int diff,
+                           const char *hex) {
+    char v[65];
+    if (!anubis_tpu_verify()) return 1;
+    return anubis_verify_bits(ch, nonce, diff, v) == ANUBIS_OK &&
            memcmp(v, hex, 65) == 0;
 }
 #endif
@@ -1845,7 +1911,7 @@ int anubis_solve_bits(const char *challenge_hex, int difficulty, int threads,
                                        ctx.use_le, cap, budget_ms, &gnonce,
                                        ghex, &gms);
             if (grc == 0 &&
-                gpu_hit_ok_bits(challenge_hex, gnonce, difficulty, ghex)) {
+                tpu_hit_ok_bits(challenge_hex, gnonce, difficulty, ghex)) {
                 *out_nonce = gnonce;
                 memcpy(out_hex, ghex, 65);
                 if (out_ms != NULL) {

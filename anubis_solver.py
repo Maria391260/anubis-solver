@@ -343,6 +343,26 @@ class _Native:
                 ctypes.c_char_p,
                 ctypes.POINTER(ctypes.c_double),
             ]
+
+        # TPU entry points (2.0.3). Optional: an older .so lacks them.
+        self._has_tpu = hasattr(lib, "anubis_tpu_solve")
+        if self._has_tpu:
+            lib.anubis_tpu_available.restype = ctypes.c_int
+            lib.anubis_tpu_available.argtypes = []
+            lib.anubis_tpu_info.restype = ctypes.c_char_p
+            lib.anubis_tpu_info.argtypes = []
+            lib.anubis_tpu_solve.restype = ctypes.c_int
+            lib.anubis_tpu_solve.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_uint32,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_double,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_double),
+            ]
         for name in ("anubis_verify_argon2id", "anubis_verify_hashx",
                      "anubis_verify_tensor"):
             fn = getattr(lib, name)
@@ -409,6 +429,76 @@ class _Native:
         fn.argtypes = []
         fn.restype = ctypes.c_int
         return bool(fn())
+
+    def set_tpu_verify(self, enable: bool) -> None:
+        fn = getattr(self.lib, "anubis_set_tpu_verify", None)
+        if fn is not None:
+            fn.argtypes = [ctypes.c_int]
+            fn.restype = None
+            fn(1 if enable else 0)
+
+    def tpu_verify(self) -> bool:
+        fn = getattr(self.lib, "anubis_tpu_verify", None)
+        if fn is None:
+            return True
+        fn.argtypes = []
+        fn.restype = ctypes.c_int
+        return bool(fn())
+
+    def tpu_available(self) -> bool:
+        if not self._has_tpu:
+            return False
+        return bool(self.lib.anubis_tpu_available())
+
+    def tpu_info(self) -> str | None:
+        if not self._has_tpu:
+            return None
+        info = self.lib.anubis_tpu_info()
+        return info.decode() if info else None
+
+    def solve_tpu(
+        self,
+        challenge_hex: str,
+        difficulty: int,
+        max_nonce: int = 0,
+        budget_ms: float = 0.0,
+        use_le: bool | None = None,
+    ) -> tuple[int, str, float] | None:
+        """Raw `anubis_tpu_solve()`: returns None when no TPU is usable.
+
+        Bypasses the core's dispatch, so ANUBIS_TPU_MIN_WORK and the CPU
+        fallback do not apply, and anubis_tpu_verify() has no effect here (the
+        backend always re-derives the winning digest on the host). Raises
+        SolverError when the nonce range or the budget runs out.
+        """
+        if not self._has_tpu:
+            return None
+        raw = bytes.fromhex(challenge_hex)
+        if not 1 <= len(raw) <= 51:
+            raise ValueError("TPU challenges must be 1..51 bytes (one SHA-256 block)")
+        if not 1 <= int(difficulty) <= 256:
+            raise ValueError("difficulty must be 1..256")
+        if use_le is None:
+            use_le = raw[-1] >= 0x80
+        out_nonce = ctypes.c_uint32(0)
+        out_hex = ctypes.create_string_buffer(65)
+        out_ms = ctypes.c_double(0.0)
+        rc = self.lib.anubis_tpu_solve(
+            raw,
+            len(raw),
+            int(difficulty),
+            1 if use_le else 0,
+            int(max_nonce),
+            float(budget_ms),
+            ctypes.byref(out_nonce),
+            out_hex,
+            ctypes.byref(out_ms),
+        )
+        if rc == ANUBIS_ERR_UNSOLVED:
+            raise SolverError("TPU search exhausted its nonce range or budget")
+        if rc != ANUBIS_OK:
+            return None  # -1: no plugin, no device, compile or execute failed
+        return out_nonce.value, out_hex.value.decode(), out_ms.value
 
     def sha256_hex(self, data: bytes) -> str:
         out = ctypes.create_string_buffer(65)
@@ -626,6 +716,7 @@ class AnubisSolver:
         threads: int | None = None,
         budget_ms: float = 0.0,
         verify_gpu: bool = True,
+        verify_tpu: bool | None = None,
     ) -> None:
         self._native = _Native(lib_path)
         if threads is None:
@@ -633,6 +724,10 @@ class AnubisSolver:
         self.threads = max(1, min(256, int(threads)))
         self.budget_ms = float(budget_ms)
         self._native.set_gpu_verify(verify_gpu)
+        # None leaves the TPU decision to ANUBIS_TPU_NO_VERIFY / the libtpu
+        # default (on), so the environment variable is not silently overridden.
+        if verify_tpu is not None:
+            self._native.set_tpu_verify(verify_tpu)
 
     # -- introspection ----------------------------------------------------
     @property
@@ -667,6 +762,11 @@ class AnubisSolver:
         if gpu:
             lines.append(f"  active    {gpu}")
         return "\n".join(lines)
+
+    @property
+    def tpu(self) -> str | None:
+        """TPU description ("TPU: PJRT x.y, N devices"), or None."""
+        return self._native.tpu_info()
 
     @property
     def gpu(self) -> str | None:
@@ -824,6 +924,7 @@ class AnubisClient:
         impersonate: str | None = None,
         allow_remote_cve: bool = False,
         verify_gpu: bool = True,
+        verify_tpu: bool | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         if session is not None and impersonate is not None:
@@ -844,7 +945,8 @@ class AnubisClient:
         self.timeout = timeout
         self.max_attempts = max_attempts
         self.solver = solver or AnubisSolver(
-            lib_path=lib_path, threads=threads, verify_gpu=verify_gpu
+            lib_path=lib_path, threads=threads, verify_gpu=verify_gpu,
+            verify_tpu=verify_tpu,
         )
         self.solutions: list[Solution] = []
         self.use_cve = use_cve
@@ -1070,6 +1172,11 @@ def _main(argv: list[str]) -> int:
         help="skip the CPU re-check of GPU hits (benchmarking only)",
     )
     parser.add_argument(
+        "--no-verify-tpu",
+        action="store_true",
+        help="skip the CPU re-check of TPU hits (benchmarking only)",
+    )
+    parser.add_argument(
         "--affinity",
         default=None,
         help='CPU affinity: "pcores" (default), "off", or a mask like "0,2,4,6"',
@@ -1094,6 +1201,7 @@ def _main(argv: list[str]) -> int:
         allow_remote_cve=args.allow_remote_cve,
         impersonate=args.impersonate,
         verify_gpu=not args.no_verify_gpu,
+        verify_tpu=False if args.no_verify_tpu else None,
     )
     resp = client.get("/")
     if client.cve_bypasses:

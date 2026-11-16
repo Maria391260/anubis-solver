@@ -72,6 +72,7 @@ an Iris Xe, hence their separate flags.
 | `ANUBIS_CUDA_HASHX_CHUNK`, `ANUBIS_L0_HASHX_CHUNK`, `ANUBIS_VULKAN_HASHX_CHUNK` | HashX nonces per dispatch |
 | `ANUBIS_OPENCL_CHUNK`, `ANUBIS_OPENCL_HASHX_CHUNK` | OpenCL dispatch sizes |
 | `ANUBIS_GPU_NO_VERIFY=1` | skip the CPU re-check of GPU hits (benchmarking only) |
+| `ANUBIS_TPU_NO_VERIFY=1` | skip the CPU re-check of TPU hits (benchmarking only); also via `anubis_set_tpu_verify(0)` |
 
 Argon2id needs ~19 MiB of device memory per concurrent hash (64 lanes ≈ 1.3 GB).
 
@@ -79,6 +80,13 @@ Every accepted GPU hit is re-computed once on the CPU before it is returned.
 That is a single hash per hit (not per candidate): 13.7 ms for Argon2id and
 0.08 ms for HashX on a T4 host, so `--no-verify-gpu` only saves time when a hit
 is found inside one GPU batch (about 10% at d6–d10 on 2× T4).
+
+The TPU has its own switch, `anubis_set_tpu_verify(0)` or
+`ANUBIS_TPU_NO_VERIFY=1`, which does **not** affect the other backends; it
+inherits `ANUBIS_GPU_NO_VERIFY` when neither is set. Turning it off removes
+only the core's second hash: `anubis_tpu_solve()` always derives the winning
+digest on the host, because the StableHLO module returns a lane flag rather
+than a digest.
 
 ## What we measured
 

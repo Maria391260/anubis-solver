@@ -534,6 +534,7 @@ Environment controls:
 | `ANUBIS_CUDA_HASHX_CHUNK`, `ANUBIS_L0_HASHX_CHUNK`, `ANUBIS_VULKAN_HASHX_CHUNK` | HashX nonces per dispatch |
 | `ANUBIS_VULKAN_DEVICE`, `ANUBIS_VULKAN_ALLOW_CPU` | device choice / allow lavapipe |
 | `ANUBIS_GPU_NO_VERIFY=1` | skip the CPU re-check of GPU hits (benchmarking only) |
+| `ANUBIS_TPU_NO_VERIFY=1` | skip the CPU re-check of TPU hits (benchmarking only); also via `anubis_set_tpu_verify(0)` |
 
 Argon2id needs ~19 MiB of device memory per concurrent hash (64 lanes ≈ 1.3 GB).
 Every GPU result is recomputed on the CPU before it is accepted.
@@ -581,6 +582,11 @@ by a work threshold so the CPU keeps solving low difficulties. The inventory is
 part of the C API: `anubis_backends_compiled()`, `anubis_backends_available()`
 and `anubis_backend_name()`, plus `"backends_compiled"` in `/v1/version`,
 `GET /v1/backends` in the API service and the `anubis_backends` MCP tool.
+
+The TPU is also directly callable: `anubis_tpu_available()`,
+`anubis_tpu_info()` and `anubis_tpu_solve()` are exported ABI (see
+[c-api.md](docs/c-api.md)). `ANUBIS_TPU_MIN_WORK` and the CPU fallback apply
+only to the `anubis_solve_bits()` dispatch, not to a direct call.
 
 `make universal` prints which requested backend it had to skip and why; the
 `.so` is built and useful either way, with the reason visible instead of a

@@ -93,6 +93,9 @@ make xe-loader && ./build/xe-loader --text /tmp/intelXe_sha256.krn   # run the h
 - Dispatch order: **CUDA → Level Zero → Vulkan → OpenCL → CPU**.
 - **Every GPU hit must be re-verified** with the `anubis_verify_*` reference in
   the core before being accepted; on mismatch fall through to the CPU search.
+  The TPU has its own knob (`anubis_set_tpu_verify(0)` /
+  `ANUBIS_TPU_NO_VERIFY=1`) that skips only the core's second reference hash;
+  `anubis_tpu_solve()` always derives the winning digest itself.
 - A new solve function returns `0` hit, `1` exhausted, `-1` backend failure.
 
 ## Generated files

@@ -172,6 +172,40 @@ def main() -> int:
     ch = AnubisChallenge(id="x", random_data="00" * 64, algorithm="fast", difficulty=4)
     check("wrong nonce rejected", not solver.verify(ch, 1))
 
+    print("tpu verify knob")
+    lib = solver._native.lib
+    lib.anubis_set_gpu_verify(1)
+    lib.anubis_set_tpu_verify(-1)
+    check("tpu verify default on", solver._native.tpu_verify() is True)
+    lib.anubis_set_tpu_verify(-1)
+    lib.anubis_set_gpu_verify(0)
+    check("tpu inherits gpu verify off", solver._native.tpu_verify() is False)
+    lib.anubis_set_tpu_verify(1)
+    check("tpu explicit on overrides gpu off", solver._native.tpu_verify() is True)
+    lib.anubis_set_tpu_verify(0)
+    check("tpu explicit off", solver._native.tpu_verify() is False)
+    lib.anubis_set_tpu_verify(1)
+    lib.anubis_set_gpu_verify(1)
+
+    print("tpu abi")
+    info = solver._native.tpu_info()
+    available = solver._native.tpu_available()
+    check("tpu_available() agrees with tpu_info()", available == (info is not None))
+    check("AnubisSolver.tpu matches tpu_info()", solver.tpu == info)
+    challenge = "ab" * 20  # 40 bytes, one SHA-256 block after the nonce
+    if available:
+        nonce, digest, _ = solver._native.solve_tpu(challenge, 8)
+        check(f"solve_tpu hit nonce={nonce} verifies", bits_ok(digest, 8))
+    else:
+        check("solve_tpu() returns None without libtpu",
+              solver._native.solve_tpu(challenge, 8) is None)
+    try:
+        solver._native.solve_tpu("ab" * 64, 8)  # 64 bytes
+    except ValueError:
+        check("solve_tpu() rejects a 64-byte challenge", True)
+    else:
+        check("solve_tpu() rejects a 64-byte challenge", False)
+
     print()
     if FAILS:
         print(f"{FAILS} check(s) FAILED")

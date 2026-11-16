@@ -20,22 +20,20 @@
 extern "C" {
 #endif
 
-/* These three are for the solver core, not for host processes: the shared
- * library exports the backend inventory (anubis_backends_*) instead. Hiding
- * them keeps the .so's dynamic symbol table to the public ABI. */
-#if defined(__GNUC__)
-#  define ANUBIS_TPU_INTERNAL __attribute__((visibility("hidden")))
-#else
-#  define ANUBIS_TPU_INTERNAL
-#endif
+/* These three are public ABI, matching anubis_l0_solve and anubis_vulkan_solve
+ * (declared in include/anubis-solver.h). Nothing is linked: libtpu is
+ * dlopen()ed, so the symbols exist on every build and report "unavailable"
+ * when the plugin is missing. The core's own dispatch (anubis_solve_bits)
+ * stays the recommended path; a direct caller owns the threshold, the CPU
+ * fallback and the byte order. */
 
 /* 1 when libtpu loaded and a PJRT client with at least one addressable device
  * exists. The probe runs once per process; later calls are a cached read. */
-ANUBIS_TPU_INTERNAL int anubis_tpu_available(void);
+int anubis_tpu_available(void);
 
 /* "TPU: PJRT <major>.<minor>, <n> devices" once available, NULL otherwise.
  * The returned pointer has static storage and is valid for the process. */
-ANUBIS_TPU_INTERNAL const char *anubis_tpu_info(void);
+const char *anubis_tpu_info(void);
 
 /*
  * Search for a nonce whose sha256(challenge || u32 nonce) has `difficulty`
@@ -56,12 +54,10 @@ ANUBIS_TPU_INTERNAL const char *anubis_tpu_info(void);
  * untouched on failure. Safe to call repeatedly and from multiple threads
  * (calls are serialized; the compiled executable is cached per challenge).
  */
-ANUBIS_TPU_INTERNAL int anubis_tpu_solve(const uint8_t *challenge,
-                                         uint32_t challenge_len,
-                                         int difficulty, int use_le,
-                                         uint64_t max_nonce, double budget_ms,
-                                         uint32_t *out_nonce, char *out_hex,
-                                         double *out_ms);
+int anubis_tpu_solve(const uint8_t *challenge, uint32_t challenge_len,
+                     int difficulty, int use_le, uint64_t max_nonce,
+                     double budget_ms, uint32_t *out_nonce, char *out_hex,
+                     double *out_ms);
 
 #ifdef __cplusplus
 }

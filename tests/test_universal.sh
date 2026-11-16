@@ -58,7 +58,9 @@ fi
 
 echo "export surface"
 for sym in anubis_backends_compiled anubis_backends_available \
-           anubis_backend_name easter anubis_solver_version; do
+           anubis_backend_name easter anubis_solver_version \
+           anubis_set_tpu_verify anubis_tpu_verify \
+           anubis_tpu_available anubis_tpu_info anubis_tpu_solve; do
     nm -D --defined-only "$LIB" 2>/dev/null | grep -q " T $sym$"
     check "exports $sym" $?
 done
