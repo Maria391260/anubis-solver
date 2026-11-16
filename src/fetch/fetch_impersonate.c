@@ -54,6 +54,16 @@ typedef int CURLcode;
 #define CURLOPT_CONNECTTIMEOUT_MS 156     /* LONG + 156 */
 #define CURLOPT_HEADERDATA 10029          /* OBJECTPOINT + 29  */
 #define CURLOPT_HEADERFUNCTION 20079      /* FUNCTIONPOINT + 79 */
+#define CURLOPT_COOKIE 10022              /* STRINGPOINT + 22  */
+#define CURLINFO_COOKIELIST 0x40001c      /* CURLINFO_SLIST + 28 */
+
+/* Only the shape matters: libcurl hands out a singly linked list of strings
+ * and curl_slist_free_all() releases it. data/next is the whole public
+ * definition. */
+struct curl_slist {
+    char *data;
+    struct curl_slist *next;
+};
 
 struct imp_api {
     void *lib;
@@ -67,6 +77,7 @@ struct imp_api {
     CURLcode (*easy_perform)(CURL *);
     CURLcode (*easy_getinfo)(CURL *, int, ...);
     CURLcode (*easy_impersonate)(CURL *, const char *, int);
+    void (*slist_free_all)(struct curl_slist *);
     const char *(*easy_strerror)(CURLcode);
 };
 
@@ -92,6 +103,7 @@ static int bind_symbols(void *lib, const char *path) {
     *(void **)&a.easy_getinfo = dlsym(lib, "curl_easy_getinfo");
     *(void **)&a.easy_strerror = dlsym(lib, "curl_easy_strerror");
     *(void **)&a.easy_impersonate = dlsym(lib, "curl_easy_impersonate");
+    *(void **)&a.slist_free_all = dlsym(lib, "curl_slist_free_all");
     {
         const char *(*fn_version)(void) = dlsym(lib, "curl_version");
         a.version = fn_version ? fn_version() : NULL;
@@ -296,6 +308,8 @@ int anubis_imp_resolve_target(const char *name, char *out, size_t cap) {
 struct anubis_imp_handle {
     CURL *curl;
     char target[64];
+    char *seed_cookies; /* Cookie header for the first transfer, or NULL */
+    int seed_sent;
 };
 
 struct sink {
@@ -412,7 +426,97 @@ anubis_imp_handle *anubis_imp_open(const char *target, char *err, size_t err_cap
 void anubis_imp_close(anubis_imp_handle *h) {
     if (!h) return;
     if (h->curl) g_imp.easy_cleanup(h->curl);
+    free(h->seed_cookies);
     free(h);
+}
+
+void anubis_imp_set_cookies(anubis_imp_handle *h, const char *cookies) {
+    char *copy;
+    if (!h) return;
+    copy = (cookies && *cookies) ? strdup(cookies) : NULL;
+    free(h->seed_cookies);
+    h->seed_cookies = copy;
+    h->seed_sent = 0;
+}
+
+/* The cookie engine reports one cookie per line, Netscape format:
+ *   domain \t include_subdomains \t path \t secure \t expires \t name \t value
+ * A leading "#HttpOnly_" marks an HttpOnly cookie, which is just part of the
+ * domain field and does not affect the name or the value.
+ *
+ * Returns 0 and the name/value extents when the line has all seven fields. */
+static int split_cookie_line(const char *line, const char **name,
+                             size_t *name_len, const char **value,
+                             size_t *value_len) {
+    const char *field[7];
+    size_t len[7];
+    const char *p = line;
+    int i;
+
+    for (i = 0; i < 7; i++) {
+        const char *tab = (i == 6) ? NULL : strchr(p, '\t');
+        field[i] = p;
+        len[i] = tab ? (size_t)(tab - p) : strlen(p);
+        if (i < 6 && !tab) return -1;
+        p = tab ? tab + 1 : p + len[i];
+    }
+    *name = field[5];
+    *name_len = len[5];
+    *value = field[6];
+    *value_len = len[6];
+    return 0;
+}
+
+static void cookies_from_slist(struct curl_slist *list, char **out) {
+    struct curl_slist *node;
+    size_t total = 1;
+
+    *out = NULL;
+    for (node = list; node; node = node->next) {
+        const char *name, *value;
+        size_t name_len, value_len;
+        if (split_cookie_line(node->data, &name, &name_len, &value,
+                              &value_len) == 0) {
+            total += name_len + value_len + 3;
+        }
+    }
+    *out = malloc(total);
+    if (!*out) return;
+    (*out)[0] = '\0';
+    for (node = list; node; node = node->next) {
+        const char *name, *value;
+        size_t name_len, value_len, used = strlen(*out);
+        if (split_cookie_line(node->data, &name, &name_len, &value,
+                              &value_len) != 0) {
+            continue;
+        }
+        if (used) {
+            memcpy(*out + used, "; ", 2);
+            used += 2;
+        }
+        memcpy(*out + used, name, name_len);
+        used += name_len;
+        (*out)[used++] = '=';
+        memcpy(*out + used, value, value_len);
+        used += value_len;
+        (*out)[used] = '\0';
+    }
+}
+
+int anubis_imp_cookies(anubis_imp_handle *h, char **out) {
+    struct curl_slist *list = NULL;
+
+    if (!out) return -1;
+    *out = calloc(1, 1);
+    if (!*out) return -1;
+    if (!h || !h->curl || !g_imp.slist_free_all) return 0;
+    if (g_imp.easy_getinfo(h->curl, CURLINFO_COOKIELIST, &list) != CURLE_OK) {
+        return 0;
+    }
+    free(*out);
+    cookies_from_slist(list, out);
+    g_imp.slist_free_all(list);
+    return *out ? 0 : -1;
 }
 
 const char *anubis_imp_handle_target(const anubis_imp_handle *h) {
@@ -444,6 +548,12 @@ int anubis_imp_get(anubis_imp_handle *h, const char *url, int insecure,
     }
     g_imp.easy_setopt(h->curl, CURLOPT_SSL_VERIFYPEER, insecure ? 0L : 1L);
     g_imp.easy_setopt(h->curl, CURLOPT_SSL_VERIFYHOST, insecure ? 0L : 2L);
+    /* The seed only goes on the first transfer: after that the cookie engine
+     * holds the same names and sending both would duplicate them. */
+    if (h->seed_cookies && !h->seed_sent) {
+        g_imp.easy_setopt(h->curl, CURLOPT_COOKIE, h->seed_cookies);
+        h->seed_sent = 1;
+    }
     if (headers) {
         g_imp.easy_setopt(h->curl, CURLOPT_HEADERFUNCTION, header_cb);
         g_imp.easy_setopt(h->curl, CURLOPT_HEADERDATA, &hs);

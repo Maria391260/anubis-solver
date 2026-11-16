@@ -72,6 +72,15 @@ const char *anubis_imp_handle_target(const anubis_imp_handle *h);
 int anubis_imp_get(anubis_imp_handle *h, const char *url, int insecure,
                    anubis_page *out, char **headers, size_t *headers_len);
 
+/* Seed the handle's Cookie header for the first transfer (the cookie engine
+ * still records Set-Cookie on its own). NULL clears it. */
+void anubis_imp_set_cookies(anubis_imp_handle *h, const char *cookies);
+
+/* Serialize the handle's cookie engine as "name=value; name2=value2".
+ * Returns 0 and a malloc'd string (never NULL; "" when empty), -1 when the
+ * library has no CURLINFO_COOKIELIST symbol. Free the pointer. */
+int anubis_imp_cookies(anubis_imp_handle *h, char **out);
+
 #ifdef __cplusplus
 }
 #endif

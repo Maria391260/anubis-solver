@@ -308,6 +308,29 @@ ck "/v1/dump_headers has every response, not just the last" \
    "$(count="$(grep -o 'HTTP/1\.[01]' "$BODY" 2>/dev/null | wc -l)"; \
       [ "${count:-0}" -ge 2 ] && echo 1 || echo 0)"
 
+# ---- end-to-end: session cookies ---------------------------------------
+
+CODE="$(http POST "$API/v1/fetch" "{\"url\":\"$GATE/\"}")"
+ck "/v1/fetch cold call reports solved" "$(has '"solved":true')"
+COOKIES="$(jget cookies)"
+ck "/v1/fetch cold call returns a cookie jar" \
+   "$([ -n "$COOKIES" ] && echo 1 || echo 0)"
+
+# Whitespace after the comma on purpose: the JSON walker used to stop there.
+BODY="$(python3 -c 'import json,sys; print(json.dumps({"url": sys.argv[1], "cookies": sys.argv[2]}))' \
+    "$GATE/" "$COOKIES")"
+CODE="$(http POST "$API/v1/fetch" "$BODY")"
+ck "/v1/fetch with returned cookies skips the challenge" "$(has '"solved":false')"
+ck "/v1/fetch with returned cookies reports no expiry" "$(has '"expired":false')"
+ck "/v1/fetch with returned cookies returns the same jar" \
+   "$(JAR="$(jget cookies)"; [ "$JAR" = "$COOKIES" ] && echo 1 || echo 0)"
+
+CODE="$(http POST "$API/v1/fetch" "{\"url\":\"$GATE/\",\"cookies\":\"anubis-auth=stale\"}")"
+ck "/v1/fetch with a stale cookie reports expired" "$(has '"expired":true')"
+ck "/v1/fetch with a stale cookie still solves" "$(has '"solved":true')"
+ck "/v1/fetch with a stale cookie returns a fresh jar" \
+   "$(JAR="$(jget cookies)"; [ -n "$JAR" ] && [ "$JAR" != "anubis-auth=stale" ] && echo 1 || echo 0)"
+
 # ---- summary ------------------------------------------------------------
 
 echo

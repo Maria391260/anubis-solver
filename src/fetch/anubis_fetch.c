@@ -127,6 +127,32 @@ static void jar_set(jar *j, const char *pair) {
     j->items[j->n++] = xstrdup(pair);
 }
 
+/* Seed a jar from a Cookie header value ("a=b; c=d"), the form a caller keeps
+ * between fetches. Names already present are replaced, which is what makes the
+ * response's own Set-Cookie win over a stale seed. */
+static void jar_seed(jar *j, const char *cookies) {
+    const char *p = cookies;
+    while (p && *p) {
+        const char *semi = strchr(p, ';');
+        size_t len = semi ? (size_t)(semi - p) : strlen(p);
+        while (len > 0 && (*p == ' ' || *p == '\t')) {
+            p++;
+            len--;
+        }
+        while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t')) {
+            len--;
+        }
+        if (len > 0 && len < 1024) {
+            char pair[1024];
+            memcpy(pair, p, len);
+            pair[len] = '\0';
+            jar_set(j, pair);
+        }
+        if (!semi) break;
+        p = semi + 1;
+    }
+}
+
 static char *jar_header(jar *j) {
     size_t total = 1;
     for (size_t i = 0; i < j->n; i++) total += strlen(j->items[i]) + 2;
@@ -484,6 +510,41 @@ static int xport_get(xport *x, const char *url, anubis_page *out,
     return http_get(url, &x->j, NULL, out, headers, headers_len);
 }
 
+static void xport_seed_cookies(xport *x, const char *cookies) {
+    if (cookies == NULL || *cookies == '\0') {
+        return;
+    }
+    if (x->imp) {
+        anubis_imp_set_cookies(x->imp, cookies);
+    } else {
+        jar_seed(&x->j, cookies);
+    }
+}
+
+/* The jar as it stands after the exchange: the seed plus everything the site
+ * set, with the site's values winning. The impersonating transport keeps its
+ * own jar, so merge rather than replace. */
+static char *xport_cookies(xport *x, const char *seed) {
+    char *header;
+    if (!x->imp) {
+        return jar_header(&x->j);
+    }
+    {
+        jar j = {0};
+        char *list = NULL;
+        if (seed != NULL) {
+            jar_seed(&j, seed);
+        }
+        if (anubis_imp_cookies(x->imp, &list) == 0 && list != NULL) {
+            jar_seed(&j, list);
+            free(list);
+        }
+        header = jar_header(&j);
+        jar_free(&j);
+    }
+    return header;
+}
+
 static void xport_close(xport *x) {
     if (x->imp) {
         anubis_imp_close(x->imp);
@@ -743,8 +804,17 @@ static int hdr_append(char **acc, size_t *acc_len, const char *block,
     return 0;
 }
 
+/* Cookie state for one exchange. `cookies` is the caller's jar going in;
+ * out_cookies comes back owned by the caller. */
+typedef struct {
+    const char *cookies;
+    char *out_cookies;
+    int solved;
+    int expired;
+} fetch_cookies;
+
 static int fetch_impl(const char *url, const char *target, anubis_page *out,
-                      char **headers, size_t *headers_len) {
+                      char **headers, size_t *headers_len, fetch_cookies *ck) {
     xport x = {0};
     char *current = xstrdup(url);
     char *acc = NULL;
@@ -768,6 +838,12 @@ static int fetch_impl(const char *url, const char *target, anubis_page *out,
     if (open_transport(&x, target, out) != 0) {
         free(current);
         return -1;
+    }
+    if (ck != NULL) {
+        ck->out_cookies = NULL;
+        ck->solved = 0;
+        ck->expired = 0;
+        xport_seed_cookies(&x, ck->cookies);
     }
 
     for (attempt = 0; attempt < 8; attempt++) {
@@ -803,6 +879,12 @@ static int fetch_impl(const char *url, const char *target, anubis_page *out,
         }
         if (is_challenge_page(page.body) && strstr(page.body, "anubis_challenge")) {
             char algorithm[32] = "sha256", random_data[1024] = "", id[256] = "";
+            if (ck != NULL) {
+                ck->solved = 1;
+                if (ck->cookies != NULL && *ck->cookies != '\0') {
+                    ck->expired = 1; /* the site did not accept them */
+                }
+            }
             long difficulty = 0;
             uint32_t nonce = 0;
             char digest[65] = "";
@@ -912,6 +994,9 @@ static int fetch_impl(const char *url, const char *target, anubis_page *out,
         if (headers_len != NULL) {
             *headers_len = acc_len;
         }
+        if (ck != NULL) {
+            ck->out_cookies = xport_cookies(&x, ck->cookies);
+        }
         rc = 0;
         break;
     }
@@ -927,17 +1012,33 @@ done:
 }
 
 int anubis_fetch_get_with(const char *url, const char *target, anubis_page *out) {
-    return fetch_impl(url, target, out, NULL, NULL);
+    return fetch_impl(url, target, out, NULL, NULL, NULL);
 }
 
-int anubis_fetch_get_dump(const char *url, const char *target,
-                          anubis_page_dump *out) {
+int anubis_fetch_get_dump_with(const char *url, const char *target,
+                               const char *cookies, anubis_page_dump *out) {
+    fetch_cookies ck = {0};
+
     if (out == NULL) {
         return -1;
     }
     memset(out, 0, sizeof *out);
-    return fetch_impl(url, target, &out->page, &out->headers,
-                      &out->headers_len);
+    ck.cookies = cookies;
+    if (fetch_impl(url, target, &out->page, &out->headers, &out->headers_len,
+                   &ck) != 0) {
+        free(ck.out_cookies);
+        return -1;
+    }
+    out->cookies = ck.out_cookies;
+    out->cookies_len = ck.out_cookies ? strlen(ck.out_cookies) : 0;
+    out->solved = ck.solved;
+    out->expired = ck.expired;
+    return 0;
+}
+
+int anubis_fetch_get_dump(const char *url, const char *target,
+                          anubis_page_dump *out) {
+    return anubis_fetch_get_dump_with(url, target, NULL, out);
 }
 
 void anubis_page_dump_free(anubis_page_dump *dump) {
@@ -948,6 +1049,9 @@ void anubis_page_dump_free(anubis_page_dump *dump) {
     free(dump->headers);
     dump->headers = NULL;
     dump->headers_len = 0;
+    free(dump->cookies);
+    dump->cookies = NULL;
+    dump->cookies_len = 0;
 }
 
 int anubis_fetch_get(const char *url, anubis_page *out) {

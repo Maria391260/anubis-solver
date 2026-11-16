@@ -917,7 +917,7 @@ static const char TOOLS_JSON[] =
     "way, and return the page as readable text. The text begins with status: <code>, "
     "url: <final_url> and transport: <openssl|curl-impersonate/profile>.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
-    "\"url\":{\"type\":\"string\",\"description\":\"Absolute http or https URL.\"},"
+    "\"url\":{\"type\":\"string\",\"description\":\"Absolute http or https URL.\"},\"cookies\":{\"type\":\"string\",\"description\":\"The cookies: value from an earlier call. Pass it back to reuse the solved session instead of solving again; when the site stops accepting it the result says expired: yes and carries a fresh set.\"},"
     "\"max_chars\":{\"type\":\"integer\",\"description\":\"Maximum body characters "
     "to return (default 100000, 0 means unlimited).\"},"
     "\"impersonate\":{\"type\":\"string\",\"description\":\"TLS fingerprint to "
@@ -925,8 +925,8 @@ static const char TOOLS_JSON[] =
     "concrete profile such as chrome116, edge101 or safari15_5, \\\"auto\\\" or "
     "\\\"off\\\" for the built-in OpenSSL client.\"}},"
     "\"required\":[\"url\"]}},"
-    "{\"name\":\"anubis_fetch_raw\",\"description\":\"Fetch an Anubis-protected URL, solving any challenge on the way, and return the body exactly as it arrived: raw HTML or bytes, not the readable text anubis_fetch produces. Begins with status: <code>, url: <final_url> and transport: <openssl|curl-impersonate/profile>.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute http or https URL.\"},\"max_chars\":{\"type\":\"integer\",\"description\":\"Maximum body characters to return (default 100000, 0 means unlimited).\"},\"impersonate\":{\"type\":\"string\",\"description\":\"TLS fingerprint to present: chrome (default when a curl-impersonate library is installed), a concrete profile such as chrome116, edge101 or safari15_5, \\\"auto\\\" or \\\"off\\\" for the built-in OpenSSL client.\"}},\"required\":[\"url\"]}},"
-    "{\"name\":\"anubis_dump_headers\",\"description\":\"Fetch an Anubis-protected URL, solving any challenge on the way, and return the raw header blocks of every response it went through, in order: the challenge, the pass-challenge reply, any redirect and the final page. Each block starts with its own status line.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute http or https URL.\"},\"impersonate\":{\"type\":\"string\",\"description\":\"TLS fingerprint to present: chrome (default when a curl-impersonate library is installed), a concrete profile such as chrome116, edge101 or safari15_5, \\\"auto\\\" or \\\"off\\\" for the built-in OpenSSL client.\"}},\"required\":[\"url\"]}},"
+    "{\"name\":\"anubis_fetch_raw\",\"description\":\"Fetch an Anubis-protected URL, solving any challenge on the way, and return the body exactly as it arrived: raw HTML or bytes, not the readable text anubis_fetch produces. Begins with status: <code>, url: <final_url> and transport: <openssl|curl-impersonate/profile>.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute http or https URL.\"},\"cookies\":{\"type\":\"string\",\"description\":\"The cookies: value from an earlier call. Pass it back to reuse the solved session instead of solving again; when the site stops accepting it the result says expired: yes and carries a fresh set.\"},\"max_chars\":{\"type\":\"integer\",\"description\":\"Maximum body characters to return (default 100000, 0 means unlimited).\"},\"impersonate\":{\"type\":\"string\",\"description\":\"TLS fingerprint to present: chrome (default when a curl-impersonate library is installed), a concrete profile such as chrome116, edge101 or safari15_5, \\\"auto\\\" or \\\"off\\\" for the built-in OpenSSL client.\"}},\"required\":[\"url\"]}},"
+    "{\"name\":\"anubis_dump_headers\",\"description\":\"Fetch an Anubis-protected URL, solving any challenge on the way, and return the raw header blocks of every response it went through, in order: the challenge, the pass-challenge reply, any redirect and the final page. Each block starts with its own status line.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute http or https URL.\"},\"cookies\":{\"type\":\"string\",\"description\":\"The cookies: value from an earlier call. Pass it back to reuse the solved session instead of solving again; when the site stops accepting it the result says expired: yes and carries a fresh set.\"},\"impersonate\":{\"type\":\"string\",\"description\":\"TLS fingerprint to present: chrome (default when a curl-impersonate library is installed), a concrete profile such as chrome116, edge101 or safari15_5, \\\"auto\\\" or \\\"off\\\" for the built-in OpenSSL client.\"}},\"required\":[\"url\"]}},"
     "{\"name\":\"anubis_solve\","
     "\"description\":\"Solve one Anubis proof-of-work challenge locally, without "
     "network access. Returns a JSON text with nonce, response digest and "
@@ -1047,11 +1047,33 @@ static void tool_solve(const json_value *id, const json_value *args) {
     sb_free(&text);
 }
 
+/* status/url/transport plus the session state. A caller keeps the session by
+ * passing the cookies line back on the next call; expired says the site no
+ * longer accepted them and the line below it is the replacement. */
+static void append_preamble(sb *text, const anubis_page_dump *dump,
+                            const char *url) {
+    sb_printf(text,
+              "status: %d\nurl: %s\ntransport: %s\nsolved: %s\nexpired: %s\n",
+              dump->page.status,
+              dump->page.final_url ? dump->page.final_url : url,
+              anubis_fetch_transport(), dump->solved ? "yes" : "no",
+              dump->expired ? "yes" : "no");
+    if (dump->cookies != NULL && dump->cookies_len > 0) {
+        sb_puts(text, "cookies: ");
+        sb_puts(text, dump->cookies);
+        sb_puts(text, "\n");
+    } else {
+        sb_puts(text, "cookies: (none)\n");
+    }
+    sb_puts(text, "\n");
+}
+
 static void tool_fetch(const json_value *id, const json_value *args) {
     const char *url = jv_string(args, "url");
     const char *impersonate = jv_string(args, "impersonate");
+    const char *cookies = jv_string(args, "cookies");
     long max_chars = 100000;
-    anubis_page page;
+    anubis_page_dump dump;
     sb body, text;
     size_t keep;
 
@@ -1069,29 +1091,27 @@ static void tool_fetch(const json_value *id, const json_value *args) {
             return;
         }
     }
-    memset(&page, 0, sizeof page);
-    if (anubis_fetch_get_with(url, impersonate, &page) != 0) {
+    memset(&dump, 0, sizeof dump);
+    if (anubis_fetch_get_dump_with(url, impersonate, cookies, &dump) != 0) {
         send_tool_error(id, "fetch failed: %s",
-                        page.error[0] ? page.error : "unknown error");
-        anubis_page_free(&page);
+                        dump.page.error[0] ? dump.page.error : "unknown error");
+        anubis_page_dump_free(&dump);
         return;
     }
     sb_init(&body);
-    html_to_text(page.body ? page.body : "", page.body_len, &body);
+    html_to_text(dump.page.body ? dump.page.body : "", dump.page.body_len, &body);
     keep = body.len;
     if (max_chars > 0 && (size_t)max_chars < keep)
         keep = utf8_truncate(body.s, keep, (size_t)max_chars);
 
     sb_init(&text);
-    sb_printf(&text, "status: %d\nurl: %s\ntransport: %s\n\n", page.status,
-              page.final_url ? page.final_url : url, anubis_fetch_transport());
+    append_preamble(&text, &dump, url);
     if (keep > 0) sb_putn(&text, body.s, keep);
     send_tool_text(id, text.s, text.len, 0);
     sb_free(&text);
     sb_free(&body);
-    anubis_page_free(&page);
+    anubis_page_dump_free(&dump);
 }
-
 
 /* Same fetch as tool_fetch, without the HTML to text pass: the caller gets the
  * body as the server sent it. Bytes are still valid UTF-8 in practice, so the
@@ -1099,8 +1119,9 @@ static void tool_fetch(const json_value *id, const json_value *args) {
 static void tool_fetch_raw(const json_value *id, const json_value *args) {
     const char *url = jv_string(args, "url");
     const char *impersonate = jv_string(args, "impersonate");
+    const char *cookies = jv_string(args, "cookies");
     long max_chars = 100000;
-    anubis_page page;
+    anubis_page_dump dump;
     sb text;
     size_t keep;
 
@@ -1118,24 +1139,24 @@ static void tool_fetch_raw(const json_value *id, const json_value *args) {
             return;
         }
     }
-    memset(&page, 0, sizeof page);
-    if (anubis_fetch_get_with(url, impersonate, &page) != 0) {
+    memset(&dump, 0, sizeof dump);
+    if (anubis_fetch_get_dump_with(url, impersonate, cookies, &dump) != 0) {
         send_tool_error(id, "fetch failed: %s",
-                        page.error[0] ? page.error : "unknown error");
-        anubis_page_free(&page);
+                        dump.page.error[0] ? dump.page.error : "unknown error");
+        anubis_page_dump_free(&dump);
         return;
     }
-    keep = page.body_len;
+    keep = dump.page.body_len;
     if (max_chars > 0 && (size_t)max_chars < keep)
-        keep = utf8_truncate(page.body ? page.body : "", keep, (size_t)max_chars);
+        keep = utf8_truncate(dump.page.body ? dump.page.body : "", keep,
+                             (size_t)max_chars);
 
     sb_init(&text);
-    sb_printf(&text, "status: %d\nurl: %s\ntransport: %s\n\n", page.status,
-              page.final_url ? page.final_url : url, anubis_fetch_transport());
-    if (keep > 0) sb_putn(&text, page.body, keep);
+    append_preamble(&text, &dump, url);
+    if (keep > 0) sb_putn(&text, dump.page.body, keep);
     send_tool_text(id, text.s, text.len, 0);
     sb_free(&text);
-    anubis_page_free(&page);
+    anubis_page_dump_free(&dump);
 }
 
 /* The same fetch, reporting the header blocks instead of the page: every
@@ -1143,6 +1164,7 @@ static void tool_fetch_raw(const json_value *id, const json_value *args) {
 static void tool_dump_headers(const json_value *id, const json_value *args) {
     const char *url = jv_string(args, "url");
     const char *impersonate = jv_string(args, "impersonate");
+    const char *cookies = jv_string(args, "cookies");
     anubis_page_dump dump;
     sb text;
 
@@ -1151,17 +1173,15 @@ static void tool_dump_headers(const json_value *id, const json_value *args) {
         return;
     }
     memset(&dump, 0, sizeof dump);
-    if (anubis_fetch_get_dump(url, impersonate, &dump) != 0) {
+    if (anubis_fetch_get_dump_with(url, impersonate, cookies, &dump) != 0) {
         send_tool_error(id, "fetch failed: %s",
                         dump.page.error[0] ? dump.page.error : "unknown error");
         anubis_page_dump_free(&dump);
         return;
     }
     sb_init(&text);
-    sb_printf(&text, "status: %d\nurl: %s\ntransport: %s\nheaders: %zu bytes\n\n",
-              dump.page.status,
-              dump.page.final_url ? dump.page.final_url : url,
-              anubis_fetch_transport(), dump.headers_len);
+    append_preamble(&text, &dump, url);
+    sb_printf(&text, "headers: %zu bytes\n\n", dump.headers_len);
     if (dump.headers != NULL && dump.headers_len > 0)
         sb_putn(&text, dump.headers, dump.headers_len);
     send_tool_text(id, text.s, text.len, 0);

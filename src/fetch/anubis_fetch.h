@@ -48,6 +48,10 @@ typedef struct {
     anubis_page page;   /* status, body, final_url, error as usual */
     char *headers;      /* every response header block seen, in order, CRLF */
     size_t headers_len; /* NUL-terminated anyway, but may contain NULs */
+    char *cookies;      /* "name=value; name2=value2" to send next time */
+    size_t cookies_len;
+    int solved;         /* a challenge was solved during this call */
+    int expired;        /* cookies were supplied and the site rejected them */
 } anubis_page_dump;
 
 /* Same fetch as anubis_fetch_get_with(), plus the raw header blocks of every
@@ -56,6 +60,21 @@ typedef struct {
  * concatenation is self-describing. Free with anubis_page_dump_free(). */
 int anubis_fetch_get_dump(const char *url, const char *target,
                           anubis_page_dump *out);
+
+/* The same, with the cookie jar carried in and out by the caller.
+ *
+ * `cookies` is a Cookie header value ("name=value; name2=value2") from an
+ * earlier call, or NULL for a cold start. Out->cookies always holds the jar as
+ * the site left it, so a caller keeps a session by passing the same string
+ * back; no server-side state is needed and it survives process restarts.
+ *
+ * out->solved says a challenge was answered in this call, out->expired says
+ * the supplied cookies were no longer accepted (a challenge was served
+ * anyway). A caller that passes cookies and gets expired=1 should replace them
+ * with the new out->cookies and carry on. Thread-safe. */
+int anubis_fetch_get_dump_with(const char *url, const char *target,
+                               const char *cookies, anubis_page_dump *out);
+
 void anubis_page_dump_free(anubis_page_dump *dump);
 
 /* Same, but choose the impersonation profile for this call only, so a

@@ -438,6 +438,7 @@ static int json_find(const char *s, size_t n, const char *key, size_t *vpos) {
     }
     for (;;) {
         strbuf k = {0};
+        jws(s, n, &i); /* a pretty-printed body has spaces after the comma */
         if (!jstring(s, n, &i, &k)) {
             sb_free(&k);
             return 0;
@@ -987,65 +988,61 @@ static void handle_verify(int fd, const char *body, size_t blen) {
     sb_free(&b);
 }
 
+static int fetch_args(int fd, const char *body, size_t blen, char **url,
+                      char **impersonate, char **cookies);
+
 static void handle_fetch(int fd, const char *body, size_t blen) {
     char *url = NULL;
     char *impersonate = NULL;
-    int r = json_get_string(body, blen, "url", &url);
-    if (r <= 0) {
-        reply_error(fd, 400, r < 0 ? "bad json" : "missing field");
-        return;
-    }
-    if (url[0] == '\0') {
-        free(url);
-        reply_error(fd, 400, "missing field");
-        return;
-    }
+    char *cookies = NULL;
+    anubis_page_dump dump;
+    strbuf b = {0};
 
-    /* Optional per-request profile: the service is multi-threaded, so this
-     * must not go through the process-wide default. */
-    if (json_get_string(body, blen, "impersonate", &impersonate) < 0) {
+    if (fetch_args(fd, body, blen, &url, &impersonate, &cookies) != 0) {
+        return;
+    }
+    memset(&dump, 0, sizeof dump);
+    if (anubis_fetch_get_dump_with(url, impersonate, cookies, &dump) != 0) {
+        const char *msg = dump.page.error[0] ? dump.page.error : "fetch failed";
+        reply_error(fd, 502, msg);
+        anubis_page_dump_free(&dump);
         free(url);
         free(impersonate);
-        reply_error(fd, 400, "bad json");
+        free(cookies);
         return;
     }
 
-    anubis_page page;
-    memset(&page, 0, sizeof page);
-    int rc = anubis_fetch_get_with(url, impersonate, &page);
-    free(url);
-    free(impersonate);
-    if (rc != 0) {
-        const char *msg = page.error[0] ? page.error : "fetch failed";
-        reply_error(fd, 502, msg);
-        anubis_page_free(&page);
-        return;
-    }
-
-    strbuf b = {0};
-    sb_printf(&b, "{\"status\":%d,\"final_url\":", page.status);
-    sb_json_string(&b, page.final_url ? page.final_url : "",
-                   page.final_url ? strlen(page.final_url) : 0);
+    sb_printf(&b, "{\"status\":%d,\"final_url\":", dump.page.status);
+    sb_json_string(&b, dump.page.final_url ? dump.page.final_url : "",
+                   dump.page.final_url ? strlen(dump.page.final_url) : 0);
     sb_puts(&b, ",\"transport\":");
     sb_json_string(&b, anubis_fetch_transport(), strlen(anubis_fetch_transport()));
+    sb_printf(&b, ",\"solved\":%s,\"expired\":%s,\"cookies\":",
+              dump.solved ? "true" : "false", dump.expired ? "true" : "false");
+    sb_json_string(&b, dump.cookies ? dump.cookies : "",
+                   dump.cookies ? dump.cookies_len : 0);
     sb_puts(&b, ",\"content\":");
-    sb_json_string(&b, page.body ? page.body : "",
-                   page.body ? page.body_len : 0);
+    sb_json_string(&b, dump.page.body ? dump.page.body : "",
+                   dump.page.body ? dump.page.body_len : 0);
     sb_puts(&b, "}");
     http_reply(fd, 200, b.data);
     sb_free(&b);
-    anubis_page_free(&page);
+    anubis_page_dump_free(&dump);
+    free(url);
+    free(impersonate);
+    free(cookies);
 }
 
-/* Parse the two fetch arguments both fetch endpoints take. Returns 0 on
- * success with the url and impersonate strings owned by the caller, and -1
- * after replying when the body was bad. */
+/* Parse the fetch arguments every fetch endpoint takes: url is required,
+ * impersonate and cookies are optional. All three come back owned by the
+ * caller. Returns 0, or -1 after replying when the body was bad. */
 static int fetch_args(int fd, const char *body, size_t blen, char **url,
-                      char **impersonate) {
+                      char **impersonate, char **cookies) {
     int r;
 
     *url = NULL;
     *impersonate = NULL;
+    *cookies = NULL;
     r = json_get_string(body, blen, "url", url);
     if (r <= 0) {
         reply_error(fd, 400, r < 0 ? "bad json" : "missing field");
@@ -1057,11 +1054,14 @@ static int fetch_args(int fd, const char *body, size_t blen, char **url,
         reply_error(fd, 400, "missing field");
         return -1;
     }
-    if (json_get_string(body, blen, "impersonate", impersonate) < 0) {
+    if (json_get_string(body, blen, "impersonate", impersonate) < 0 ||
+        json_get_string(body, blen, "cookies", cookies) < 0) {
         free(*url);
         *url = NULL;
         free(*impersonate);
         *impersonate = NULL;
+        free(*cookies);
+        *cookies = NULL;
         reply_error(fd, 400, "bad json");
         return -1;
     }
@@ -1073,21 +1073,23 @@ static int fetch_args(int fd, const char *body, size_t blen, char **url,
 static void handle_fetch_raw(int fd, const char *body, size_t blen) {
     char *url = NULL;
     char *impersonate = NULL;
+    char *cookies = NULL;
     anubis_page_dump dump;
     char content_type[160] = "";
-    char extra[2048];
     char final_url[1200];
+    strbuf extra = {0};
 
-    if (fetch_args(fd, body, blen, &url, &impersonate) != 0) {
+    if (fetch_args(fd, body, blen, &url, &impersonate, &cookies) != 0) {
         return;
     }
     memset(&dump, 0, sizeof dump);
-    if (anubis_fetch_get_dump(url, impersonate, &dump) != 0) {
+    if (anubis_fetch_get_dump_with(url, impersonate, cookies, &dump) != 0) {
         const char *msg = dump.page.error[0] ? dump.page.error : "fetch failed";
         reply_error(fd, 502, msg);
         anubis_page_dump_free(&dump);
         free(url);
         free(impersonate);
+        free(cookies);
         return;
     }
     if (!header_value(dump.headers, dump.headers_len, "Content-Type",
@@ -1097,35 +1099,52 @@ static void handle_fetch_raw(int fd, const char *body, size_t blen) {
     snprintf(final_url, sizeof final_url, "%s",
              dump.page.final_url ? dump.page.final_url : url);
     header_safe(final_url);
-    snprintf(extra, sizeof extra,
-             "X-Anubis-Status: %d\r\n"
-             "X-Anubis-Final-URL: %s\r\n"
-             "X-Anubis-Transport: %s\r\n",
-             dump.page.status, final_url, anubis_fetch_transport());
-    http_reply_raw(fd, 200, content_type, extra,
+    sb_printf(&extra,
+              "X-Anubis-Status: %d\r\n"
+              "X-Anubis-Final-URL: %s\r\n"
+              "X-Anubis-Transport: %s\r\n"
+              "X-Anubis-Solved: %s\r\n"
+              "X-Anubis-Expired: %s\r\n",
+              dump.page.status, final_url, anubis_fetch_transport(),
+              dump.solved ? "1" : "0", dump.expired ? "1" : "0");
+    if (dump.cookies != NULL && dump.cookies_len > 0) {
+        char *safe = strdup(dump.cookies);
+        if (safe != NULL) {
+            header_safe(safe);
+            sb_puts(&extra, "X-Anubis-Cookies: ");
+            sb_puts(&extra, safe);
+            sb_puts(&extra, "\r\n");
+            free(safe);
+        }
+    }
+    http_reply_raw(fd, 200, content_type, extra.data,
                    dump.page.body ? dump.page.body : "", dump.page.body_len);
+    sb_free(&extra);
     anubis_page_dump_free(&dump);
     free(url);
     free(impersonate);
+    free(cookies);
 }
 
 /* Every response header block the fetch went through, as JSON. */
 static void handle_dump_headers(int fd, const char *body, size_t blen) {
     char *url = NULL;
     char *impersonate = NULL;
+    char *cookies = NULL;
     anubis_page_dump dump;
     strbuf b = {0};
 
-    if (fetch_args(fd, body, blen, &url, &impersonate) != 0) {
+    if (fetch_args(fd, body, blen, &url, &impersonate, &cookies) != 0) {
         return;
     }
     memset(&dump, 0, sizeof dump);
-    if (anubis_fetch_get_dump(url, impersonate, &dump) != 0) {
+    if (anubis_fetch_get_dump_with(url, impersonate, cookies, &dump) != 0) {
         const char *msg = dump.page.error[0] ? dump.page.error : "fetch failed";
         reply_error(fd, 502, msg);
         anubis_page_dump_free(&dump);
         free(url);
         free(impersonate);
+        free(cookies);
         return;
     }
     sb_printf(&b, "{\"status\":%d,\"final_url\":", dump.page.status);
@@ -1133,6 +1152,11 @@ static void handle_dump_headers(int fd, const char *body, size_t blen) {
                    strlen(dump.page.final_url ? dump.page.final_url : url));
     sb_puts(&b, ",\"transport\":");
     sb_json_string(&b, anubis_fetch_transport(), strlen(anubis_fetch_transport()));
+    sb_printf(&b, ",\"solved\":%s,\"expired\":%s",
+              dump.solved ? "true" : "false", dump.expired ? "true" : "false");
+    sb_puts(&b, ",\"cookies\":");
+    sb_json_string(&b, dump.cookies ? dump.cookies : "",
+                   dump.cookies ? dump.cookies_len : 0);
     sb_printf(&b, ",\"headers_len\":%zu,\"headers\":", dump.headers_len);
     sb_json_string(&b, dump.headers ? dump.headers : "",
                    dump.headers ? dump.headers_len : 0);
@@ -1142,6 +1166,7 @@ static void handle_dump_headers(int fd, const char *body, size_t blen) {
     anubis_page_dump_free(&dump);
     free(url);
     free(impersonate);
+    free(cookies);
 }
 
 /* ------------------------------------------------------------------ */
