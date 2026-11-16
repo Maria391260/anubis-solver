@@ -286,6 +286,28 @@ ck "/v1/fetch answer reports status 200" "$(has '"status":200')"
 ck "/v1/fetch content contains PAST THE WALL" "$(has 'PAST THE WALL')"
 ck "/v1/fetch returns a final_url" "$(has '"final_url":"http://127.0.0.1:'"$GATE_PORT"'/"')"
 
+# ---- end-to-end: raw body and dumped headers ----------------------------
+
+RAW="$(curl -sS --max-time 20 -D "$TMP/raw.head" -o "$BODY" -w '%{http_code}' \
+    -X POST -H 'Content-Type: application/json' \
+    --data-binary "{\"url\":\"$GATE/\"}" "$API/v1/fetch_raw" 2>/dev/null || echo 000)"
+ck "POST /v1/fetch_raw through live Anubis gate -> 200" "$(code_is "$RAW" 200)"
+ck "/v1/fetch_raw returns the raw HTML, not text" "$(has '<html>')"
+ck "/v1/fetch_raw carries the origin Content-Type" \
+   "$(grep -qi '^Content-Type: text/html' "$TMP/raw.head" && echo 1 || echo 0)"
+ck "/v1/fetch_raw reports X-Anubis-Status" \
+   "$(grep -qi '^X-Anubis-Status: 200' "$TMP/raw.head" && echo 1 || echo 0)"
+ck "/v1/fetch_raw reports X-Anubis-Final-URL" \
+   "$(grep -qi '^X-Anubis-Final-URL: http' "$TMP/raw.head" && echo 1 || echo 0)"
+
+CODE="$(http POST "$API/v1/dump_headers" "{\"url\":\"$GATE/\"}")"
+ck "POST /v1/dump_headers through live Anubis gate -> 200" "$(code_is "$CODE" 200)"
+ck "/v1/dump_headers reports a headers_len" "$(has '"headers_len":')"
+ck "/v1/dump_headers captured the Anubis cookie" "$(has 'et-Cookie')"
+ck "/v1/dump_headers has every response, not just the last" \
+   "$(count="$(grep -o 'HTTP/1\.[01]' "$BODY" 2>/dev/null | wc -l)"; \
+      [ "${count:-0}" -ge 2 ] && echo 1 || echo 0)"
+
 # ---- summary ------------------------------------------------------------
 
 echo

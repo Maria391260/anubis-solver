@@ -254,7 +254,7 @@ static int decode_chunked(const char *in, size_t inlen, buf *out) {
 }
 
 static int http_get(const char *url, jar *j, const char *extra_headers,
-                    anubis_page *out) {
+                    anubis_page *out, char **headers, size_t *headers_len) {
     url_t u;
     int fd = -1, rc = -1;
     SSL_CTX *ctx = NULL;
@@ -365,6 +365,26 @@ static int http_get(const char *url, jar *j, const char *extra_headers,
         int chunked = 0;
         long content_length = -1;
 
+        /* The header block as it arrived, status line included. */
+        if (headers != NULL) {
+            *headers = NULL;
+            if (headers_len != NULL) {
+                *headers_len = 0;
+            }
+            if (hdr_end != NULL) {
+                size_t hl = (size_t)(hdr_end - raw.data);
+                char *copy = malloc(hl + 1);
+                if (copy != NULL) {
+                    memcpy(copy, raw.data, hl);
+                    copy[hl] = '\0';
+                    *headers = copy;
+                    if (headers_len != NULL) {
+                        *headers_len = hl;
+                    }
+                }
+            }
+        }
+
         out->status = 0;
         if (strncmp(line, "HTTP/", 5) == 0) {
             char *sp = strchr(line, ' ');
@@ -454,12 +474,14 @@ typedef struct {
     jar j;
 } xport;
 
-static int xport_get(xport *x, const char *url, anubis_page *out) {
+static int xport_get(xport *x, const char *url, anubis_page *out,
+                     char **headers, size_t *headers_len) {
     if (x->imp) {
         const char *insecure = getenv("ANUBIS_INSECURE");
-        return anubis_imp_get(x->imp, url, insecure && *insecure == '1', out);
+        return anubis_imp_get(x->imp, url, insecure && *insecure == '1', out,
+                              headers, headers_len);
     }
-    return http_get(url, &x->j, NULL, out);
+    return http_get(url, &x->j, NULL, out, headers, headers_len);
 }
 
 static void xport_close(xport *x) {
@@ -699,13 +721,45 @@ void anubis_page_free(anubis_page *page) {
     memset(page, 0, sizeof *page);
 }
 
-int anubis_fetch_get_with(const char *url, const char *target, anubis_page *out) {
+/* Append one response's header block to the running dump. Blocks already end
+ * with CRLF; the extra newline only keeps them apart when one does not. */
+static int hdr_append(char **acc, size_t *acc_len, const char *block,
+                      size_t len) {
+    char *n;
+    if (block == NULL || len == 0) {
+        return 0;
+    }
+    n = realloc(*acc, *acc_len + len + 2);
+    if (n == NULL) {
+        return -1;
+    }
+    memcpy(n + *acc_len, block, len);
+    *acc_len += len;
+    if (n[*acc_len - 1] != '\n') {
+        n[(*acc_len)++] = '\n';
+    }
+    n[*acc_len] = '\0';
+    *acc = n;
+    return 0;
+}
+
+static int fetch_impl(const char *url, const char *target, anubis_page *out,
+                      char **headers, size_t *headers_len) {
     xport x = {0};
     char *current = xstrdup(url);
+    char *acc = NULL;
+    size_t acc_len = 0;
     int attempt;
+    int rc = -1;
 
     if (!out) return -1;
     memset(out, 0, sizeof *out);
+    if (headers != NULL) {
+        *headers = NULL;
+    }
+    if (headers_len != NULL) {
+        *headers_len = 0;
+    }
     if (!url || !current) {
         snprintf(out->error, sizeof out->error, "bad url");
         free(current);
@@ -718,13 +772,26 @@ int anubis_fetch_get_with(const char *url, const char *target, anubis_page *out)
 
     for (attempt = 0; attempt < 8; attempt++) {
         anubis_page page = {0};
-        if (xport_get(&x, current, &page) != 0) {
+        char *page_hdr = NULL;
+        size_t page_hdr_len = 0;
+
+        if (xport_get(&x, current, &page, headers ? &page_hdr : NULL,
+                      headers ? &page_hdr_len : NULL) != 0) {
             snprintf(out->error, sizeof out->error, "%s", page.error);
+            free(page_hdr);
             anubis_page_free(&page);
-            free(current);
-            xport_close(&x);
-            return -1;
+            goto done;
         }
+        /* Accumulate before any branch: the dump wants every response, not
+         * just the one that finally carried the page. */
+        if (headers != NULL &&
+            hdr_append(&acc, &acc_len, page_hdr, page_hdr_len) != 0) {
+            snprintf(out->error, sizeof out->error, "out of memory");
+            free(page_hdr);
+            anubis_page_free(&page);
+            goto done;
+        }
+        free(page_hdr);
         if (page.final_url && (page.status == 301 || page.status == 302 ||
                                page.status == 303 || page.status == 307 ||
                                page.status == 308)) {
@@ -750,17 +817,13 @@ int anubis_fetch_get_with(const char *url, const char *target, anubis_page *out)
             if (random_data[0] == '\0') {
                 snprintf(out->error, sizeof out->error, "challenge without randomData");
                 anubis_page_free(&page);
-                free(current);
-                xport_close(&x);
-                return -1;
+                goto done;
             }
             origin = origin_of(current);
             if (!origin) {
                 snprintf(out->error, sizeof out->error, "bad url");
                 anubis_page_free(&page);
-                free(current);
-                xport_close(&x);
-                return -1;
+                goto done;
             }
             enc_id = url_encode(id);
             enc_rd = url_encode(random_data);
@@ -793,9 +856,7 @@ int anubis_fetch_get_with(const char *url, const char *target, anubis_page *out)
                              "cannot solve %s difficulty %ld", algorithm, difficulty);
                     free(origin); free(enc_id); free(enc_rd); free(enc_redir);
                     anubis_page_free(&page);
-                    free(current);
-                    xport_close(&x);
-                    return -1;
+                    goto done;
                 }
                 enc_resp = url_encode(digest);
                 pass = malloc(strlen(origin) + strlen(enc_resp) + strlen(enc_redir) +
@@ -811,32 +872,82 @@ int anubis_fetch_get_with(const char *url, const char *target, anubis_page *out)
             free(enc_rd);
             free(enc_redir);
 
-            if (xport_get(&x, pass, &solved) != 0) {
-                snprintf(out->error, sizeof out->error, "pass-challenge failed: %.200s",
-                         solved.error);
+            {
+                char *solved_hdr = NULL;
+                size_t solved_hdr_len = 0;
+
+                if (xport_get(&x, pass, &solved,
+                              headers ? &solved_hdr : NULL,
+                              headers ? &solved_hdr_len : NULL) != 0) {
+                    snprintf(out->error, sizeof out->error,
+                             "pass-challenge failed: %.200s", solved.error);
+                    free(solved_hdr);
+                    free(pass);
+                    anubis_page_free(&solved);
+                    anubis_page_free(&page);
+                    goto done;
+                }
                 free(pass);
+                if (headers != NULL &&
+                    hdr_append(&acc, &acc_len, solved_hdr, solved_hdr_len) != 0) {
+                    snprintf(out->error, sizeof out->error, "out of memory");
+                    free(solved_hdr);
+                    anubis_page_free(&solved);
+                    anubis_page_free(&page);
+                    goto done;
+                }
+                free(solved_hdr);
                 anubis_page_free(&solved);
-                anubis_page_free(&page);
-                free(current);
-                xport_close(&x);
-                return -1;
             }
-            free(pass);
-            anubis_page_free(&solved);
             anubis_page_free(&page);
             continue; /* re-fetch the original URL with the new cookie */
         }
 
         *out = page;
         if (!out->final_url) out->final_url = xstrdup(current);
-        free(current);
-        xport_close(&x);
-        return 0;
+        if (headers != NULL) {
+            *headers = acc;
+            acc = NULL;
+        }
+        if (headers_len != NULL) {
+            *headers_len = acc_len;
+        }
+        rc = 0;
+        break;
     }
-    snprintf(out->error, sizeof out->error, "too many challenge rounds");
+    if (rc != 0) {
+        snprintf(out->error, sizeof out->error, "too many challenge rounds");
+    }
+
+done:
+    free(acc);
     free(current);
     xport_close(&x);
-    return -1;
+    return rc;
+}
+
+int anubis_fetch_get_with(const char *url, const char *target, anubis_page *out) {
+    return fetch_impl(url, target, out, NULL, NULL);
+}
+
+int anubis_fetch_get_dump(const char *url, const char *target,
+                          anubis_page_dump *out) {
+    if (out == NULL) {
+        return -1;
+    }
+    memset(out, 0, sizeof *out);
+    return fetch_impl(url, target, &out->page, &out->headers,
+                      &out->headers_len);
+}
+
+void anubis_page_dump_free(anubis_page_dump *dump) {
+    if (dump == NULL) {
+        return;
+    }
+    anubis_page_free(&dump->page);
+    free(dump->headers);
+    dump->headers = NULL;
+    dump->headers_len = 0;
 }
 
 int anubis_fetch_get(const char *url, anubis_page *out) {

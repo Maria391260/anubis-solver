@@ -41,6 +41,23 @@ typedef struct {
 int anubis_fetch_get(const char *url, anubis_page *out);
 void anubis_page_free(anubis_page *page);
 
+/* Headers seen along the way, next to the page. A separate struct because
+ * anubis_page is allocated by the caller: growing it would write past the end
+ * of every program compiled against an older release. */
+typedef struct {
+    anubis_page page;   /* status, body, final_url, error as usual */
+    char *headers;      /* every response header block seen, in order, CRLF */
+    size_t headers_len; /* NUL-terminated anyway, but may contain NULs */
+} anubis_page_dump;
+
+/* Same fetch as anubis_fetch_get_with(), plus the raw header blocks of every
+ * response it went through: the challenge 401, the pass-challenge reply, any
+ * redirect and the final page. Each block starts with its own status line, so
+ * concatenation is self-describing. Free with anubis_page_dump_free(). */
+int anubis_fetch_get_dump(const char *url, const char *target,
+                          anubis_page_dump *out);
+void anubis_page_dump_free(anubis_page_dump *dump);
+
 /* Same, but choose the impersonation profile for this call only, so a
  * multi-threaded caller (the API service) never races on global state.
  * `target` may be NULL for the default, "off" for the built-in OpenSSL

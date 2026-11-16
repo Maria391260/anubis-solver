@@ -53,8 +53,8 @@ Two binaries, one shared C client, no scripting runtime:
 
 | binary | what it is | docs |
 |---|---|---|
-| `anubis_mcp` | MCP server over stdio: tools `anubis_fetch`, `anubis_solve`, `anubis_version`, `anubis_backends` | [docs/mcp.md](docs/mcp.md) |
-| `anubis_api` | HTTP/1.1 JSON service: `/v1/solve`, `/v1/verify`, `/v1/fetch`, `/v1/backends` | [docs/api-service.md](docs/api-service.md) |
+| `anubis_mcp` | MCP server over stdio: tools `anubis_fetch`, `anubis_fetch_raw`, `anubis_dump_headers`, `anubis_solve`, `anubis_version`, `anubis_backends` | [docs/mcp.md](docs/mcp.md) |
+| `anubis_api` | HTTP/1.1 JSON service: `/v1/solve`, `/v1/verify`, `/v1/fetch`, `/v1/fetch_raw`, `/v1/dump_headers`, `/v1/backends` | [docs/api-service.md](docs/api-service.md) |
 
 ```bash
 make -j8 libanubis_solver.so
@@ -112,7 +112,8 @@ make test-impersonate         # local TLS server: GREASE present/absent per prof
 - **Two C services (new in 2.0.1)**: an **MCP server** over stdio (`anubis_mcp`)
   that lets an agent fetch Anubis-protected URLs and solve challenges, and an
   **HTTP API service** (`anubis_api`) exposing `/v1/solve`, `/v1/verify`,
-  `/v1/fetch` and `/v1/backends` as JSON. Both link the `.so` and the shared C
+  `/v1/fetch`, `/v1/fetch_raw`, `/v1/dump_headers` and `/v1/backends` as JSON.
+  Both link the `.so` and the shared C
   fetch layer (`src/fetch/`), with no Python or Node in the path.
 - **Every GPU hit is re-verified** with the CPU reference; a mismatch silently
   falls back, so a broken driver cannot produce an invalid proof.

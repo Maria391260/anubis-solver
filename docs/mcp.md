@@ -52,6 +52,8 @@ under `/usr/local/bin` + `/usr/local/lib`).
 | tool | arguments | returns |
 |---|---|---|
 | `anubis_fetch` | `url` (required), `max_chars` (default 100000), `impersonate` optional | `status: <code>`, `url: <final>`, `transport: <openssl\|curl-impersonate/profile>`, then the page as text |
+| `anubis_fetch_raw` | same as `anubis_fetch` | the same preamble, then the body exactly as it arrived: raw HTML or bytes, no tag stripping |
+| `anubis_dump_headers` | `url` (required), `impersonate` optional | `status:`, `url:`, `transport:`, `headers: <n> bytes`, then the raw header block of every response seen, in order |
 | `anubis_solve` | `algorithm`, `challenge` (hex), `difficulty`, `threads` optional | JSON `{"nonce":n,"response":"<hex>","algorithm":"..."}` |
 | `anubis_version` | none | JSON `{"version":"2.0.2","codename":"shaoogle","algorithms":[...],"impersonate":"chrome116","impersonate_available":true}` |
 | `anubis_backends` | none | JSON `{"compiled":["cpu","vulkan","opencl"],"available":["cpu","vulkan","opencl"]}`; `available` probes the drivers and can take a second on a cold stack |
@@ -62,6 +64,13 @@ under `/usr/local/bin` + `/usr/local/lib`).
 `preact`), submits `pass-challenge` with the cookies the server set, and
 re-fetches. TLS is verified; `ANUBIS_INSECURE=1` disables verification for
 testing against a self-signed gate.
+
+All three fetch tools share that client. `anubis_fetch_raw` is for callers that
+want the document rather than prose — an agent reading a page, a scraper that
+matches on markup. `anubis_dump_headers` is the debugging view: it returns the
+header block of the challenge, of the `pass-challenge` reply, of any redirect
+and of the final page, so a gate that answers unexpectedly can be diagnosed
+without packet capture.
 
 ## Browser TLS fingerprints
 

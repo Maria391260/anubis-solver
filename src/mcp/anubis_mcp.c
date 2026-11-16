@@ -3,10 +3,12 @@
  *
  * Newline-delimited JSON-RPC 2.0 over stdio: one request object per line on
  * stdin, one response object per line on stdout, nothing else on stdout.
- * Notifications (no "id") get no response. The three tools are anubis_fetch
+ * Notifications (no "id") get no response. The tools are anubis_fetch
  * (network fetch through the C fetch layer, which solves challenges while it
- * goes), anubis_solve (one local proof of work) and anubis_version
- * (introspection).
+ * goes, returned as text), anubis_fetch_raw (the same fetch without the HTML
+ * to text pass), anubis_dump_headers (the same fetch, reporting the header
+ * blocks of every response it went through), anubis_solve (one local proof of
+ * work), anubis_version and anubis_backends (introspection).
  *
  * No JSON library: a small validating parser and a small escaper are right
  * here. No dynamic allocations survive a request. The solver is the same
@@ -923,6 +925,8 @@ static const char TOOLS_JSON[] =
     "concrete profile such as chrome116, edge101 or safari15_5, \\\"auto\\\" or "
     "\\\"off\\\" for the built-in OpenSSL client.\"}},"
     "\"required\":[\"url\"]}},"
+    "{\"name\":\"anubis_fetch_raw\",\"description\":\"Fetch an Anubis-protected URL, solving any challenge on the way, and return the body exactly as it arrived: raw HTML or bytes, not the readable text anubis_fetch produces. Begins with status: <code>, url: <final_url> and transport: <openssl|curl-impersonate/profile>.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute http or https URL.\"},\"max_chars\":{\"type\":\"integer\",\"description\":\"Maximum body characters to return (default 100000, 0 means unlimited).\"},\"impersonate\":{\"type\":\"string\",\"description\":\"TLS fingerprint to present: chrome (default when a curl-impersonate library is installed), a concrete profile such as chrome116, edge101 or safari15_5, \\\"auto\\\" or \\\"off\\\" for the built-in OpenSSL client.\"}},\"required\":[\"url\"]}},"
+    "{\"name\":\"anubis_dump_headers\",\"description\":\"Fetch an Anubis-protected URL, solving any challenge on the way, and return the raw header blocks of every response it went through, in order: the challenge, the pass-challenge reply, any redirect and the final page. Each block starts with its own status line.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Absolute http or https URL.\"},\"impersonate\":{\"type\":\"string\",\"description\":\"TLS fingerprint to present: chrome (default when a curl-impersonate library is installed), a concrete profile such as chrome116, edge101 or safari15_5, \\\"auto\\\" or \\\"off\\\" for the built-in OpenSSL client.\"}},\"required\":[\"url\"]}},"
     "{\"name\":\"anubis_solve\","
     "\"description\":\"Solve one Anubis proof-of-work challenge locally, without "
     "network access. Returns a JSON text with nonce, response digest and "
@@ -1088,6 +1092,83 @@ static void tool_fetch(const json_value *id, const json_value *args) {
     anubis_page_free(&page);
 }
 
+
+/* Same fetch as tool_fetch, without the HTML to text pass: the caller gets the
+ * body as the server sent it. Bytes are still valid UTF-8 in practice, so the
+ * same character cap applies. */
+static void tool_fetch_raw(const json_value *id, const json_value *args) {
+    const char *url = jv_string(args, "url");
+    const char *impersonate = jv_string(args, "impersonate");
+    long max_chars = 100000;
+    anubis_page page;
+    sb text;
+    size_t keep;
+
+    if (!url || !*url) {
+        send_tool_error(id, "missing required argument: url");
+        return;
+    }
+    if (jv_get(args, "max_chars")) {
+        if (!jv_long(args, "max_chars", &max_chars)) {
+            send_tool_error(id, "max_chars must be an integer");
+            return;
+        }
+        if (max_chars < 0) {
+            send_tool_error(id, "max_chars must be non-negative");
+            return;
+        }
+    }
+    memset(&page, 0, sizeof page);
+    if (anubis_fetch_get_with(url, impersonate, &page) != 0) {
+        send_tool_error(id, "fetch failed: %s",
+                        page.error[0] ? page.error : "unknown error");
+        anubis_page_free(&page);
+        return;
+    }
+    keep = page.body_len;
+    if (max_chars > 0 && (size_t)max_chars < keep)
+        keep = utf8_truncate(page.body ? page.body : "", keep, (size_t)max_chars);
+
+    sb_init(&text);
+    sb_printf(&text, "status: %d\nurl: %s\ntransport: %s\n\n", page.status,
+              page.final_url ? page.final_url : url, anubis_fetch_transport());
+    if (keep > 0) sb_putn(&text, page.body, keep);
+    send_tool_text(id, text.s, text.len, 0);
+    sb_free(&text);
+    anubis_page_free(&page);
+}
+
+/* The same fetch, reporting the header blocks instead of the page: every
+ * response the loop went through, challenge and pass-challenge included. */
+static void tool_dump_headers(const json_value *id, const json_value *args) {
+    const char *url = jv_string(args, "url");
+    const char *impersonate = jv_string(args, "impersonate");
+    anubis_page_dump dump;
+    sb text;
+
+    if (!url || !*url) {
+        send_tool_error(id, "missing required argument: url");
+        return;
+    }
+    memset(&dump, 0, sizeof dump);
+    if (anubis_fetch_get_dump(url, impersonate, &dump) != 0) {
+        send_tool_error(id, "fetch failed: %s",
+                        dump.page.error[0] ? dump.page.error : "unknown error");
+        anubis_page_dump_free(&dump);
+        return;
+    }
+    sb_init(&text);
+    sb_printf(&text, "status: %d\nurl: %s\ntransport: %s\nheaders: %zu bytes\n\n",
+              dump.page.status,
+              dump.page.final_url ? dump.page.final_url : url,
+              anubis_fetch_transport(), dump.headers_len);
+    if (dump.headers != NULL && dump.headers_len > 0)
+        sb_putn(&text, dump.headers, dump.headers_len);
+    send_tool_text(id, text.s, text.len, 0);
+    sb_free(&text);
+    anubis_page_dump_free(&dump);
+}
+
 static void tool_call(const json_value *id, const json_value *params) {
     const char *name;
     const json_value *args;
@@ -1111,6 +1192,10 @@ static void tool_call(const json_value *id, const json_value *params) {
     }
     if (strcmp(name, "anubis_fetch") == 0) {
         tool_fetch(id, args);
+    } else if (strcmp(name, "anubis_fetch_raw") == 0) {
+        tool_fetch_raw(id, args);
+    } else if (strcmp(name, "anubis_dump_headers") == 0) {
+        tool_dump_headers(id, args);
     } else if (strcmp(name, "anubis_solve") == 0) {
         tool_solve(id, args);
     } else if (strcmp(name, "anubis_version") == 0) {

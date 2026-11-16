@@ -64,9 +64,13 @@ const char *anubis_imp_handle_target(const anubis_imp_handle *h);
 
 /* GET url on this handle. `insecure` skips certificate verification.
  * Fills out->status/body/body_len/final_url, or out->error on failure.
- * Redirects are followed by the library; cookies are handled by it too. */
+ * Redirects are followed by the library; cookies are handled by it too.
+ *
+ * When `headers` is not NULL it receives a malloc'd copy of every response
+ * header block the transfer produced (status lines included) and `headers_len`
+ * its size; both are NULL/0 when the library gave none. Free the pointer. */
 int anubis_imp_get(anubis_imp_handle *h, const char *url, int insecure,
-                   anubis_page *out);
+                   anubis_page *out, char **headers, size_t *headers_len);
 
 #ifdef __cplusplus
 }

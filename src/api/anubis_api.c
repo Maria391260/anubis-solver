@@ -7,7 +7,9 @@
  *   GET  /v1/version
  *   POST /v1/solve
  *   POST /v1/verify
- *   POST /v1/fetch
+ *   POST /v1/fetch          JSON envelope, body as a string
+ *   POST /v1/fetch_raw      the body bytes verbatim, origin Content-Type
+ *   POST /v1/dump_headers   the header blocks of every response on the way
  *
  * One thread per connection, no external web framework, and a tiny
  * hand-written JSON parser/emitter so the binary has no extra dependencies.
@@ -34,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -617,6 +620,90 @@ static void http_reply(int fd, int status, const char *body) {
     (void)write_all(fd, body, strlen(body));
 }
 
+/* Like http_reply, but for a body that must not be JSON-escaped: /v1/fetch_raw
+ * hands back the upstream bytes with the upstream Content-Type. `extra` is a
+ * pre-formatted block of additional response headers (may be NULL). */
+static void http_reply_raw(int fd, int status, const char *content_type,
+                           const char *extra, const char *body, size_t len) {
+    char head[1536];
+    int n;
+    if (content_type == NULL || *content_type == '\0') {
+        content_type = "application/octet-stream";
+    }
+    n = snprintf(head, sizeof head,
+                 "HTTP/1.1 %d %s\r\n"
+                 "Content-Type: %s\r\n"
+                 "Content-Length: %zu\r\n"
+                 "%s"
+                 "Connection: close\r\n"
+                 "\r\n",
+                 status, reason_phrase(status), content_type, len,
+                 extra != NULL ? extra : "");
+    if (n < 0 || (size_t)n >= sizeof head) {
+        return;
+    }
+    if (write_all(fd, head, (size_t)n) != 0) {
+        return;
+    }
+    if (len > 0) {
+        (void)write_all(fd, body, len);
+    }
+}
+
+/* Copy CR/LF out of a value that goes into a response header line. */
+static void header_safe(char *s) {
+    for (; *s != '\0'; s++) {
+        if (*s == '\r' || *s == '\n') {
+            *s = ' ';
+        }
+    }
+}
+
+/* Case-insensitive lookup of the last `name` header in a raw block. Returns 0
+ * and writes a NUL-terminated value (leading space trimmed) on success. */
+static int header_value(const char *headers, size_t len, const char *name,
+                        char *out, size_t cap) {
+    size_t name_len = strlen(name);
+    const char *p = headers;
+    const char *end = headers + len;
+    int found = 0;
+
+    if (out == NULL || cap == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        size_t line_len = eol ? (size_t)(eol - p) : (size_t)(end - p);
+        if (line_len > name_len && line_len >= name_len + 1 &&
+            strncasecmp(p, name, name_len) == 0 && p[name_len] == ':') {
+            const char *v = p + name_len + 1;
+            const char *v_end = p + line_len;
+            size_t k;
+            while (v < v_end && (*v == ' ' || *v == '\t')) {
+                v++;
+            }
+            while (v_end > v && (v_end[-1] == '\r' || v_end[-1] == ' ' ||
+                                 v_end[-1] == '\t')) {
+                v_end--;
+            }
+            k = (size_t)(v_end - v);
+            if (k >= cap) {
+                k = cap - 1;
+            }
+            memcpy(out, v, k);
+            out[k] = '\0';
+            header_safe(out);
+            found = 1;
+        }
+        if (eol == NULL) {
+            break;
+        }
+        p = eol + 1;
+    }
+    return found;
+}
+
 static void reply_error(int fd, int status, const char *message) {
     strbuf b = {0};
     sb_puts(&b, "{\"error\":");
@@ -950,6 +1037,113 @@ static void handle_fetch(int fd, const char *body, size_t blen) {
     anubis_page_free(&page);
 }
 
+/* Parse the two fetch arguments both fetch endpoints take. Returns 0 on
+ * success with the url and impersonate strings owned by the caller, and -1
+ * after replying when the body was bad. */
+static int fetch_args(int fd, const char *body, size_t blen, char **url,
+                      char **impersonate) {
+    int r;
+
+    *url = NULL;
+    *impersonate = NULL;
+    r = json_get_string(body, blen, "url", url);
+    if (r <= 0) {
+        reply_error(fd, 400, r < 0 ? "bad json" : "missing field");
+        return -1;
+    }
+    if ((*url)[0] == '\0') {
+        free(*url);
+        *url = NULL;
+        reply_error(fd, 400, "missing field");
+        return -1;
+    }
+    if (json_get_string(body, blen, "impersonate", impersonate) < 0) {
+        free(*url);
+        *url = NULL;
+        free(*impersonate);
+        *impersonate = NULL;
+        reply_error(fd, 400, "bad json");
+        return -1;
+    }
+    return 0;
+}
+
+/* The body bytes exactly as the origin sent them, with the origin
+ * Content-Type and the fetch metadata as X-Anubis-* headers. */
+static void handle_fetch_raw(int fd, const char *body, size_t blen) {
+    char *url = NULL;
+    char *impersonate = NULL;
+    anubis_page_dump dump;
+    char content_type[160] = "";
+    char extra[2048];
+    char final_url[1200];
+
+    if (fetch_args(fd, body, blen, &url, &impersonate) != 0) {
+        return;
+    }
+    memset(&dump, 0, sizeof dump);
+    if (anubis_fetch_get_dump(url, impersonate, &dump) != 0) {
+        const char *msg = dump.page.error[0] ? dump.page.error : "fetch failed";
+        reply_error(fd, 502, msg);
+        anubis_page_dump_free(&dump);
+        free(url);
+        free(impersonate);
+        return;
+    }
+    if (!header_value(dump.headers, dump.headers_len, "Content-Type",
+                      content_type, sizeof content_type)) {
+        snprintf(content_type, sizeof content_type, "application/octet-stream");
+    }
+    snprintf(final_url, sizeof final_url, "%s",
+             dump.page.final_url ? dump.page.final_url : url);
+    header_safe(final_url);
+    snprintf(extra, sizeof extra,
+             "X-Anubis-Status: %d\r\n"
+             "X-Anubis-Final-URL: %s\r\n"
+             "X-Anubis-Transport: %s\r\n",
+             dump.page.status, final_url, anubis_fetch_transport());
+    http_reply_raw(fd, 200, content_type, extra,
+                   dump.page.body ? dump.page.body : "", dump.page.body_len);
+    anubis_page_dump_free(&dump);
+    free(url);
+    free(impersonate);
+}
+
+/* Every response header block the fetch went through, as JSON. */
+static void handle_dump_headers(int fd, const char *body, size_t blen) {
+    char *url = NULL;
+    char *impersonate = NULL;
+    anubis_page_dump dump;
+    strbuf b = {0};
+
+    if (fetch_args(fd, body, blen, &url, &impersonate) != 0) {
+        return;
+    }
+    memset(&dump, 0, sizeof dump);
+    if (anubis_fetch_get_dump(url, impersonate, &dump) != 0) {
+        const char *msg = dump.page.error[0] ? dump.page.error : "fetch failed";
+        reply_error(fd, 502, msg);
+        anubis_page_dump_free(&dump);
+        free(url);
+        free(impersonate);
+        return;
+    }
+    sb_printf(&b, "{\"status\":%d,\"final_url\":", dump.page.status);
+    sb_json_string(&b, dump.page.final_url ? dump.page.final_url : url,
+                   strlen(dump.page.final_url ? dump.page.final_url : url));
+    sb_puts(&b, ",\"transport\":");
+    sb_json_string(&b, anubis_fetch_transport(), strlen(anubis_fetch_transport()));
+    sb_printf(&b, ",\"headers_len\":%zu,\"headers\":", dump.headers_len);
+    sb_json_string(&b, dump.headers ? dump.headers : "",
+                   dump.headers ? dump.headers_len : 0);
+    sb_puts(&b, "}");
+    http_reply(fd, 200, b.data);
+    sb_free(&b);
+    anubis_page_dump_free(&dump);
+    free(url);
+    free(impersonate);
+}
+
 /* ------------------------------------------------------------------ */
 /* Connection handling                                                 */
 /* ------------------------------------------------------------------ */
@@ -1127,15 +1321,21 @@ static void handle_client(int fd) {
     } else if (is_post &&
                (strcmp(path, "/v1/solve") == 0 ||
                 strcmp(path, "/v1/verify") == 0 ||
-                strcmp(path, "/v1/fetch") == 0)) {
+                strcmp(path, "/v1/fetch") == 0 ||
+                strcmp(path, "/v1/fetch_raw") == 0 ||
+                strcmp(path, "/v1/dump_headers") == 0)) {
         if (!json_validate(body, content_length)) {
             reply_error(fd, 400, "bad json");
         } else if (strcmp(path, "/v1/solve") == 0) {
             handle_solve(fd, body, content_length);
         } else if (strcmp(path, "/v1/verify") == 0) {
             handle_verify(fd, body, content_length);
-        } else {
+        } else if (strcmp(path, "/v1/fetch") == 0) {
             handle_fetch(fd, body, content_length);
+        } else if (strcmp(path, "/v1/fetch_raw") == 0) {
+            handle_fetch_raw(fd, body, content_length);
+        } else {
+            handle_dump_headers(fd, body, content_length);
         }
     } else {
         reply_error(fd, 404, "not found");

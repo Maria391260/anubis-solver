@@ -212,11 +212,30 @@ if (anubis_fetch_get_with("https://example.com/", "chrome", &page) == 0) {
 |---|---|
 | `anubis_fetch_get(url, &page)` | fetch, solving any challenge; default transport |
 | `anubis_fetch_get_with(url, target, &page)` | same, with a per-call TLS profile |
+| `anubis_fetch_get_dump(url, target, &dump)` | same, plus `anubis_page_dump.headers`: every response header block seen, in order |
+| `anubis_page_dump_free(&dump)` | free a dump (`anubis_page_free` for the embedded page) |
 | `anubis_fetch_set_impersonate(target)` | process default: `auto`, `off`, `chrome`, `chrome116`, … |
 | `anubis_fetch_impersonate()` | the configured profile, `""` when off |
 | `anubis_fetch_impersonate_available()` | 1 when libcurl-impersonate is installed |
 | `anubis_fetch_transport()` | transport of this thread's last fetch |
 | `anubis_fetch_version()` | version of the layer |
+
+`anubis_page` is unchanged from earlier releases: it is allocated by the caller,
+so a new field would write past the end of programs compiled against an older
+header. Headers live in a second struct instead.
+
+```c
+anubis_page_dump dump;
+if (anubis_fetch_get_dump("https://example.com/", "chrome", &dump) == 0) {
+    fwrite(dump.headers, 1, dump.headers_len, stdout);  /* every response */
+    anubis_page_dump_free(&dump);
+}
+```
+
+`dump.headers` concatenates the raw blocks of every response the fetch went
+through — the challenge, the `pass-challenge` reply, redirects and the final
+page — each starting with its own status line. It is a single allocation with
+CRLF line endings and a trailing NUL; `headers_len` is the length without it.
 
 Impersonation is a runtime `dlopen()` of a libcurl-impersonate, searched for in
 `$ANUBIS_IMPERSONATE_LIB`, `3rd_party/curl-impersonate/lib/`, next to the

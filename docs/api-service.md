@@ -110,6 +110,49 @@ installed; without it the default is OpenSSL and an explicit profile is a 502
 rather than a silent downgrade. `ANUBIS_IMPERSONATE` sets the default profile
 for the process.
 
+### `POST /v1/fetch_raw`
+
+The same fetch, but the response is the upstream body itself instead of a JSON
+envelope: no escaping, no string copy, and binary content is fine.
+
+```bash
+curl -sD - -o page.html localhost:8088/v1/fetch_raw -d '{"url":"https://example.com/"}'
+```
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/html
+Content-Length: 1256
+X-Anubis-Status: 200
+X-Anubis-Final-URL: https://example.com/
+X-Anubis-Transport: curl-impersonate/chrome116
+Connection: close
+```
+
+`Content-Type` is the origin's own; the `X-Anubis-*` headers carry what the JSON
+endpoint would report. A failure to reach or solve the site is still a 502 with
+`{"error":"..."}`. Arguments are the same `url` and `impersonate` as
+`/v1/fetch`.
+
+### `POST /v1/dump_headers`
+
+The headers the fetch went through, instead of the page:
+
+```bash
+curl -s localhost:8088/v1/dump_headers -d '{"url":"https://example.com/"}'
+```
+
+```json
+{"status":200,"final_url":"https://example.com/",
+ "transport":"curl-impersonate/chrome116","headers_len":812,
+ "headers":"HTTP/1.1 200 OK\r\nSet-Cookie: anubis-auth=...\r\n..."}
+```
+
+Every response is included, in order — the challenge, the `pass-challenge`
+reply, any redirect and the final page — each starting with its own status
+line. That is what makes it useful when a gate behaves differently from what its
+page says. `headers` is the raw block with CRLF line endings, as JSON escapes.
+
 ## Limits
 
 A request body over `--max-body` (default 1 MiB) is a 413. Responses are JSON

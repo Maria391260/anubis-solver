@@ -130,7 +130,8 @@ def main():
     elif mode == "tools":
         tools = ids[2]["result"]["tools"]
         names = [t["name"] for t in tools]
-        assert sorted(names) == ["anubis_backends", "anubis_fetch",
+        assert sorted(names) == ["anubis_backends", "anubis_dump_headers",
+                                 "anubis_fetch", "anubis_fetch_raw",
                                  "anubis_solve", "anubis_version"], names
         for tool in tools:
             assert tool["description"], tool["name"]
@@ -180,6 +181,22 @@ def main():
         assert text.startswith("status: 200\nurl: "), text[:80]
         assert "PAST THE WALL" in text, text[:200]
         assert "<h1>" not in text and "<script" not in text, "HTML not stripped"
+    elif mode == "fetch_raw":
+        r = ids[2]["result"]
+        assert r["isError"] is False, tool_text(ids[2])
+        text = tool_text(ids[2])
+        assert text.startswith("status: 200\nurl: "), text[:80]
+        assert "PAST THE WALL" in text, text[:200]
+        assert "<html>" in text, "HTML was stripped"
+        assert "<script" in text, "script tags were stripped"
+    elif mode == "dump_headers":
+        r = ids[3]["result"]
+        assert r["isError"] is False, tool_text(ids[3])
+        text = tool_text(ids[3])
+        assert text.startswith("status: 200\nurl: "), text[:80]
+        assert "headers: " in text, text[:80]
+        assert "Set-Cookie" in text or "set-cookie" in text, text[:400]
+        assert text.count("HTTP/1.") >= 2, "only the final response was dumped"
     else:
         raise SystemExit("unknown mode " + mode)
     return 0
@@ -215,7 +232,7 @@ check() { # mode description
 
 check valid "stdout lines are all JSON-RPC 2.0 objects"
 check init "initialize returns protocolVersion 2024-11-05 and serverInfo.name anubis"
-check tools "tools/list lists exactly anubis_backends, anubis_fetch, anubis_solve, anubis_version"
+check tools "tools/list lists exactly anubis_backends, anubis_dump_headers, anubis_fetch, anubis_fetch_raw, anubis_solve, anubis_version"
 check solve_sha256 "anubis_solve sha256 difficulty 4 returns nonce and 64-hex response"
 check solve_tensor "anubis_solve tensor difficulty 2 returns nonce and 64-hex response"
 check version "anubis_version returns version 2.0.2 and codename shaoogle"
@@ -271,12 +288,24 @@ else
     if wait_port "$PORT_BACKEND" 5 && wait_port "$PORT_GATE" 5; then
         OUT3=$TMP/out3.jsonl
         run_requests "$OUT3" \
-            '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"anubis_fetch","arguments":{"url":"http://127.0.0.1:8099/"}}}'
+            '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"anubis_fetch","arguments":{"url":"http://127.0.0.1:8099/"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"anubis_fetch_raw","arguments":{"url":"http://127.0.0.1:8099/"}}}' \
+            '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"anubis_dump_headers","arguments":{"url":"http://127.0.0.1:8099/"}}}'
         if python3 "$TMP/check.py" fetch "$OUT3"; then
             pass "anubis_fetch through the local gate returns isError false and PAST THE WALL"
             FETCH_OK=1
         else
             fail "anubis_fetch through the local gate returns isError false and PAST THE WALL"
+        fi
+        if python3 "$TMP/check.py" fetch_raw "$OUT3"; then
+            pass "anubis_fetch_raw returns raw HTML, script tags intact"
+        else
+            fail "anubis_fetch_raw returns raw HTML, script tags intact"
+        fi
+        if python3 "$TMP/check.py" dump_headers "$OUT3"; then
+            pass "anubis_dump_headers returns every response header block"
+        else
+            fail "anubis_dump_headers returns every response header block"
         fi
     else
         fail "anubis_fetch through the local gate (gate did not start)"

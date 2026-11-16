@@ -52,6 +52,8 @@ typedef int CURLcode;
 #define CURLOPT_ACCEPT_ENCODING 10102     /* OBJECTPOINT + 102 */
 #define CURLOPT_TIMEOUT_MS 155            /* LONG + 155 */
 #define CURLOPT_CONNECTTIMEOUT_MS 156     /* LONG + 156 */
+#define CURLOPT_HEADERDATA 10029          /* OBJECTPOINT + 29  */
+#define CURLOPT_HEADERFUNCTION 20079      /* FUNCTIONPOINT + 79 */
 
 struct imp_api {
     void *lib;
@@ -330,6 +332,36 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
     return n;
 }
 
+/* Header callback. Unlike the body this cannot abort on size: a gate can send
+ * a lot of Set-Cookie lines and there is no useful smaller answer, so the cap
+ * is generous and an overrun keeps the transfer but drops the block. */
+#define IMP_MAX_HEADERS (1u << 20)
+
+static size_t header_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    struct sink *s = userdata;
+    size_t n = size * nmemb;
+    if (s->len + n + 1 > IMP_MAX_HEADERS) {
+        s->overflow = 1;
+        return n; /* keep going; the block is simply dropped afterwards */
+    }
+    if (s->len + n + 1 > s->cap) {
+        size_t cap = s->cap ? s->cap : 1024;
+        char *d;
+        while (cap < s->len + n + 1) cap *= 2;
+        d = realloc(s->data, cap);
+        if (!d) {
+            s->overflow = 1;
+            return n;
+        }
+        s->data = d;
+        s->cap = cap;
+    }
+    memcpy(s->data + s->len, ptr, n);
+    s->len += n;
+    s->data[s->len] = '\0';
+    return n;
+}
+
 anubis_imp_handle *anubis_imp_open(const char *target, char *err, size_t err_cap) {
     anubis_imp_handle *h;
     char resolved[64];
@@ -388,14 +420,21 @@ const char *anubis_imp_handle_target(const anubis_imp_handle *h) {
 }
 
 int anubis_imp_get(anubis_imp_handle *h, const char *url, int insecure,
-                   anubis_page *out) {
+                   anubis_page *out, char **headers, size_t *headers_len) {
     struct sink s = {0};
+    struct sink hs = {0};
     char errbuf[256] = {0};
     CURLcode rc;
     long code = 0;
     char *effective = NULL;
 
     if (!h || !url || !out) return -1;
+    if (headers) {
+        *headers = NULL;
+    }
+    if (headers_len) {
+        *headers_len = 0;
+    }
     if (g_imp.easy_setopt(h->curl, CURLOPT_URL, url) != CURLE_OK ||
         g_imp.easy_setopt(h->curl, CURLOPT_WRITEDATA, &s) != CURLE_OK ||
         g_imp.easy_setopt(h->curl, CURLOPT_ERRORBUFFER, errbuf) != CURLE_OK) {
@@ -405,6 +444,13 @@ int anubis_imp_get(anubis_imp_handle *h, const char *url, int insecure,
     }
     g_imp.easy_setopt(h->curl, CURLOPT_SSL_VERIFYPEER, insecure ? 0L : 1L);
     g_imp.easy_setopt(h->curl, CURLOPT_SSL_VERIFYHOST, insecure ? 0L : 2L);
+    if (headers) {
+        g_imp.easy_setopt(h->curl, CURLOPT_HEADERFUNCTION, header_cb);
+        g_imp.easy_setopt(h->curl, CURLOPT_HEADERDATA, &hs);
+    } else {
+        g_imp.easy_setopt(h->curl, CURLOPT_HEADERFUNCTION, NULL);
+        g_imp.easy_setopt(h->curl, CURLOPT_HEADERDATA, NULL);
+    }
 
     rc = g_imp.easy_perform(h->curl);
     if (rc != CURLE_OK) {
@@ -416,6 +462,7 @@ int anubis_imp_get(anubis_imp_handle *h, const char *url, int insecure,
                                : (g_imp.easy_strerror ? g_imp.easy_strerror(rc)
                                                       : "transfer failed"));
         free(s.data);
+        free(hs.data);
         return -1;
     }
     g_imp.easy_getinfo(h->curl, CURLINFO_RESPONSE_CODE, &code);
@@ -425,5 +472,13 @@ int anubis_imp_get(anubis_imp_handle *h, const char *url, int insecure,
     out->body = s.data ? s.data : calloc(1, 1);
     out->body_len = s.len;
     out->final_url = effective ? strdup(effective) : NULL;
+    if (headers && hs.data && !hs.overflow) {
+        *headers = hs.data;
+        if (headers_len) {
+            *headers_len = hs.len;
+        }
+    } else {
+        free(hs.data);
+    }
     return 0;
 }
