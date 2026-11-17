@@ -1,0 +1,20 @@
+{
+  "host": {
+    "gpu": "2x NVIDIA Tesla T4 (Kaggle)",
+    "cpu": "Intel Xeon @ 2.00GHz (Kaggle)",
+    "cuda": "13.0 (ptxas from the image)",
+    "measured": "2026-11-17",
+    "kernel": "monktelv31/anubis-ptx-t4"
+  },
+  "source": "src/nvidia/ptx/kaggle_bench_ptx.py, hand-written PTX assembled by ptxas sm_75",
+  "throughput_mhps": {
+    "1gpu_ilp1": 2655.5,
+    "1gpu_ilp2": 2686.8,
+    "1gpu_ilp4": 2673.1,
+    "2gpu_ilp1": 5280.1,
+    "2gpu_ilp2": 5264.6,
+    "2gpu_ilp4": 5290.8
+  },
+  "notes": "Fixed-range scan: 256 Mi nonces and 1 Gi nonces per measurement, no hit possible (rc=exhausted), so MH/s = nonces / wall time and includes the launch and copy-back. ILP barely matters: the kernel is bound by something other than the message schedule. 2 GPUs scale to 1.96x. The PTX simulator test (test_ptx.py) passes on the same run: every digest matches hashlib; the notebook's own decimal-mode check reported FAIL, which is a bug in that older harness, not in the kernel (the simulator checks decimal mode against hashlib and passes).",
+  "raw": "kaggle kernels output monktelv31/anubis-ptx-t4"
+}

@@ -283,6 +283,42 @@ the earliest hit wins; the CPU re-verifies the digest before accepting it.
 `tools/bench_gpu.py` reproduces the table and verifies every digest against
 hashlib. Raw data: [`results/cuda-t4.json`](results/cuda-t4.json).
 
+## PTX: hand-written kernels, no nvcc
+
+`src/nvidia/ptx/` holds the SHA-256 kernels written directly as PTX, so
+`ptxas` assembles them and nothing else is needed on the build machine. They
+are not part of `libanubis_solver.so`: `ptx_loader.c` is a small driver-API
+loader with a flat ABI (`anubis_ptx_solve`, and `anubis_ptx_hashx_*` for the
+HashX interpreter). Every digest is re-verified by the CPU before it counts.
+
+Measured on Kaggle with 2× Tesla T4, `ptxas` 13.0, 2026-11-17. The range is
+fixed and a hit is impossible, so MH/s is nonces ÷ wall time — launch and
+copy-back included, nothing extrapolated:
+
+| workload | 1× T4 | 2× T4 | scaling |
+|---|---:|---:|---:|
+| PTX `sha256`, ILP=1 | 2655 MH/s | 5280 MH/s | 1.99× |
+| PTX `sha256`, ILP=2 | **2687 MH/s** | 5265 MH/s | 1.96× |
+| PTX `sha256`, ILP=4 | 2673 MH/s | **5291 MH/s** | 1.98× |
+
+ILP makes almost no difference, and that is the interesting result: the
+message schedule is not the limit here, so widening it buys nothing. Two
+devices split the range and scale to ~1.96×, i.e. the PCIe copies are not on
+the critical path for a range this size (1–4 M nonces per launch).
+
+These are scan rates from a standalone kernel, like the WASM and SASS tables;
+the CUDA rows above are timings of a real search through the library, with
+per-chunk dispatch and verification, so the two are not directly comparable —
+read the PTX column as "what this kernel does on its own". Verification ran in
+the same job: `test_ptx.py` executes both kernels in `ptxsim.py` and matches
+every digest against `hashlib` (mode 1 little- and big-endian, decimal nonces
+of 1–10 digits, nibble and bit difficulty, both ILP lanes).
+
+Raw data: [`results/ptx-t4-2026-11-17.json`](results/ptx-t4-2026-11-17.json).
+Reproduce with `python3 src/nvidia/ptx/kaggle_bench_ptx.py` on any CUDA
+machine, or `kaggle kernels push -p src/nvidia/ptx/kaggle_hashx` for the
+HashX job.
+
 ## Intel GPU: oneAPI Level Zero vs Vulkan
 
 Iris Xe (ADL GT2), one thread driving the GPU, median of 5, 2026-11-12.
