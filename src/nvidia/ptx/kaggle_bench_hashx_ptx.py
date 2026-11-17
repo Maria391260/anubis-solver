@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark hashx_interp.ptx (the HashX interpreter in PTX) on a real GPU.
 
-    python3 kaggle_bench_hashx_ptx.py [sm_75] [difficulty ...]
+    python3 kaggle_bench_hashx_ptx.py [sm_75]
 
 Builds the cubin with build_ptx.sh, compiles ptx_loader.c, exports a program
 from the CPU HashX reference (src/hashx/hashx.c) and drives the loader through
@@ -39,6 +39,8 @@ class Shm:
             ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)]
         self.lib.hx_shim_hash.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
                                            ctypes.c_uint64, ctypes.c_char_p]
+        self.lib.hx_shim_scan.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                           ctypes.c_uint32, ctypes.c_char_p]
 
         st = ctypes.c_void_p()
         sz = ctypes.c_size_t()
@@ -77,15 +79,15 @@ def leading_zero_bits(digest):
 
 
 def cpu_rate(shim, samples=200000):
+    """CPU reference rate, measured inside C (no ctypes overhead)."""
+    out = ctypes.create_string_buffer(32)
     t = time.perf_counter()
-    for n in range(samples):
-        shim.hash(n)
+    shim.lib.hx_shim_scan(shim.state, shim.size, samples, out)
     return samples / (time.perf_counter() - t) / 1e6
 
 
 def main():
     arch = sys.argv[1] if len(sys.argv) > 1 else "sm_75"
-    diffs = [int(x) for x in sys.argv[2:]] or [20, 24, 28]
 
     common.build_cubins(HERE, arch, "2")
     so = common.build_loader(HERE)
@@ -138,7 +140,9 @@ def main():
     print("\n== correctness: difficulty 0, the digest must match the CPU ==")
     failed = 0
     for nonce in (0, 1, 7, 123456, MAX_NONCE):
-        rc, got, hexdig, ms = solve(0, nonce)
+        # max_nonce = nonce makes the kernel scan exactly that one candidate,
+        # so the hit is that nonce and the digest can be compared directly.
+        rc, got, hexdig, ms = solve(0, nonce, nonce)
         exp = shim.hash(got).hex()
         ok = rc == 0 and got == nonce and hexdig == exp
         print("  nonce=%-10d %s" % (got, "ok" if ok else "MISMATCH"))
@@ -163,22 +167,24 @@ def main():
         if not ok:
             failed += 1
 
-    print("\n== throughput (nonces scanned = hit nonce + 1) ==")
-    for bits in diffs:
+    print("\n== throughput: a fixed scan with no possible hit ==")
+    print("   (difficulty 64 > 256 bits of digest, so the kernel must")
+    print("    exhaust the range; both T4s split it, the count is exact)")
+    for total in (1 << 27,):
         best = None
         for _ in range(3):
-            rc, got, hexdig, ms = solve(bits)
-            if rc != 0 or ms <= 0:
-                continue
-            mhps = (got + 1) / (ms / 1000.0) / 1e6
+            rc, _, _, ms = solve(64, 0, total - 1)
+            if rc != 1:
+                print("  FAIL expected exhaustion, rc=%d" % rc)
+                failed += 1
+                break
+            mhps = total / (ms / 1000.0) / 1e6
             best = mhps if best is None else max(best, mhps)
-            print("  %2d bits: nonce=%-10d %8.2f ms  %8.2f MH/s" %
-                  (bits, got, ms, mhps))
-            result["bench"].append({"bits": bits, "nonce": got, "ms": ms,
-                                    "mhps": mhps})
+            print("  %d nonces: %8.2f ms  %8.2f MH/s" % (total, ms, mhps))
+            result["bench"].append({"scanned": total, "ms": ms, "mhps": mhps})
         if best is not None:
             print("  best: %.2f MH/s" % best)
-            result["bench"].append({"bits": bits, "best_mhps": best})
+            result["bench"].append({"scanned": total, "best_mhps": best})
 
     cpu = cpu_rate(shim)
     result["cpu_mhps"] = cpu

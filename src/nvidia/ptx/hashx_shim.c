@@ -10,6 +10,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "../../hashx/hashx.h"
 
@@ -32,6 +33,22 @@ void hx_shim_hash(const void *state, size_t size, uint64_t nonce,
                   unsigned char out[32])
 {
     hashx_hash(state, size, nonce, out);
+}
+
+/* Hash `count` nonces with the C reference; used for the CPU rate. The
+ * digests are folded into out[32] so the loop cannot be optimised away. */
+void hx_shim_scan(const void *state, size_t size, uint32_t count,
+                  unsigned char out[32])
+{
+    unsigned char dg[32];
+    uint32_t i;
+    memset(out, 0, 32);
+    for (i = 0; i < count; i++) {
+        hashx_hash(state, size, (unsigned long long)i, dg);
+        for (int j = 0; j < 32; j++) {
+            out[j] ^= dg[j];
+        }
+    }
 }
 
 void hx_shim_free(void *state)
