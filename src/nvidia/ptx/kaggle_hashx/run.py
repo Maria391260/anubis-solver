@@ -18,8 +18,7 @@ import time
 from pathlib import Path
 
 OUT = Path("/kaggle/working")
-SRC = Path("/kaggle/src")
-REPO = SRC / "anubis-solver"
+REPO = OUT / "anubis-solver"   # /kaggle/src is read-only
 BRANCH = "ptx-hashx"
 URL = "https://gitlab.com/celikfana/anubis-solver.git"
 PTX = REPO / "src" / "nvidia" / "ptx"
@@ -45,7 +44,6 @@ def stage(name, **kw):
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    SRC.mkdir(parents=True, exist_ok=True)
     result = {"started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     try:
         stage("gpu")
