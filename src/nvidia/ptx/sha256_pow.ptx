@@ -1,0 +1,497 @@
+/*
+ * sha256_pow.ptx -- Anubis SHA-256 proof-of-work kernel (complete).
+ *
+ * One thread hashes one candidate nonce. The prefix is a whole number of
+ * 64-byte blocks, so its midstate is passed in and only the final (tail)
+ * block is hashed here.
+ *
+ *   mode 0 (fast/slow):  message = prefix || decimal(nonce)
+ *   mode 1 (sha256):     message = prefix || u32 nonce [le|be]
+ *
+ * The message block and the 16-word schedule live in local memory, which is
+ * the same trade-off the original CUDA kernel makes (see
+ * ../cuda/cuda_sha256.cu). All 64 rounds are computed. A result that meets
+ * the difficulty is reported through results_ptr:
+ *
+ *   struct results {
+ *       u32 count; u32 pad[3];
+ *       u32 nonces[8];
+ *       u32 hashes[8][8];
+ *   };
+ *
+ * The caller (src/core/anubis_solver.c) re-verifies every digest.
+ */
+
+.version 7.5
+.target sm_75
+.address_size 64
+
+/* SHA-256 round constants. */
+.const .align 4 .u32 c_k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+.visible .entry sha256_pow_kernel(
+    .param .u32 mid0, .param .u32 mid1, .param .u32 mid2, .param .u32 mid3,
+    .param .u32 mid4, .param .u32 mid5, .param .u32 mid6, .param .u32 mid7,
+    .param .u32 prefix_len,
+    .param .u32 mode,
+    .param .u32 use_le,
+    .param .u32 difficulty,
+    .param .u32 check_bits,
+    .param .u32 base,
+    .param .u32 count,
+    .param .u64 results_ptr
+) {
+    .reg .pred %p, %pd;
+    .reg .u32 %mid0, %mid1, %mid2, %mid3, %mid4, %mid5, %mid6, %mid7;
+    .reg .u32 %prefix_len, %mode, %use_le, %difficulty, %check_bits;
+    .reg .u32 %base, %count;
+    .reg .u64 %res;
+
+    .reg .u32 %nt, %ct, %tx, %idx, %nonce;
+    .reg .u32 %i, %j, %n, %k, %d, %v, %dlen, %t, %t1, %t2;
+    .reg .u32 %b0, %b1, %b2, %b3, %wv;
+    .reg .u32 %x, %y, %s0, %s1, %s2, %ch, %maj, %kc;
+    .reg .u32 %a, %b, %c, %dd, %e, %f, %g, %h;
+    .reg .u32 %o0, %o1, %o2, %o3, %o4, %o5, %o6, %o7;
+    .reg .u32 %nbits, %full, %rem, %mask, %byte, %ok, %bi, %slot, %off;
+
+    .reg .u64 %rb, %rb_blk, %rb_w, %rb_dg, %rb_tmp;
+    .reg .u64 %rd, %rd2, %rk;
+
+    /* local memory: blk[64] | w[16] | dg[32] | tmp[24] */
+    .local .align 4 .b8 lmem[192];
+
+    ld.param.u32 %mid0, [mid0];
+    ld.param.u32 %mid1, [mid1];
+    ld.param.u32 %mid2, [mid2];
+    ld.param.u32 %mid3, [mid3];
+    ld.param.u32 %mid4, [mid4];
+    ld.param.u32 %mid5, [mid5];
+    ld.param.u32 %mid6, [mid6];
+    ld.param.u32 %mid7, [mid7];
+    ld.param.u32 %prefix_len, [prefix_len];
+    ld.param.u32 %mode, [mode];
+    ld.param.u32 %use_le, [use_le];
+    ld.param.u32 %difficulty, [difficulty];
+    ld.param.u32 %check_bits, [check_bits];
+    ld.param.u32 %base, [base];
+    ld.param.u32 %count, [count];
+    ld.param.u64 %res, [results_ptr];
+
+    /* idx = ctaid.x * ntid.x + tid.x */
+    mov.u32 %nt, %ntid.x;
+    mov.u32 %ct, %ctaid.x;
+    mov.u32 %tx, %tid.x;
+    mad.lo.u32 %idx, %ct, %nt, %tx;
+    setp.ge.u32 %p, %idx, %count;
+    @%p bra BB_DONE;
+
+    /* nonce = base + idx (always fits in 32 bits: base + count <= 2^32-1) */
+    add.u32 %nonce, %base, %idx;
+
+    /* lmem bases */
+    mov.u64 %rb, lmem;
+    add.u64 %rb_blk, %rb, 0;
+    add.u64 %rb_w, %rb, 64;
+    add.u64 %rb_dg, %rb, 128;
+    add.u64 %rb_tmp, %rb, 160;
+
+    /* zero blk[0..63] */
+    mov.u32 %i, 0;
+    mov.u32 %t, 0;
+BB_ZERO:
+    setp.ge.u32 %p, %i, 16;
+    @%p bra BB_ZERO_DONE;
+    mul.wide.u32 %rd, %i, 4;
+    add.u64 %rd, %rb_blk, %rd;
+    st.local.u32 [%rd], %t;
+    add.u32 %i, %i, 1;
+    bra BB_ZERO;
+BB_ZERO_DONE:
+
+    /* ---------------- build the tail block ---------------- */
+    setp.eq.u32 %p, %mode, 0;
+    @%p bra BB_DECIMAL;
+
+    /* mode 1: fixed 4-byte nonce */
+    setp.eq.u32 %p, %use_le, 1;
+    @%p bra BB_FIX_LE;
+    shr.b32 %t, %nonce, 24;
+    st.local.u8 [%rb_blk+0], %t;
+    shr.b32 %t, %nonce, 16;
+    st.local.u8 [%rb_blk+1], %t;
+    shr.b32 %t, %nonce, 8;
+    st.local.u8 [%rb_blk+2], %t;
+    st.local.u8 [%rb_blk+3], %nonce;
+    bra BB_FIX_DONE;
+BB_FIX_LE:
+    st.local.u8 [%rb_blk+0], %nonce;
+    shr.b32 %t, %nonce, 8;
+    st.local.u8 [%rb_blk+1], %t;
+    shr.b32 %t, %nonce, 16;
+    st.local.u8 [%rb_blk+2], %t;
+    shr.b32 %t, %nonce, 24;
+    st.local.u8 [%rb_blk+3], %t;
+BB_FIX_DONE:
+    mov.u32 %dlen, 4;
+    bra BB_PAD;
+
+BB_DECIMAL:
+    /* decimal digits of nonce, reversed into tmp[0..n-1] */
+    setp.eq.u32 %pd, %nonce, 0;
+    @%pd bra BB_DEC_ZERO;
+    mov.u32 %v, %nonce;
+    mov.u32 %n, 0;
+BB_DEC_LOOP:
+    rem.u32 %d, %v, 10;
+    add.u32 %d, %d, 48;
+    cvt.u64.u32 %rd, %n;
+    add.u64 %rd, %rb_tmp, %rd;
+    st.local.u8 [%rd], %d;
+    add.u32 %n, %n, 1;
+    div.u32 %v, %v, 10;
+    setp.ne.u32 %pd, %v, 0;
+    @%pd bra BB_DEC_LOOP;
+
+    /* reverse tmp[0..n-1] into blk[0..n-1] */
+    mov.u32 %i, 0;
+BB_REV:
+    setp.ge.u32 %pd, %i, %n;
+    @%pd bra BB_REV_DONE;
+    sub.u32 %k, %n, 1;
+    sub.u32 %k, %k, %i;
+    cvt.u64.u32 %rd, %k;
+    add.u64 %rd, %rb_tmp, %rd;
+    ld.local.u8 %d, [%rd];
+    cvt.u64.u32 %rd, %i;
+    add.u64 %rd, %rb_blk, %rd;
+    st.local.u8 [%rd], %d;
+    add.u32 %i, %i, 1;
+    bra BB_REV;
+BB_REV_DONE:
+    mov.u32 %dlen, %n;
+    bra BB_PAD;
+BB_DEC_ZERO:
+    mov.u32 %d, 48;
+    st.local.u8 [%rb_blk], %d;
+    mov.u32 %dlen, 1;
+
+BB_PAD:
+    /* blk[dlen] = 0x80 */
+    cvt.u64.u32 %rd, %dlen;
+    add.u64 %rd, %rb_blk, %rd;
+    mov.u32 %t, 0x80;
+    st.local.u8 [%rd], %t;
+
+    /* bits = (prefix_len + dlen) * 8, big-endian in blk[56..63] */
+    cvt.u64.u32 %rd, %prefix_len;
+    cvt.u64.u32 %rd2, %dlen;
+    add.u64 %rd, %rd, %rd2;
+    shl.b64 %rd, %rd, 3;
+    shr.u64 %rd2, %rd, 56;
+    cvt.u32.u64 %t, %rd2;
+    st.local.u8 [%rb_blk+56], %t;
+    shr.u64 %rd2, %rd, 48;
+    cvt.u32.u64 %t, %rd2;
+    st.local.u8 [%rb_blk+57], %t;
+    shr.u64 %rd2, %rd, 40;
+    cvt.u32.u64 %t, %rd2;
+    st.local.u8 [%rb_blk+58], %t;
+    shr.u64 %rd2, %rd, 32;
+    cvt.u32.u64 %t, %rd2;
+    st.local.u8 [%rb_blk+59], %t;
+    shr.u64 %rd2, %rd, 24;
+    cvt.u32.u64 %t, %rd2;
+    st.local.u8 [%rb_blk+60], %t;
+    shr.u64 %rd2, %rd, 16;
+    cvt.u32.u64 %t, %rd2;
+    st.local.u8 [%rb_blk+61], %t;
+    shr.u64 %rd2, %rd, 8;
+    cvt.u32.u64 %t, %rd2;
+    st.local.u8 [%rb_blk+62], %t;
+    cvt.u32.u64 %t, %rd;
+    st.local.u8 [%rb_blk+63], %t;
+
+    /* w[0..15] = big-endian words of blk */
+    mov.u32 %i, 0;
+BB_LDW:
+    setp.ge.u32 %p, %i, 16;
+    @%p bra BB_LDW_DONE;
+    mul.wide.u32 %rd, %i, 4;
+    add.u64 %rd, %rb_blk, %rd;
+    ld.local.u8 %b0, [%rd];
+    ld.local.u8 %b1, [%rd+1];
+    ld.local.u8 %b2, [%rd+2];
+    ld.local.u8 %b3, [%rd+3];
+    shl.b32 %wv, %b0, 24;
+    shl.b32 %t, %b1, 16;
+    or.b32 %wv, %wv, %t;
+    shl.b32 %t, %b2, 8;
+    or.b32 %wv, %wv, %t;
+    or.b32 %wv, %wv, %b3;
+    mul.wide.u32 %rd2, %i, 4;
+    add.u64 %rd2, %rb_w, %rd2;
+    st.local.u32 [%rd2], %wv;
+    add.u32 %i, %i, 1;
+    bra BB_LDW;
+BB_LDW_DONE:
+
+    /* ---------------- compression ---------------- */
+    mov.u32 %a, %mid0;
+    mov.u32 %b, %mid1;
+    mov.u32 %c, %mid2;
+    mov.u32 %dd, %mid3;
+    mov.u32 %e, %mid4;
+    mov.u32 %f, %mid5;
+    mov.u32 %g, %mid6;
+    mov.u32 %h, %mid7;
+
+    cvta.const.u64 %rk, c_k;
+
+    mov.u32 %i, 0;
+BB_ROUND:
+    setp.ge.u32 %p, %i, 64;
+    @%p bra BB_ROUNDS_DONE;
+
+    /* expand the message schedule for i >= 16 */
+    setp.lt.u32 %p, %i, 16;
+    @%p bra BB_NO_SCHED;
+
+    /* x = w[(i+1)&15], y = w[(i+14)&15] */
+    add.u32 %t, %i, 1;
+    and.b32 %t, %t, 15;
+    mul.wide.u32 %rd, %t, 4;
+    add.u64 %rd, %rb_w, %rd;
+    ld.local.u32 %x, [%rd];
+    add.u32 %t, %i, 14;
+    and.b32 %t, %t, 15;
+    mul.wide.u32 %rd, %t, 4;
+    add.u64 %rd, %rb_w, %rd;
+    ld.local.u32 %y, [%rd];
+
+    /* s0 = rotr(x,7) ^ rotr(x,18) ^ (x>>3) */
+    shf.r.wrap.b32 %s0, %x, %x, 7;
+    shf.r.wrap.b32 %s1, %x, %x, 18;
+    xor.b32 %s0, %s0, %s1;
+    shr.b32 %s1, %x, 3;
+    xor.b32 %s0, %s0, %s1;
+
+    /* s1 = rotr(y,17) ^ rotr(y,19) ^ (y>>10) */
+    shf.r.wrap.b32 %s1, %y, %y, 17;
+    shf.r.wrap.b32 %s2, %y, %y, 19;
+    xor.b32 %s1, %s1, %s2;
+    shr.b32 %s2, %y, 10;
+    xor.b32 %s1, %s1, %s2;
+
+    /* w[i&15] += s0 + w[(i+9)&15] + s1 */
+    and.b32 %j, %i, 15;
+    mul.wide.u32 %rd, %j, 4;
+    add.u64 %rd, %rb_w, %rd;
+    ld.local.u32 %t1, [%rd];
+    add.u32 %t1, %t1, %s0;
+    add.u32 %t1, %t1, %s1;
+    add.u32 %t, %i, 9;
+    and.b32 %t, %t, 15;
+    mul.wide.u32 %rd2, %t, 4;
+    add.u64 %rd2, %rb_w, %rd2;
+    ld.local.u32 %t2, [%rd2];
+    add.u32 %t1, %t1, %t2;
+    st.local.u32 [%rd], %t1;
+
+BB_NO_SCHED:
+    /* s1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25) */
+    shf.r.wrap.b32 %s1, %e, %e, 6;
+    shf.r.wrap.b32 %s2, %e, %e, 11;
+    xor.b32 %s1, %s1, %s2;
+    shf.r.wrap.b32 %s2, %e, %e, 25;
+    xor.b32 %s1, %s1, %s2;
+
+    /* ch = (e&f) ^ (~e&g) */
+    and.b32 %ch, %e, %f;
+    not.b32 %t, %e;
+    and.b32 %t, %t, %g;
+    xor.b32 %ch, %ch, %t;
+
+    /* kc = c_k[i]; get w[i&15] */
+    mul.wide.u32 %rd, %i, 4;
+    add.u64 %rd, %rk, %rd;
+    ld.const.u32 %kc, [%rd];
+    and.b32 %j, %i, 15;
+    mul.wide.u32 %rd2, %j, 4;
+    add.u64 %rd2, %rb_w, %rd2;
+    ld.local.u32 %wv, [%rd2];
+
+    /* t1 = h + s1 + ch + kc + w[i&15] */
+    add.u32 %t1, %h, %s1;
+    add.u32 %t1, %t1, %ch;
+    add.u32 %t1, %t1, %kc;
+    add.u32 %t1, %t1, %wv;
+
+    /* s0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22) */
+    shf.r.wrap.b32 %s0, %a, %a, 2;
+    shf.r.wrap.b32 %s2, %a, %a, 13;
+    xor.b32 %s0, %s0, %s2;
+    shf.r.wrap.b32 %s2, %a, %a, 22;
+    xor.b32 %s0, %s0, %s2;
+
+    /* maj = (a&b) ^ (a&c) ^ (b&c) */
+    and.b32 %maj, %a, %b;
+    and.b32 %t, %a, %c;
+    xor.b32 %maj, %maj, %t;
+    and.b32 %t, %b, %c;
+    xor.b32 %maj, %maj, %t;
+
+    /* t2 = s0 + maj */
+    add.u32 %t2, %s0, %maj;
+
+    /* state rotation */
+    mov.u32 %h, %g;
+    mov.u32 %g, %f;
+    mov.u32 %f, %e;
+    add.u32 %e, %dd, %t1;
+    mov.u32 %dd, %c;
+    mov.u32 %c, %b;
+    mov.u32 %b, %a;
+    add.u32 %a, %t1, %t2;
+
+    add.u32 %i, %i, 1;
+    bra BB_ROUND;
+
+BB_ROUNDS_DONE:
+    /* o = mid + state */
+    add.u32 %o0, %mid0, %a;
+    add.u32 %o1, %mid1, %b;
+    add.u32 %o2, %mid2, %c;
+    add.u32 %o3, %mid3, %dd;
+    add.u32 %o4, %mid4, %e;
+    add.u32 %o5, %mid5, %f;
+    add.u32 %o6, %mid6, %g;
+    add.u32 %o7, %mid7, %h;
+
+    /* dg[0..31] = big-endian bytes of o */
+    shr.b32 %t, %o0, 24; st.local.u8 [%rb_dg+0], %t;
+    shr.b32 %t, %o0, 16; st.local.u8 [%rb_dg+1], %t;
+    shr.b32 %t, %o0, 8;  st.local.u8 [%rb_dg+2], %t;
+    st.local.u8 [%rb_dg+3], %o0;
+    shr.b32 %t, %o1, 24; st.local.u8 [%rb_dg+4], %t;
+    shr.b32 %t, %o1, 16; st.local.u8 [%rb_dg+5], %t;
+    shr.b32 %t, %o1, 8;  st.local.u8 [%rb_dg+6], %t;
+    st.local.u8 [%rb_dg+7], %o1;
+    shr.b32 %t, %o2, 24; st.local.u8 [%rb_dg+8], %t;
+    shr.b32 %t, %o2, 16; st.local.u8 [%rb_dg+9], %t;
+    shr.b32 %t, %o2, 8;  st.local.u8 [%rb_dg+10], %t;
+    st.local.u8 [%rb_dg+11], %o2;
+    shr.b32 %t, %o3, 24; st.local.u8 [%rb_dg+12], %t;
+    shr.b32 %t, %o3, 16; st.local.u8 [%rb_dg+13], %t;
+    shr.b32 %t, %o3, 8;  st.local.u8 [%rb_dg+14], %t;
+    st.local.u8 [%rb_dg+15], %o3;
+    shr.b32 %t, %o4, 24; st.local.u8 [%rb_dg+16], %t;
+    shr.b32 %t, %o4, 16; st.local.u8 [%rb_dg+17], %t;
+    shr.b32 %t, %o4, 8;  st.local.u8 [%rb_dg+18], %t;
+    st.local.u8 [%rb_dg+19], %o4;
+    shr.b32 %t, %o5, 24; st.local.u8 [%rb_dg+20], %t;
+    shr.b32 %t, %o5, 16; st.local.u8 [%rb_dg+21], %t;
+    shr.b32 %t, %o5, 8;  st.local.u8 [%rb_dg+22], %t;
+    st.local.u8 [%rb_dg+23], %o5;
+    shr.b32 %t, %o6, 24; st.local.u8 [%rb_dg+24], %t;
+    shr.b32 %t, %o6, 16; st.local.u8 [%rb_dg+25], %t;
+    shr.b32 %t, %o6, 8;  st.local.u8 [%rb_dg+26], %t;
+    st.local.u8 [%rb_dg+27], %o6;
+    shr.b32 %t, %o7, 24; st.local.u8 [%rb_dg+28], %t;
+    shr.b32 %t, %o7, 16; st.local.u8 [%rb_dg+29], %t;
+    shr.b32 %t, %o7, 8;  st.local.u8 [%rb_dg+30], %t;
+    st.local.u8 [%rb_dg+31], %o7;
+
+    /* ---------------- difficulty check ----------------
+     * nbits = check_bits ? difficulty : difficulty*4   (nibbles -> bits)
+     * leading nbits bits of the digest must be zero.
+     */
+    mov.u32 %nbits, %difficulty;
+    setp.ne.u32 %p, %check_bits, 0;
+    @%p bra BB_HAVE_NBITS;
+    mul.lo.u32 %nbits, %difficulty, 4;
+BB_HAVE_NBITS:
+    shr.u32 %full, %nbits, 3;
+    and.b32 %rem, %nbits, 7;
+
+    mov.u32 %ok, 1;
+    mov.u32 %bi, 0;
+BB_CHK:
+    setp.ge.u32 %p, %bi, %full;
+    @%p bra BB_CHK_REM;
+    cvt.u64.u32 %rd, %bi;
+    add.u64 %rd, %rb_dg, %rd;
+    ld.local.u8 %byte, [%rd];
+    setp.ne.u32 %p, %byte, 0;
+    @%p bra BB_CHK_FAIL;
+    add.u32 %bi, %bi, 1;
+    bra BB_CHK;
+
+BB_CHK_REM:
+    setp.eq.u32 %p, %rem, 0;
+    @%p bra BB_CHK_DONE;
+    /* mask = (0xff << (8-rem)) & 0xff */
+    sub.u32 %t, 8, %rem;
+    shl.b32 %mask, 0xff, %t;
+    and.b32 %mask, %mask, 0xff;
+    cvt.u64.u32 %rd, %full;
+    add.u64 %rd, %rb_dg, %rd;
+    ld.local.u8 %byte, [%rd];
+    and.b32 %byte, %byte, %mask;
+    setp.ne.u32 %p, %byte, 0;
+    @%p bra BB_CHK_FAIL;
+    bra BB_CHK_DONE;
+
+BB_CHK_FAIL:
+    mov.u32 %ok, 0;
+
+BB_CHK_DONE:
+    setp.eq.u32 %p, %ok, 0;
+    @%p bra BB_DONE;
+
+    /* ---------------- report the hit ----------------
+     * slot = atomicAdd(&res->count, 1); if slot < 8 store nonce+hash.
+     */
+    atom.global.add.u32 %slot, [%res], 1;
+    setp.ge.u32 %p, %slot, 8;
+    @%p bra BB_DONE;
+
+    mul.lo.u32 %off, %slot, 4;
+    add.u32 %off, %off, 16;              /* nonces[slot] */
+    cvt.u64.u32 %rd, %off;
+    add.u64 %rd, %res, %rd;
+    st.global.u32 [%rd], %nonce;
+
+    mul.lo.u32 %off, %slot, 32;
+    add.u32 %off, %off, 48;              /* hashes[slot][0] */
+    cvt.u64.u32 %rd, %off;
+    add.u64 %rd, %res, %rd;
+    st.global.u32 [%rd+0],  %o0;
+    st.global.u32 [%rd+4],  %o1;
+    st.global.u32 [%rd+8],  %o2;
+    st.global.u32 [%rd+12], %o3;
+    st.global.u32 [%rd+16], %o4;
+    st.global.u32 [%rd+20], %o5;
+    st.global.u32 [%rd+24], %o6;
+    st.global.u32 [%rd+28], %o7;
+
+BB_DONE:
+    ret;
+}

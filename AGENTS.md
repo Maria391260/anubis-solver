@@ -27,6 +27,8 @@ make L0_INC=/path         # where level_zero/ze_api.h lives
 python3 tests/test_core.py
 python3 tests/test_local.py        # needs a local Anubis checkout (ANUBIS_SRC)
 python3 tests/test_versions.py
+python3 src/nvidia/ptx/test_ptx.py        # SHA-256 PTX via the simulator
+python3 src/nvidia/ptx/test_hashx_ptx.py  # HashX PTX via the simulator + hashx.c
 python3 tools/bench_tiers.py
 python3 tools/bench_gpu.py          # per-backend rows: cuda/l0, vulkan, opencl, cpu
 python3 tools/bench_argon2_gpu.py  # ANUBIS_GPU_ARGON2=1 for the GPU
@@ -113,6 +115,7 @@ make xe-loader && ./build/xe-loader --text /tmp/intelXe_sha256.krn   # run the h
 | `src/intel/xe/intelXe_sha256.igc.xe` | run `tools/xe-sha256-opencl.c`, `dd` the `.text.sha256_pow` section out of the Zebin, `iga64 -p 12p1 -d` |
 | `beyond/rtl/periph/deepseek_egg.v`, `beyond/vectors/deepseek_egg.txt`, `beyond/vectors/deepseek_egg_alt.txt` | `python3 beyond/tools/gen_deepseek_egg.py` (both messages are in the generator) |
 | `mascot/deepseek-maid-bubble.png` | `python3 tools/make_maid_bubble.py` (see `MAID.md`) |
+| `src/nvidia/ptx/hashx_interp.ptx` | `python3 src/nvidia/ptx/gen_hashx_ptx.py` |
 | (none yet) | `sassasm/` is a partial SASS assembler, checked by `python3 sassasm/selftest.py` against ptxas |
 
 ## Pitfalls we hit
