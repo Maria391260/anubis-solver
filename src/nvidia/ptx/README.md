@@ -188,8 +188,12 @@ on two, essentially flat across ILP 1/2/4. The earlier claim of `2.4 GH/s` was
 attached to a stub that computed a single round, so it was meaningless and has
 been removed.
 
-The HashX interpreter is benchmarked by `kaggle_bench_hashx_ptx.py`
-(`monktelv31/anubis-hashx-ptx`); see `results/hashx-ptx-t4-*.json`.
+The HashX interpreter was measured in the same way on 2026-11-17 (kernel
+`monktelv31/anubis-hashx-ptx`): **115.4 MH/s** on two T4s over a fixed 128 Mi
+nonce range, against 9.7 MH/s for one CPU thread (11.9×). That is level with
+the CUDA interpreter (~108 MH/s under the library's dispatch), which is what
+the work says it should be. Every digest was checked against `hashx_hash()`.
+See `results/hashx-ptx-t4-2026-11-17.json`.
 
 Measure on real hardware by loading the cubins with `ptx_loader.c`; the CUDA
 kernels in `../cuda/` are the reference numbers (`fast` ~922 MH/s and `sha256`

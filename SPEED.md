@@ -473,6 +473,18 @@ That is ~70–110 MH/s on the pair of T4s versus ~8.8 MH/s for one CPU thread
 
 Raw data: [`results/hashx-cuda-t4.json`](results/hashx-cuda-t4.json).
 
+The same interpreter written in PTX (`src/nvidia/ptx/hashx_interp.ptx`) lands
+at **115.4 MH/s** on the same pair of T4s — 3 reps over a fixed 128 Mi nonce
+range at a difficulty no digest can meet, so the denominator is the work done.
+One CPU thread is 9.7 MH/s, so 11.9×. That it matches the CUDA interpreter
+(~108 MH/s under the library's dispatch) is the expected result: same program,
+same twelve operations per instruction, and `r[]` lives in local memory either
+way because the register index is data. Every digest was checked against
+`hashx_hash()` at nonces 0, 1, 7, 123456 and 2^32−1, and the 12- and 16-bit
+searches returned the *first* real solution with the required zeros.
+
+Raw data: [`results/hashx-ptx-t4-2026-11-17.json`](results/hashx-ptx-t4-2026-11-17.json).
+
 ### HashX on Level Zero (Intel GPUs)
 
 The same interpreter ported to OpenCL C. It is **correct** (it finds the same
