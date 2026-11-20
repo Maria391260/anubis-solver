@@ -31,10 +31,17 @@ endif
 NGHTTP3_PREFIX ?= $(or $(shell pkg-config --variable=prefix libnghttp3 2>/dev/null),../third_party/nghttp3)
 NGHTTP3_CFLAGS ?= $(wildcard $(NGHTTP3_PREFIX)/include/nghttp3/nghttp3.h)
 NGHTTP3_LIB    ?= $(firstword $(wildcard $(NGHTTP3_PREFIX)/lib/libnghttp3.a $(NGHTTP3_PREFIX)/lib/libnghttp3.so) $(shell pkg-config --libs libnghttp3 2>/dev/null))
+# nghttp3 is not enough: the HTTP/3 code calls OpenSSL's QUIC API, which is
+# 3.5 and later. third_party/nghttp3 ships with the tree, so a distribution
+# with an older OpenSSL (Kaggle's image is 3.0) would otherwise fail on
+# <openssl/quic.h> and take the whole gate down with it. Ask the compiler.
+OPENSSL_QUIC_H := $(shell printf '%s\n' '\#include <openssl/quic.h>' | $(CC) -E -x c - >/dev/null 2>&1 && echo yes)
 ifneq ($(strip $(NGHTTP3_CFLAGS)),)
 ifneq ($(strip $(NGHTTP3_LIB)),)
+ifneq ($(strip $(OPENSSL_QUIC_H)),)
 HTTP_CFLAGS += -DHAVE_NGHTTP3 -I$(NGHTTP3_PREFIX)/include
 HTTP_LIBS   += $(NGHTTP3_LIB)
+endif
 endif
 endif
 
