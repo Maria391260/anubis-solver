@@ -24,6 +24,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -131,13 +132,17 @@ def main():
     gate_port = free_port()
     backend = http.server.ThreadingHTTPServer(("127.0.0.1", backend_port), Backend)
     threading.Thread(target=backend.serve_forever, daemon=True).start()
+    # Keep the gate's own stderr: a binary built for another libc, or one that
+    # cannot open web/, exits before listening, and "did not start" alone does
+    # not say which.
+    gate_err = tempfile.TemporaryFile(mode="w+")
     gate = subprocess.Popen(
         [GATE, "--listen", f"127.0.0.1:{gate_port}",
          "--target", f"http://127.0.0.1:{backend_port}",
          "--algorithm", "tensor-v", "--difficulty", str(DIFF),
          "--secret-hex", SECRET,
          "--web", os.path.join(ROOT, "betterAnusbis", "web")],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stdout=subprocess.DEVNULL, stderr=gate_err)
     base = f"http://127.0.0.1:{gate_port}"
     try:
         for _ in range(100):
@@ -145,9 +150,17 @@ def main():
                 socket.create_connection(("127.0.0.1", gate_port), 0.1).close()
                 break
             except OSError:
+                if gate.poll() is not None:
+                    break
                 time.sleep(0.05)
         else:
-            raise AssertionError("the gate did not start")
+            gate.terminate()
+            raise AssertionError("the gate did not start (still running)")
+        if gate.poll() is not None:
+            gate_err.seek(0)
+            raise AssertionError(
+                "the gate exited with %s:\n%s"
+                % (gate.returncode, gate_err.read()[-1500:]))
 
         jar = http.cookiejar.CookieJar()
         op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
@@ -215,6 +228,7 @@ def main():
         except subprocess.TimeoutExpired:
             gate.kill()
         backend.shutdown()
+        gate_err.close()
 
     print("tensor-v gate: all checks passed")
     return 0

@@ -34,8 +34,9 @@ NGHTTP3_LIB    ?= $(firstword $(wildcard $(NGHTTP3_PREFIX)/lib/libnghttp3.a $(NG
 # nghttp3 is not enough: the HTTP/3 code calls OpenSSL's QUIC API, which is
 # 3.5 and later. third_party/nghttp3 ships with the tree, so a distribution
 # with an older OpenSSL (Kaggle's image is 3.0) would otherwise fail on
-# <openssl/quic.h> and take the whole gate down with it. Ask the compiler.
-OPENSSL_QUIC_H := $(shell printf '%s\n' '\#include <openssl/quic.h>' | $(CC) -E -x c - >/dev/null 2>&1 && echo yes)
+# <openssl/quic.h> and take the whole gate down with it. Ask the compiler;
+# -include keeps the probe free of make's '#' comment rules.
+OPENSSL_QUIC_H := $(shell $(CC) -E -x c -include openssl/quic.h - </dev/null >/dev/null 2>&1 && echo yes)
 ifneq ($(strip $(NGHTTP3_CFLAGS)),)
 ifneq ($(strip $(NGHTTP3_LIB)),)
 ifneq ($(strip $(OPENSSL_QUIC_H)),)

@@ -75,6 +75,13 @@ def main():
                 "grep -c 'anubis_tensor_v_'")
     RESULT["exports_tensor_v"] = out.strip()
 
+    # The gate must be built here, from this source tree: the checked-in
+    # binary was linked against the author's glibc and cannot run on Kaggle.
+    rc, out = sh("make -B -C betterAnusbis")
+    RESULT["gate_build"] = {"rc": rc, "tail": out[-1500:]}
+    if rc != 0:
+        finish()
+
     for name in ("test_tensor_v", "test_tensor_v_gate"):
         rc, out = sh(f"python3 tests/{name}.py")
         RESULT[name] = {"rc": rc, "tail": out[-2500:]}
@@ -103,22 +110,19 @@ def main():
     sh("(cd /tmp/ba-site && nohup python3 -m http.server %d --bind 127.0.0.1 "
        ">/dev/null 2>&1 &)" % BACKEND_PORT, cwd="/tmp")
     time.sleep(1)
-    rc, out = sh("make -C betterAnusbis")
-    RESULT["gate_build"] = {"rc": rc, "tail": out[-800:] if rc else ""}
-    if rc == 0:
-        sh("./betterAnusbis --listen 127.0.0.1:%d --target "
-           "http://127.0.0.1:%d --algorithm tensor-v --difficulty 4 "
-           ">/tmp/gate.log 2>&1 &" % (PORT, BACKEND_PORT),
-           cwd=str(REPO / "betterAnusbis"))
-        time.sleep(1)
-        rc, out = sh("python3 anubis_solver.py http://127.0.0.1:%d/" % PORT,
-                     timeout=300)
-        RESULT["gate_tensor_v"] = {"rc": rc,
-                                   "passed": "PAST THE WALL" in out,
-                                   "tail": out[-1000:]}
-        _, log = sh("tail -20 /tmp/gate.log", cwd="/tmp")
-        RESULT["gate_log"] = log[-1200:]
-        sh("pkill -f 'betterAnusbis --listen' || true", cwd="/tmp")
+    sh("./betterAnusbis --listen 127.0.0.1:%d --target "
+       "http://127.0.0.1:%d --algorithm tensor-v --difficulty 4 "
+       ">/tmp/gate.log 2>&1 &" % (PORT, BACKEND_PORT),
+       cwd=str(REPO / "betterAnusbis"))
+    time.sleep(1)
+    rc, out = sh("python3 anubis_solver.py http://127.0.0.1:%d/" % PORT,
+                 timeout=300)
+    RESULT["gate_tensor_v"] = {"rc": rc,
+                               "passed": "PAST THE WALL" in out,
+                               "tail": out[-1000:]}
+    _, log = sh("tail -20 /tmp/gate.log", cwd="/tmp")
+    RESULT["gate_log"] = log[-1200:]
+    sh("pkill -f 'betterAnusbis --listen' || true", cwd="/tmp")
 
     finish()
 
