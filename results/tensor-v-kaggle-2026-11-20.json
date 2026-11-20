@@ -1,0 +1,72 @@
+{
+  "date": "2026-11-20",
+  "host": "Kaggle script kernel (CPU), monktelv31/anubis-tensor-v",
+  "cpu": "Intel Xeon CPU @ 2.20GHz, 2 cores / 4 threads",
+  "os": "Linux 6.18.55+",
+  "commit": "35424ab kaggle/tensor-v: build the gate on the target, and say why it failed",
+  "samples": 96,
+  "lib": "libanubis_solver.so",
+  "rows": [
+    {
+      "difficulty": 2,
+      "n": 128,
+      "samples": 96,
+      "client_root_ms": 1.96,
+      "client_witness_ms": 1.89,
+      "server_sample_ms": 0.0278,
+      "server_verify_ms": 1.507,
+      "ratio": 2.6,
+      "witness_bytes": 41104
+    },
+    {
+      "difficulty": 4,
+      "n": 256,
+      "samples": 96,
+      "client_root_ms": 7.09,
+      "client_witness_ms": 7.32,
+      "server_sample_ms": 0.0681,
+      "server_verify_ms": 2.009,
+      "ratio": 7.2,
+      "witness_bytes": 47248
+    },
+    {
+      "difficulty": 8,
+      "n": 512,
+      "samples": 96,
+      "client_root_ms": 32.23,
+      "client_witness_ms": 33.11,
+      "server_sample_ms": 0.0318,
+      "server_verify_ms": 2.801,
+      "ratio": 23.3,
+      "witness_bytes": 53392
+    },
+    {
+      "difficulty": 12,
+      "n": 768,
+      "samples": 96,
+      "client_root_ms": 81.98,
+      "client_witness_ms": 83.01,
+      "server_sample_ms": 0.0327,
+      "server_verify_ms": 3.601,
+      "ratio": 45.8,
+      "witness_bytes": 59536
+    },
+    {
+      "difficulty": 16,
+      "n": 1024,
+      "samples": 96,
+      "client_root_ms": 165.48,
+      "client_witness_ms": 165.3,
+      "server_sample_ms": 0.0337,
+      "server_verify_ms": 4.16,
+      "ratio": 79.5,
+      "witness_bytes": 59536
+    }
+  ],
+  "checks": {
+    "test_tensor_v": 0,
+    "test_tensor_v_gate": 0,
+    "wasm_cross_check": 0,
+    "gate_end_to_end": true
+  }
+}

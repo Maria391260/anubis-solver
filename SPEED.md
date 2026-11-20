@@ -1272,6 +1272,18 @@ Reproduce: `python3 tools/bench_tensor_v.py` (C client and verifier) and the
 wasm timing in that section's `node` one-liner; the JSON is
 [`results/tensor-v-2026-11-19.json`](results/tensor-v-2026-11-19.json).
 
+The same benchmark on a Kaggle CPU kernel (2 Xeon cores at 2.20 GHz — a slower
+box than the one above, so the client side stretches and the server side does
+not) gives 2.6x at difficulty 2, 23x at 8 and **79.5x at 16**: 331 ms of client
+work against 4.2 ms of server check. The ratio is the property that matters,
+not the absolute number, and it moves with the client's machine because the
+server's work is `O(k*N)` either way. That run is also the portability check for
+this tier: it clones the `unstable` branch, builds, and passes
+`test_tensor_v.py`, `test_tensor_v_gate.py`, the wasm cross-check and one real
+challenge through the gate. Reproduce with
+`kaggle kernels push -p src/core/kaggle_tensor_v`; the JSON is
+[`results/tensor-v-kaggle-2026-11-20.json`](results/tensor-v-kaggle-2026-11-20.json).
+
 The browser builds the tree in the wasm kernel (`tv_solve`, `tv_make_witness`);
 the pure-JavaScript fallback (`tvTree`, `tvWitnessJS` in the page) is the same
 tree written with the page's SHA-256, and `wasm/verify-tensor-v.mjs` +
