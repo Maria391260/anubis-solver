@@ -1,0 +1,14 @@
+{
+  "id": "monktelv31/anubis-tensor-v",
+  "title": "anubis tensor v",
+  "code_file": "run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "keywords": [],
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}
