@@ -67,10 +67,17 @@ directory to the machine `PATH`, and is uninstalled through *Apps & features*.
 
 Anubis's job, reduced to one rule: every request is challenged, the client solves
 it, the server verifies, sets a signed cookie, and proxies the request. That is
-what this implements — **all six algorithms**, with verification done by
+what this implements — **every algorithm**, with verification done by
 `libanubis_solver.so`, the same engine the CLI and the Firefox extension solve
 with. Server and client cannot disagree about a primitive because it is the same
 code.
+
+`tensor-v` is the seventh algorithm and is ours alone: the same GEMM as `tensor`,
+but the client commits to the output and the server samples it, so the gate does
+2-3 ms of work instead of 20-130 ms. It is a two-request protocol (commit, then
+audit) handled by the challenge page and the `audit-tensor` endpoint; see
+[SECURITY-REVIEW.md](SECURITY-REVIEW.md#tensor-v-sampled-verification). `tensor`
+remains the one-request tier for solvers that expect a single digest.
 
 `./test-all-algorithms.sh` — each line asserts the protected page came back, not
 just that a challenge was issued:
@@ -82,6 +89,8 @@ just that a challenge was issued:
   metarefresh  difficulty 1   via node    PASS
   argon2id     difficulty 4   via python  PASS
   hashx        difficulty 4   via python  PASS
+  tensor       difficulty 4   via node    PASS
+  tensor-v     difficulty 4   via python  PASS
 
 honeypot
   trap link hidden in <script type="ignore"> PASS
@@ -156,7 +165,7 @@ where to listen, what to protect
   --strip-base-prefix        strip that prefix before the backend sees it
 
 the challenge
-  --algorithm NAME           fast, slow, sha256, argon2id, hashx, metarefresh
+  --algorithm NAME           fast, slow, sha256, argon2id, hashx, tensor, tensor-v, metarefresh
   --difficulty N             bits for sha256/argon2id/hashx, nibbles for fast/slow
   --challenge-status N       status for the challenge page (default 200)
   --deny-status N            status for a policy deny (default 200, see below)
@@ -295,7 +304,8 @@ challenge bytes and only falls back to fetching the interpreter.
 | `sha256` | `sha256_pow_batch.wasm` (four nonces wide) | 38.7 KB | exact, and **1.8-2.1x faster** |
 | `argon2id` | `argon2id_pow.wasm` (our register-resident fill, m=19456 t=2 p=1) | 13.9 KB | **exact, and 1.02-1.05x faster** |
 | `hashx` | compiled in the page from the challenge (`hashx_jit.mjs`), falling back to `hashx_pow.wasm` | 10.4 KB / 14.9 KB | **exact, and 7-8x faster** |
-| `tensor` | `tensor_pow.wasm` (int8 GEMM, SIMD dot) | 44.9 KB | not comparable: Anubis has no such tier. Exact against the C engine and the page's JavaScript |
+| `tensor` | `tensor_pow.wasm` (int8 GEMM, SIMD dot) | 49.4 KB | not comparable: Anubis has no such tier. Exact against the C engine and the page's JavaScript |
+| `tensor-v` | the same module, plus `tv_solve` / `tv_make_witness` (Merkle root and witness) | 49.4 KB | not comparable; exact against the C core (`wasm/verify-tensor-v.mjs`) |
 
 `sha256` and the nibble challenges also have a **pure-JavaScript SHA-256**.
 If WebAssembly is missing or the module will not instantiate, the page computes
@@ -336,22 +346,43 @@ proof  = SHA256(C as N*N little-endian int32)     N = 64 * clamp(difficulty, 2, 
 ```
 
 There is no nonce to search: the digest is the whole proof, and the server
-recomputes one GEMM to check it. The page tries **WebNN** first (an int8 `gemm`
-in a graph, which reaches NPUs and integrated GPUs), then `tensor_pow.wasm`,
-then a pure-JavaScript GEMM; `#pure-js` forces the last one. WebNN results are
-never trusted blindly: the page recomputes two output rows in JavaScript and
-falls through if they disagree, because backend int8 support is uneven and a
-wrong GEMM would only produce a rejected digest.
+recomputes one GEMM to check it. The page tries **WebNN** first (a `gemm` in a
+graph, which reaches NPUs and integrated GPUs), then `tensor_pow.wasm`, then a
+pure-JavaScript GEMM; `#pure-js` forces the last one. WebNN results are never
+trusted blindly: the page recomputes two output rows in JavaScript and falls
+through if they disagree, because backend `gemm` support is uneven and a wrong
+GEMM would only produce a rejected digest.
 
-Everything is integer on purpose. Float addition reassociates, so a float GEMM
-would give a different digest per tiling or backend and the server could never
-check it; int32 accumulation in a fixed order is identical in wasm, JavaScript,
-WebNN and the C verifier. Measured on one i7-1260P core (see
+Everything is integer on purpose. Float addition reassociates, so a naive float
+GEMM would give a different digest per tiling or backend and the server could
+never check it; int32 accumulation in a fixed order is identical in wasm,
+JavaScript and the C verifier. WebNN's `gemm()` only takes float32/float16, so
+the page widens the matrices to float32, which is still exact here: every
+partial sum is an integer below `1024 * 127 * 128 < 2^24`, and float32
+represents every integer up to 2^24. The output is narrowed back to int32.
+Measured on one i7-1260P core (see
 [SPEED.md](../SPEED.md#tensor-one-integer-gemm-and-why-webnn-is-its-real-target)):
 difficulty 8 is a 512x512x512 product, about 40 ms in the wasm kernel and
 0.4-0.7 s in JavaScript; the server's C verifier takes 20 ms. Checked by
 `node tests_js_tensor.mjs`, `node wasm/verify-tensor.mjs` and the C engine's
 `anubis_tensor_digest`.
+
+`tensor-v` is the sampled proof of the same product. The client reads the second
+matrix as `BT` (the stream's second matrix, so `C[i][j]` is one contiguous row
+dot one contiguous row), commits to `C` in 32-element Merkle leaves, and sends
+the root. The gate answers with 96 block indices and one position in each; the
+client opens those blocks with their proofs and posts them to `audit-tensor`.
+The gate checks the leaves against the committed root and recomputes only those
+96 elements — a few milliseconds instead of a full GEMM, and a client that
+skipped a fraction `f` of the matrix passes with probability `f^96`. The page
+gets `C` from WebNN when `navigator.ml` exists (and the backend passes the
+two-row check), hands it to `tensor_pow.wasm`'s `tv_solve_from_c`, and builds
+the witness with `tv_make_witness`; the same module is the GEMM fallback, and
+`#pure-js` uses the page's own GEMM and SHA-256 tree. `wasm/verify-tensor-v.mjs`
+pins the wasm root and witness against the C core, and
+`tests_js_tensor_v.mjs` exercises the WebNN hand-off, the explicit-transpose
+retry and the pure-JavaScript path. See
+[SECURITY-REVIEW.md](SECURITY-REVIEW.md#tensor-v-sampled-verification).
 
 `hashx` also shows what it costs. The page compiles the challenge's program,
 then scans nonces in windows of 262,144 and drives a progress bar that says

@@ -101,11 +101,16 @@ tensor_pow.wasm: tensor_pow.c
 	      -Wl,--export=result_hash_ptr -Wl,--export=result_hash_size \
 	      -Wl,--export=anubis_work -Wl,--export=a_ptr -Wl,--export=b_ptr \
 	      -Wl,--export=c_ptr -Wl,--export=kernel_mode -Wl,--export=tensor_matmul \
-	      -Wl,--export=has_simd -o tensor_pow.wasm tensor_pow.c
+	      -Wl,--export=has_simd -Wl,--export=tv_solve -Wl,--export=tv_solve_from_c \
+	      -Wl,--export=tv_make_witness -Wl,--export=tv_root_ptr -Wl,--export=tv_in_ptr \
+	      -Wl,--export=tv_wit_ptr -o tensor_pow.wasm tensor_pow.c
 	@ls -l tensor_pow.wasm
 
 verify-tensor: tensor_pow.wasm
 	node verify-tensor.mjs
+
+verify-tensor-v: tensor_pow.wasm
+	node verify-tensor-v.mjs
 
 # needs a running Anubis: anubis -bind 127.0.0.1:8923 \
 #   -target http://127.0.0.1:8001 -policy-fname policy.yaml \
@@ -171,4 +176,4 @@ clean:
 	      argon2_fill.wasm argon2_fill.wat argon2_fill_simd.wasm argon2_fill_simd.wat \
 	      argon2_fill_c.wasm
 
-.PHONY: all bench a2i vectors compare live serve clean verify-tensor
+.PHONY: all bench a2i vectors compare live serve clean verify-tensor verify-tensor-v

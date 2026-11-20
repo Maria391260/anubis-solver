@@ -25,15 +25,20 @@ make VULKAN=0             # skip Vulkan
 make L0_INC=/path         # where level_zero/ze_api.h lives
 
 python3 tests/test_core.py
+python3 tests/test_tensor_v.py      # tensor-v: root, sample, witness, tamper
+python3 tests/test_tensor_v_gate.py # the two-request commit/audit protocol
 python3 tests/test_local.py        # needs a local Anubis checkout (ANUBIS_SRC)
 python3 tests/test_versions.py
 python3 src/nvidia/ptx/test_ptx.py        # SHA-256 PTX via the simulator
 python3 src/nvidia/ptx/test_hashx_ptx.py  # HashX PTX via the simulator + hashx.c
 python3 tools/bench_tiers.py
+python3 tools/bench_tensor_v.py       # tensor-v: client GEMM+tree vs sampled server check
 python3 tools/bench_gpu.py          # per-backend rows: cuda/l0, vulkan, opencl, cpu
 python3 tools/bench_argon2_gpu.py  # ANUBIS_GPU_ARGON2=1 for the GPU
 python3 tools/bench_hashx_gpu.py   # ANUBIS_GPU_HASHX=1 for CUDA
 node tools/bench-endtoend.mjs      # the wall, 2 servers x 3 clients
+node betterAnusbis/tests_js_tensor.mjs    # the `tensor` browser paths
+node betterAnusbis/tests_js_tensor_v.mjs  # `tensor-v` sample protocol + WebNN hand-off
 python3 tools/bench-server-resources.py   # RAM and CPU, from /proc
 node tools/bench-client-resources.mjs     # wasm vs native memory and CPU
 

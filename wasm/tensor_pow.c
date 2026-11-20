@@ -35,6 +35,21 @@
  *   kernel_mode(u32)             0 = scalar, 1 = SIMD (no-op without -msimd128)
  *   tensor_matmul(u32 n)         run C = A@B with the selected kernel
  *
+ * The sampled variant, `tensor-v` (the gate's two-request protocol):
+ *
+ *   tv_solve(u32 difficulty) -> u32
+ *                                C = A@BT (BT is the stream's second matrix read
+ *                                as rows) and the Merkle tree over C in 32-element
+ *                                leaves; 0 on success
+ *   tv_root_ptr() -> u32         32-byte root from the last tv_solve
+ *   tv_in_ptr() -> u32           write u32le block, u32le position pairs here
+ *   tv_make_witness(u32 difficulty, u32 count) -> u32
+ *                                serializes the sample and proofs at tv_wit_ptr,
+ *                                returns the byte length (0 on error)
+ *   tv_wit_ptr() -> u32          the witness blob
+ *   tv_solve_from_c(u32 n)       build the tree from a C computed elsewhere
+ *                                (WebNN); the challenge must be at data_ptr
+ *
  * Build (see the Makefile):
  *   clang --target=wasm32 -O3 -nostdlib -Wl,--no-entry -Wl,--export-memory \
  *         -Wl,--export=data_ptr ... -o tensor_pow.wasm tensor_pow.c
@@ -395,4 +410,213 @@ uint32_t anubis_work(uint32_t difficulty, uint32_t nonce, uint32_t iterand) {
     matmul(n);                       /* step 6 */
     digest_c(n, result);             /* step 7 */
     return 0;                        /* step 8: nonce 0 */
+}
+
+/* ------------------------------------------------------------- tensor-v
+ *
+ * Same stream and same A as `tensor`, but B is read as its transpose
+ * (BT[j][k] = stream[N*N + j*N + k]) so C[i][j] is the dot product of two
+ * contiguous rows. The client commits to C in 32-int32 blocks:
+ *
+ *   chal = SHA256("ANUBIS-TENSOR-VC" || challenge bytes)
+ *   leaf = SHA256("ANUBIS-TENSOR-VL" || chal || u32le(block) || 128 bytes)
+ *   node = SHA256("ANUBIS-TENSOR-VN" || left || right)  (odd last duplicated)
+ *
+ * and later serializes the blocks the server sampled, with their Merkle
+ * proofs. The server never runs tv_matmul; it recomputes a few elements.
+ */
+#define TV_BLOCK 32
+#define TV_MAX_LEAVES 32768u          /* N = 1024 */
+#define TV_MAX_SAMPLES 256u
+#define TV_TREE_BYTES (2u * TV_MAX_LEAVES * 32u)
+#define TV_WIT_BYTES (256u * 1024u)
+
+static uint8_t tv_tree[TV_TREE_BYTES];
+static uint8_t tv_wit[TV_WIT_BYTES];
+static uint8_t tv_in[TV_MAX_SAMPLES * 8u];
+static uint8_t tv_root[32];
+static uint8_t tv_chal[32];
+static uint8_t tv_tmp[4224];
+
+static const uint8_t tv_dom_leaf[16] = {
+    'A', 'N', 'U', 'B', 'I', 'S', '-', 'T', 'E', 'N', 'S', 'O', 'R', '-', 'V', 'L'};
+static const uint8_t tv_dom_node[16] = {
+    'A', 'N', 'U', 'B', 'I', 'S', '-', 'T', 'E', 'N', 'S', 'O', 'R', '-', 'V', 'N'};
+static const uint8_t tv_dom_chal[16] = {
+    'A', 'N', 'U', 'B', 'I', 'S', '-', 'T', 'E', 'N', 'S', 'O', 'R', '-', 'V', 'C'};
+
+static void tv_put_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+/* BT layout: C[i][j] = sum_k A[i][k] * B[j][k]. A plain dot product, which is
+ * also what the WebNN path gets after transposing the second matrix. */
+static int32_t tv_dot(uint32_t n, const uint8_t *a, const int8_t *b) {
+    int32_t s = 0;
+    uint32_t k = 0;
+#if defined(__wasm_simd128__)
+    v128_t lo = wasm_i32x4_splat(0), hi = wasm_i32x4_splat(0);
+    for (; k + 8 <= n; k += 8) {
+        v128_t av = wasm_i16x8_extend_low_i8x16(wasm_v128_load(a + k));
+        v128_t bv = wasm_i16x8_extend_low_i8x16(wasm_v128_load(b + k));
+        v128_t p = wasm_i16x8_mul(av, bv);
+        lo = wasm_i32x4_add(lo, wasm_i32x4_extend_low_i16x8(p));
+        hi = wasm_i32x4_add(hi, wasm_i32x4_extend_high_i16x8(p));
+    }
+    {
+        int32_t lane[4];
+        wasm_v128_store(lane, wasm_i32x4_add(lo, hi));
+        s = lane[0] + lane[1] + lane[2] + lane[3];
+    }
+#endif
+    for (; k < n; k++) s += (int32_t)a[k] * (int32_t)b[k];
+    return s;
+}
+
+static void tv_matmul(uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *arow = A + (size_t)i * n;
+        int32_t *crow = C + (size_t)i * n;
+        for (uint32_t j = 0; j < n; j++) {
+            crow[j] = tv_dot(n, arow, B + (size_t)j * n);
+        }
+    }
+}
+
+static void tv_build_chal(void) {
+    uint32_t len = buf_len > 4096u ? 4096u : buf_len;
+    for (uint32_t i = 0; i < 16u; i++) tv_tmp[i] = tv_dom_chal[i];
+    for (uint32_t i = 0; i < len; i++) tv_tmp[16u + i] = buf[i];
+    sha256(tv_tmp, 16u + len, tv_chal);
+}
+
+/* Build the tree over C. Returns the number of levels, or 0 on bad n. */
+static uint32_t tv_build_tree(uint32_t n) {
+    const uint32_t leaves = (n * n) / TV_BLOCK;
+    uint32_t cnt[16], off[16];
+    uint32_t levels = 0;
+    size_t total = 0;
+
+    if (leaves == 0 || leaves > TV_MAX_LEAVES) return 0;
+    cnt[0] = leaves;
+    total = leaves;
+    while (cnt[levels] > 1u) {
+        levels++;
+        if (levels >= 16u) return 0;
+        cnt[levels] = (cnt[levels - 1] + 1u) / 2u;
+        total += cnt[levels];
+    }
+    levels++;
+    off[0] = 0;
+    for (uint32_t l = 1; l < levels; l++) off[l] = off[l - 1] + cnt[l - 1];
+    if (total * 32u > TV_TREE_BYTES) return 0;
+
+    for (uint32_t b = 0; b < leaves; b++) {
+        for (uint32_t i = 0; i < 16u; i++) tv_tmp[i] = tv_dom_leaf[i];
+        for (uint32_t i = 0; i < 32u; i++) tv_tmp[16u + i] = tv_chal[i];
+        tv_put_u32(tv_tmp + 48u, b);
+        const uint8_t *block = (const uint8_t *)(C + (size_t)b * TV_BLOCK);
+        for (uint32_t i = 0; i < TV_BLOCK * 4u; i++) tv_tmp[52u + i] = block[i];
+        sha256(tv_tmp, 52u + TV_BLOCK * 4u, tv_tree + (off[0] + b) * 32u);
+    }
+    for (uint32_t l = 1; l < levels; l++) {
+        for (uint32_t j = 0; j < cnt[l]; j++) {
+            const uint8_t *left = tv_tree + (off[l - 1] + 2u * j) * 32u;
+            const uint8_t *right = (2u * j + 1u < cnt[l - 1])
+                                       ? tv_tree + (off[l - 1] + 2u * j + 1u) * 32u
+                                       : left;
+            for (uint32_t i = 0; i < 16u; i++) tv_tmp[i] = tv_dom_node[i];
+            for (uint32_t i = 0; i < 32u; i++) tv_tmp[16u + i] = left[i];
+            for (uint32_t i = 0; i < 32u; i++) tv_tmp[48u + i] = right[i];
+            sha256(tv_tmp, 80u, tv_tree + (off[l] + j) * 32u);
+        }
+    }
+    for (uint32_t i = 0; i < 32u; i++) tv_root[i] = tv_tree[(off[levels - 1]) * 32u + i];
+    return levels;
+}
+
+/* Compute C from the challenge bytes and build the tree. */
+uint32_t tv_solve(uint32_t difficulty) {
+    uint32_t d = difficulty < 2u ? 2u : (difficulty > 16u ? 16u : difficulty);
+    uint32_t n = 64u * d;
+
+    sha256(buf, buf_len, seed);
+    fill_ab(n);
+    tv_matmul(n);
+    tv_build_chal();
+    if (tv_build_tree(n) == 0) return 1;
+    return 0;
+}
+
+/* Rebuild the tree over C that the caller already filled (WebNN, or a JS
+ * kernel). The challenge bytes must still be in buf. */
+uint32_t tv_solve_from_c(uint32_t n) {
+    if (n < 128u || n > NN_MAX || (n & 63u) != 0) return 1;
+    tv_build_chal();
+    if (tv_build_tree(n) == 0) return 1;
+    return 0;
+}
+
+uint8_t *tv_root_ptr(void) { return tv_root; }
+uint8_t *tv_in_ptr(void) { return tv_in; }
+uint8_t *tv_wit_ptr(void) { return tv_wit; }
+
+/* Serialize the sampled blocks and their proofs. tv_in holds count pairs of
+ * (u32 block, u32 position). Returns the blob length, or 0 on bad input. */
+uint32_t tv_make_witness(uint32_t difficulty, uint32_t count) {
+    uint32_t d = difficulty < 2u ? 2u : (difficulty > 16u ? 16u : difficulty);
+    uint32_t n = 64u * d;
+    uint32_t leaves = (n * n) / TV_BLOCK;
+    uint32_t levels = 0, c = leaves;
+    while (c > 1u) { c = (c + 1u) / 2u; levels++; }
+    uint32_t proof_len = levels * 32u;
+    if (count == 0 || count > TV_MAX_SAMPLES) return 0;
+    size_t need = 16u + (size_t)count * 12u + (size_t)count * proof_len +
+                  (size_t)count * TV_BLOCK * 4u;
+    if (need > TV_WIT_BYTES) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t block = tv_in[i * 8u] | (tv_in[i * 8u + 1] << 8) |
+                         (tv_in[i * 8u + 2] << 16) | (tv_in[i * 8u + 3] << 24);
+        uint32_t pos = tv_in[i * 8u + 4] | (tv_in[i * 8u + 5] << 8) |
+                       (tv_in[i * 8u + 6] << 16) | (tv_in[i * 8u + 7] << 24);
+        if (block >= leaves || pos >= TV_BLOCK) return 0;
+    }
+    tv_put_u32(tv_wit + 0, 0x31565654u);
+    tv_put_u32(tv_wit + 4, n);
+    tv_put_u32(tv_wit + 8, count);
+    tv_put_u32(tv_wit + 12, leaves);
+    size_t at = 16;
+    for (uint32_t i = 0; i < count; i++) {
+        for (int b = 0; b < 4; b++) tv_wit[at + b] = tv_in[i * 8u + b];
+        for (int b = 0; b < 4; b++) tv_wit[at + 4 + b] = tv_in[i * 8u + 4 + b];
+        tv_put_u32(tv_wit + at + 8, proof_len / 32u);
+        at += 12;
+    }
+    /* proof siblings, level 0 first */
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t block = tv_in[i * 8u] | (tv_in[i * 8u + 1] << 8) |
+                         (tv_in[i * 8u + 2] << 16) | (tv_in[i * 8u + 3] << 24);
+        uint32_t cnt[16], off[16];
+        uint32_t lv = 0, cc = leaves;
+        cnt[0] = leaves;
+        while (cc > 1u) { lv++; cnt[lv] = (cc + 1u) / 2u; cc = cnt[lv]; }
+        off[0] = 0;
+        for (uint32_t l = 1; l <= lv; l++) off[l] = off[l - 1] + cnt[l - 1];
+        for (uint32_t l = 0; l < lv; l++) {
+            uint32_t idx = block >> l;
+            uint32_t sib = idx ^ 1u;
+            if (sib >= cnt[l]) sib = idx;
+            for (int b = 0; b < 32; b++)
+                tv_wit[at + b] = tv_tree[(off[l] + sib) * 32u + (uint32_t)b];
+            at += 32u;
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t block = tv_in[i * 8u] | (tv_in[i * 8u + 1] << 8) |
+                         (tv_in[i * 8u + 2] << 16) | (tv_in[i * 8u + 3] << 24);
+        const uint8_t *src = (const uint8_t *)(C + (size_t)block * TV_BLOCK);
+        for (uint32_t b = 0; b < TV_BLOCK * 4u; b++) tv_wit[at++] = src[b];
+    }
+    return (uint32_t)at;
 }

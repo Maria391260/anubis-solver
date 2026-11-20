@@ -83,6 +83,21 @@ int anubis_gpu_verify(void);
 void anubis_set_tpu_verify(int enable);       /* default 1; -1 clears */
 int anubis_tpu_verify(void);                  /* call > env > gpu switch */
 
+/* NVIDIA clock control for benchmarking. A Tesla T4 parks at 300 MHz when
+ * idle and boosts only under sustained load, so short runs measure the ramp.
+ * anubis_nvidia_force_boost_max() locks every visible GPU at its max SM clock
+ * through NVML (dlopen'd, so a CPU-only box still loads the .so) and needs
+ * root. Returns 0 when at least one device was locked, else -1 (no NVML),
+ * -2 (no device), -3 (needs root), -4 (unsupported: older than R450),
+ * -5 (driver refused: power/thermal). anubis_nvidia_clock_mhz() reads the
+ * current clock of device 0 (-1 if unknown); anubis_nvidia_boost_info()
+ * describes the last attempt. force_nvidia_boost_max() is the same call
+ * without the prefix, for plain ctypes. */
+int anubis_nvidia_force_boost_max(void);
+int force_nvidia_boost_max(void);
+int anubis_nvidia_clock_mhz(void);
+const char *anubis_nvidia_boost_info(void);
+
 /* Easter egg: the sentence the hardware answers to a BAR0 probe.
  * Static storage, never NULL, do not free. Exported under this exact
  * name (no anubis_ prefix) for the callers that scan for `easter`. */
@@ -111,6 +126,23 @@ Which family to call: `nibbles` for `fast`/`slow`, `bits` for
 `sha256`/`wasm-sha256`, `argon2id`, `hashx` respectively, plus
 `anubis_verify_tensor` and `anubis_tensor_digest` for the deterministic
 `tensor` tier (one int8 GEMM; the nonce is always 0).
+
+The sampled variant is a four-call protocol in the same header:
+
+| call | side | what it does |
+|---|---|---|
+| `anubis_tensor_v_root(challenge_hex, d, root_hex)` | client | computes C and its Merkle root |
+| `anubis_tensor_v_sample(challenge_hex, d, root_hex, secret, k, blocks, positions)` | server | derives the k sampled blocks from the secret |
+| `anubis_tensor_v_witness(challenge_hex, d, blocks, positions, k, out, cap)` | client | serializes the blocks and proofs as hex |
+| `anubis_tensor_v_check_sample(witness_hex, blocks, positions, k)` | server | rejects a witness that answers a different sample |
+| `anubis_tensor_v_verify(challenge_hex, d, root_hex, witness_hex, err, cap)` | server | checks the proofs and the sampled elements |
+
+The verifier never calls the GEMM: it recomputes `C[i][j]` for the sampled
+elements only. `anubis_tensor_v_verify` returns `ANUBIS_OK` or
+`ANUBIS_ERR_ARG`; `err` receives a short reason. `tensor-v` uses a transposed
+second matrix (`BT[j][k] = stream[N*N + j*N + k]`) so one column of B is one
+contiguous row; that is the only difference from the `tensor` bytes. See the
+comment block in `include/anubis-solver.h`.
 
 Argument encoding matters:
 

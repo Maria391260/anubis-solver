@@ -440,8 +440,9 @@ because `fetch()` is used for the modules.
 | `verify-jit.mjs` | its cross-check against the interpreter and the committed module |
 | `argon2id_pow.wasm` | the whole Argon2id hash in Anubis's ABI, 13.9 KB |
 | `hashx_pow.wasm` | HashX interpreter in Anubis's ABI, 14.9 KB |
-| `tensor_pow.c`, `tensor_pow.wasm` | the `tensor` tier: one int8 GEMM, digest of the result, 44.9 KB |
+| `tensor_pow.c`, `tensor_pow.wasm` | the `tensor` tier (one int8 GEMM, digest of the result) and the `tensor-v` root/witness, 49.4 KB |
 | `verify-tensor.mjs`, `bench-tensor.mjs` | its 48-check harness and per-size GMAC/s benchmark |
+| `verify-tensor-v.mjs` | the `tensor-v` root and witness, checked byte-for-byte from the C core |
 | `verify-a2i-module.mjs`, `verify-hashx-module.mjs` | whole-module checks against the official ones |
 
 `make` regenerates the WAT and the wasm; `make bench`, `make serve`, `make clean`.

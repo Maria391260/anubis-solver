@@ -2,11 +2,11 @@
 # Every algorithm Anubis supports, gated by betterAnusbis and solved by a client.
 #
 # fast, slow, sha256, metarefresh and tensor are solved by the Node client;
-# argon2id and hashx run through the Python CLI here. Each run asserts the protected page came
-# back, not just that a challenge was issued. The challenge page solves hashx
-# itself too (compiled in the page, with a progress bar), which is what a browser
-# does; this script keeps the CLI in the loop so a regression in the native
-# verifier still shows up.
+# argon2id, hashx and tensor-v run through the Python CLI here. Each run asserts
+# the protected page came back, not just that a challenge was issued. The
+# challenge page solves hashx itself too (compiled in the page, with a progress
+# bar), which is what a browser does; this script keeps the CLI in the loop so a
+# regression in the native verifier still shows up.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 REPO="$(cd .. && pwd)"
@@ -60,6 +60,7 @@ check metarefresh 1  node
 check argon2id    4  python
 check hashx       4  python
 check tensor      4  node
+check tensor-v    4  python
 
 # ---- honeypot -----------------------------------------------------------------
 echo

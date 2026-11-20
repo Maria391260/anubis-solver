@@ -1,0 +1,62 @@
+{
+  "date": "2026-11-19",
+  "samples": 96,
+  "lib": "libanubis_solver.so",
+  "rows": [
+    {
+      "difficulty": 2,
+      "n": 128,
+      "samples": 96,
+      "client_root_ms": 1.54,
+      "client_witness_ms": 1.49,
+      "server_sample_ms": 0.0314,
+      "server_verify_ms": 2.166,
+      "ratio": 1.4,
+      "witness_bytes": 41104
+    },
+    {
+      "difficulty": 4,
+      "n": 256,
+      "samples": 96,
+      "client_root_ms": 4.34,
+      "client_witness_ms": 3.9,
+      "server_sample_ms": 0.0378,
+      "server_verify_ms": 2.218,
+      "ratio": 3.7,
+      "witness_bytes": 47248
+    },
+    {
+      "difficulty": 8,
+      "n": 512,
+      "samples": 96,
+      "client_root_ms": 17.65,
+      "client_witness_ms": 14.49,
+      "server_sample_ms": 0.0367,
+      "server_verify_ms": 2.38,
+      "ratio": 13.5,
+      "witness_bytes": 53392
+    },
+    {
+      "difficulty": 12,
+      "n": 768,
+      "samples": 96,
+      "client_root_ms": 32.12,
+      "client_witness_ms": 32.1,
+      "server_sample_ms": 0.0321,
+      "server_verify_ms": 3.0,
+      "ratio": 21.4,
+      "witness_bytes": 59536
+    },
+    {
+      "difficulty": 16,
+      "n": 1024,
+      "samples": 96,
+      "client_root_ms": 69.01,
+      "client_witness_ms": 82.27,
+      "server_sample_ms": 0.0437,
+      "server_verify_ms": 3.564,
+      "ratio": 42.4,
+      "witness_bytes": 59536
+    }
+  ]
+}

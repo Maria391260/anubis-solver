@@ -20,7 +20,7 @@ challenge = a.AnubisChallenge.from_payload(payload)   # from the JSON dict
 |---|---|
 | `id` | challenge id (the `id` query parameter) |
 | `random_data` | the challenge string that is hashed |
-| `algorithm` | `fast`, `slow`, `sha256`, `wasm-sha256`, `argon2id`, `hashx`, `tensor` |
+| `algorithm` | `fast`, `slow`, `sha256`, `wasm-sha256`, `argon2id`, `hashx`, `tensor`, `tensor-v` |
 | `difficulty` | leading zero nibbles (fast/slow) or bits (the rest) |
 | `method` | HTTP method the site expects (`POST` by default) |
 | `raw` | the original payload |
@@ -56,10 +56,35 @@ solver.easter()       # the sentence the chip answers with; None on a .so
 solver.backends()             # ["cpu", "vulkan", "opencl"] - usable right now
 solver.backends_compiled()    # everything built into the .so
 print(solver.backend_report())  # the table the CLI prints with --backends
+solver.force_nvidia_boost_max()  # lock NVIDIA GPUs at max clock (root); 0 = ok
+solver.nvidia_clock_mhz()        # current SM clock, -1 when there is no GPU
+solver.nvidia_boost_info()       # why the last attempt succeeded or failed
 ```
 
 `solver.supported()` accepts the names in `AnubisSolver.ALGORITHMS`
-(`fast`, `slow`, `sha256`, `wasm-sha256`, `argon2id`, `hashx`, `tensor`).
+(`fast`, `slow`, `sha256`, `wasm-sha256`, `argon2id`, `hashx`, `tensor`,
+`tensor-v`).
+
+### `tensor-v`
+
+`tensor-v` is the sampled-proof tensor tier: the solver commits to the GEMM
+with a Merkle root, the gate returns the blocks it wants opened, and the client
+sends those blocks and their proofs to `audit-tensor`. The HTTP client runs
+both steps for you, so `AnubisClient.get()` and `pass_challenge()` work without
+extra code; the cookie is set by the second response.
+
+The solver-level API exposes the two halves for callers that drive the
+protocol themselves:
+
+```python
+solution = solver.solve_tensor_v(challenge)      # nonce 0, response = root
+witness  = solver.tensor_v_witness(challenge, blocks, positions)
+```
+
+The sample (`blocks`, `positions`) comes from the gate's JSON response to the
+first request; it cannot be computed without the gate's signing secret, which
+is why this algorithm is the one exception to `solve()` returning something
+self-contained.
 
 ## Errors
 

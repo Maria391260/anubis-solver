@@ -594,6 +594,25 @@ static const char *find_cookie(const char *headers, const char *name, char *out,
 
 /* --------------------------------------------------------- verification */
 
+/* `tensor-v`: the server never recomputes the GEMM. It samples this many
+ * blocks of the committed output (and one element inside each); a client that
+ * computed a fraction f of the elements passes with probability f^k. 96 is
+ * 4e-5 at f=0.9, and costs the gate ~96*N multiply-adds instead of N^3. */
+#define TENSOR_V_K 96
+
+/* The sampler's key, separated from the cookie-signing key: the two uses must
+ * not share raw key material, even though both are HMAC/SHA-256. */
+static void tensor_v_secret(char out[65]) {
+    unsigned char k[32];
+    unsigned int klen = sizeof k;
+    static const unsigned char label[] = "ANUBIS-TENSOR-V-KEY";
+    if (!HMAC(EVP_sha256(), cfg.secret, (int)sizeof cfg.secret, label,
+              sizeof label - 1, k, &klen) || klen != sizeof k) {
+        memset(k, 0, sizeof k);
+    }
+    hex_encode(k, sizeof k, out);
+}
+
 /* A tensor response is a SHA-256 digest and nothing else, so a request that
  * cannot be one is refused before the GEMM runs. This is not a security
  * boundary - a determined client can still make the server compute one GEMM
@@ -832,6 +851,34 @@ static int ch_peek_algorithm(const char *id, char *out, size_t cap) {
         if (remote_get_challenge(id, &remote) == 1) {
             ch_cache_put(&remote);
             snprintf(out, cap, "%s", remote.algorithm);
+            found = 1;
+        }
+    }
+    return found;
+}
+
+/* Same, for the fields tensor-v needs before it spends the challenge: the
+ * random data and difficulty a step-1 sample has to be derived from. */
+static int ch_peek_entry(const char *id, ch_entry *out) {
+    if (!cfg.stateful || !id || !out) return 0;
+    uint32_t h = 2166136261u;
+    for (const char *q = id; *q; q++) h = (h ^ (uint8_t)*q) * 16777619u;
+    int found = 0;
+    pthread_mutex_lock(&ch_lock);
+    for (int probe = 0; probe < 32; probe++) {
+        ch_entry *e = &ch_table[(h + (uint32_t)probe) % CH_BUCKETS];
+        if (!e->used) break;
+        if (strcmp(e->id, id) != 0) continue;
+        *out = *e;
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock(&ch_lock);
+    if (!found && (store_valkey || store_s3)) {
+        ch_entry remote;
+        if (remote_get_challenge(id, &remote) == 1) {
+            ch_cache_put(&remote);
+            *out = remote;
             found = 1;
         }
     }
@@ -4013,6 +4060,21 @@ static const char *json_field(const char *json, const char *key) {
     p++;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     return p;
+}
+
+/* A pointer into the JSON for a value that is large and known to contain no
+ * escapes (the tensor-v witness is hex). Avoids copying 100 KB twice. */
+static int json_raw_span(const char *json, const char *key, const char **out,
+                         size_t *len) {
+    const char *p = json_field(json, key);
+    const char *e;
+    if (!p || *p != '"') return 0;
+    p++;
+    e = strchr(p, '"');
+    if (!e) return 0;
+    *out = p;
+    *len = (size_t)(e - p);
+    return 1;
 }
 
 static int json_get_str(const char *json, const char *key, char *out, size_t cap) {
@@ -12687,29 +12749,37 @@ function argon2idTag(password, nonce) {
     workDone();
     return {hash:tensorDigest(c,n),nonce:0,ms:performance.now()-t0};
   }
-  // WebNN: the graph is a single int8 gemm. Support varies by browser and by
+  // WebNN: the graph is a single gemm. Support varies by browser and by
   // backend, so nothing here is trusted: the result of two rows is recomputed
   // in JavaScript and compared before the digest is accepted. A backend that
-  // cannot do int8 gemm throws at build() and the wasm kernel takes over.
+  // cannot do the gemm throws at build() and the wasm kernel takes over.
+  //
+  // The spec's gemm() is float32/float16 only, so the integer matrices are
+  // widened to float32. That is exact here: every partial sum is an integer
+  // bounded by 1024*127*128 < 2^24, and float32 represents every integer up
+  // to 2^24. The output is narrowed back to int32 after the read.
   async function tensorWebNN(n){
     const ml=navigator.ml;
     if(!ml||typeof ml.createContext!=="function") return null;
-    say("asking WebNN for an int8 GEMM");
+    say("asking WebNN for a GEMM");
     const ctx=await ml.createContext({deviceType:"gpu"});
     const builder=new MLGraphBuilder(ctx);
-    const A=builder.input("A",{dataType:"uint8",shape:[n,n]});
-    const B=builder.input("B",{dataType:"int8",shape:[n,n]});
+    const A=builder.input("A",{dataType:"float32",shape:[n,n]});
+    const B=builder.input("B",{dataType:"float32",shape:[n,n]});
     const C=builder.gemm(A,B);
     const graph=await builder.build({C});
     const {a,b}=tensorExpand(ch.randomData,n);
-    const tA=ctx.createTensor({dataType:"uint8",shape:[n,n],writable:true,readable:false});
-    const tB=ctx.createTensor({dataType:"int8",shape:[n,n],writable:true,readable:false});
-    const tC=ctx.createTensor({dataType:"int32",shape:[n,n],writable:false,readable:true});
+    const af=Float32Array.from(a), bf=Float32Array.from(b);
+    const tA=ctx.createTensor({dataType:"float32",shape:[n,n],writable:true,readable:false});
+    const tB=ctx.createTensor({dataType:"float32",shape:[n,n],writable:true,readable:false});
+    const tC=ctx.createTensor({dataType:"float32",shape:[n,n],writable:false,readable:true});
     const t0=performance.now();
-    ctx.writeTensor(tA,a); ctx.writeTensor(tB,b);
+    ctx.writeTensor(tA,af); ctx.writeTensor(tB,bf);
     ctx.dispatch(graph,{A:tA,B:tB},{C:tC});
     const out=await ctx.readTensor(tC);
-    const c=new Int32Array(out.buffer?out.buffer.slice(out.byteOffset,out.byteOffset+out.byteLength):out);
+    const raw=new Float32Array(out.buffer?out.buffer.slice(out.byteOffset,out.byteOffset+out.byteLength):out);
+    const c=new Int32Array(raw.length);
+    for(let i=0;i<raw.length;i++) c[i]=Math.round(raw[i]);
     // two rows of independent JavaScript GEMM: cheap (0.4% of the work) and
     // the difference between "WebNN worked" and "WebNN returned rubbish"
     for(const row of [0,n>>1]){
@@ -12737,11 +12807,256 @@ function argon2idTag(password, nonce) {
     return tensorInJs(n);
   }
 
+  // ------------------------------------------------------------- tensor-v
+  // The sampled-proof variant. The client computes the same stream as `tensor`
+  // but reads the second matrix as its transpose, so C[i][j] is the dot product
+  // of two contiguous rows. It commits to C in 32-int32 blocks; the server then
+  // picks 96 blocks and one element inside each from a secret, and the client
+  // opens exactly those. The wasm module builds the tree and the witness; the
+  // JavaScript tree below is the no-WebAssembly fallback.
+  const TV_LEAF=new TextEncoder().encode("ANUBIS-TENSOR-VL");
+  const TV_NODE=new TextEncoder().encode("ANUBIS-TENSOR-VN");
+  const TV_CHAL=new TextEncoder().encode("ANUBIS-TENSOR-VC");
+  function tvCat(parts){
+    let n=0; for(const p of parts) n+=p.length;
+    const out=new Uint8Array(n); let at=0;
+    for(const p of parts){ out.set(p,at); at+=p.length; }
+    return out;
+  }
+  function tvChal(rd){ return sha256bytes(tvCat([TV_CHAL,hex2bytes(rd)])); }
+  function tvLeaf(chal,b,bytes){
+    const idx=new Uint8Array(4);
+    new DataView(idx.buffer).setUint32(0,b,true);
+    return sha256bytes(tvCat([TV_LEAF,chal,idx,bytes]));
+  }
+  function tvNode(left,right){ return sha256bytes(tvCat([TV_NODE,left,right])); }
+  function tvTree(c,n){
+    const leaves=n*n/32, chal=tvChal(ch.randomData), levels=[];
+    let cur=[];
+    for(let b=0;b<leaves;b++){
+      const bytes=new Uint8Array(128), v=new DataView(bytes.buffer);
+      for(let j=0;j<32;j++) v.setInt32(4*j,c[b*32+j],true);
+      cur.push(tvLeaf(chal,b,bytes));
+    }
+    levels.push(cur);
+    while(cur.length>1){
+      const next=[];
+      for(let i=0;i<cur.length;i+=2) next.push(tvNode(cur[i],cur[i+1]||cur[i]));
+      levels.push(next); cur=next;
+    }
+    return {levels:levels,root:cur[0],leaves:leaves};
+  }
+  function tvWitnessJS(tree,c,n,blocks,positions){
+    const levels=tree.levels, depth=levels.length-1;
+    const total=16+blocks.length*12+blocks.length*depth*32+blocks.length*128;
+    const out=new Uint8Array(total), dv=new DataView(out.buffer);
+    dv.setUint32(0,0x31565654,true); dv.setUint32(4,n,true);
+    dv.setUint32(8,blocks.length,true); dv.setUint32(12,tree.leaves,true);
+    let at=16;
+    for(let i=0;i<blocks.length;i++){
+      dv.setUint32(at,blocks[i],true); dv.setUint32(at+4,positions[i],true);
+      dv.setUint32(at+8,depth,true); at+=12;
+    }
+    for(let i=0;i<blocks.length;i++){
+      let idx=blocks[i];
+      for(let l=0;l<depth;l++){
+        let sib=idx^1; if(sib>=levels[l].length) sib=idx;
+        out.set(levels[l][sib],at); at+=32; idx>>>=1;
+      }
+    }
+    for(let i=0;i<blocks.length;i++){
+      const bd=new DataView(out.buffer,at,128);
+      for(let j=0;j<32;j++) bd.setInt32(4*j,c[blocks[i]*32+j],true);
+      at+=128;
+    }
+    return tohex(out);
+  }
+  // C[i][j] = sum_k A[i][k] * BT[j][k]: both rows are contiguous, unlike the
+  // i-k-j loop the `tensor` tier uses on B[k][j].
+  function tensorVRows(a,b,c,n,from,to){
+    for(let i=from;i<to;i++){
+      const row=i*n;
+      for(let j=0;j<n;j++){
+        const brow=j*n; let sum=0;
+        for(let k=0;k<n;k++) sum+=a[row+k]*b[brow+k];
+        c[row+j]=sum;
+      }
+    }
+  }
+  // Load the tensor-v wasm kernel and put the challenge where it expects it.
+  // The same instance computes the GEMM and serialises the witness, but it
+  // also exposes tv_solve_from_c(), so a matrix computed by WebNN can reuse
+  // its tree instead of paying for a second GEMM.
+  async function tvWasmLoad(){
+    const bytes=await (await fetch("/.within.website/x/cmd/anubis/api/static/anubis/tensor_pow.wasm?v=tv1")).arrayBuffer();
+    const {instance}=await WebAssembly.instantiate(bytes,{});
+    const ex=instance.exports;
+    const raw=hex2bytes(ch.randomData);
+    new Uint8Array(ex.memory.buffer).set(raw,ex.data_ptr());
+    ex.set_data_length(raw.length);
+    return ex;
+  }
+  function tvWasmWitness(ex){
+    return (blocks,positions)=>{
+      const inp=new Uint8Array(ex.memory.buffer,ex.tv_in_ptr(),blocks.length*8);
+      const dv=new DataView(inp.buffer,inp.byteOffset,inp.byteLength);
+      for(let i=0;i<blocks.length;i++){
+        dv.setUint32(i*8,blocks[i]>>>0,true);
+        dv.setUint32(i*8+4,positions[i]>>>0,true);
+      }
+      const len=ex.tv_make_witness(diff,blocks.length)>>>0;
+      if(!len) throw new Error("tv_make_witness failed");
+      return tohex(new Uint8Array(ex.memory.buffer,ex.tv_wit_ptr(),len));
+    };
+  }
+  // WebNN: a single gemm, C = A * BT. The stream already stores the second
+  // matrix transposed, so gemm(A, B, {bTranspose:true}) is exactly what we
+  // need; backends without bTranspose get an explicit transpose. The spec's
+  // gemm() is float32/float16 only, so the int8 matrices are widened; every
+  // partial sum is an integer below 2^24, which float32 represents exactly.
+  // Support varies by browser, and the result is not trusted: two rows are
+  // recomputed in JavaScript and compared before the matrix is handed to the
+  // tree.
+  async function tensorVWebNN(n){
+    const ml=navigator.ml;
+    if(!ml||typeof ml.createContext!=="function") return null;
+    say("asking WebNN for a tensor-v GEMM");
+    const ctx=await ml.createContext({deviceType:"gpu"});
+    const {a,b}=tensorExpand(ch.randomData,n);
+    const af=Float32Array.from(a);
+    let data=Float32Array.from(b), graph;
+    const build=(operand,opts)=>{
+      const builder=new MLGraphBuilder(ctx);
+      const A=builder.input("A",{dataType:"float32",shape:[n,n]});
+      const B=builder.input("B",{dataType:"float32",shape:[n,n]});
+      const C=builder.gemm(A,B,opts);
+      return builder.build({C});
+    };
+    try{
+      graph=await build(data,{bTranspose:true});
+    }catch(e){
+      console.warn("WebNN bTranspose unavailable, transposing B:",e);
+      const bt=new Float32Array(n*n);
+      for(let j=0;j<n;j++) for(let k=0;k<n;k++) bt[k*n+j]=data[j*n+k];
+      data=bt;
+      graph=await build(data);
+    }
+    const tA=ctx.createTensor({dataType:"float32",shape:[n,n],writable:true,readable:false});
+    const tB=ctx.createTensor({dataType:"float32",shape:[n,n],writable:true,readable:false});
+    const tC=ctx.createTensor({dataType:"float32",shape:[n,n],writable:false,readable:true});
+    const t0=performance.now();
+    ctx.writeTensor(tA,af); ctx.writeTensor(tB,data);
+    await ctx.dispatch(graph,{A:tA,B:tB},{C:tC});
+    const out=await ctx.readTensor(tC);
+    const raw=new Float32Array(out.buffer?out.buffer.slice(out.byteOffset,out.byteOffset+out.byteLength):out);
+    const c=new Int32Array(raw.length);
+    for(let i=0;i<raw.length;i++) c[i]=Math.round(raw[i]);
+    // Two rows of independent JavaScript GEMM: cheap (0.4% of the work) and
+    // the difference between "WebNN worked" and "WebNN returned rubbish".
+    for(const row of [0,n>>1]){
+      const want=new Int32Array(n);
+      tensorVRows(a,b,want,n,row,row+1);
+      for(let j=0;j<n;j++){
+        if(c[row*n+j]!==want[j]) throw new Error("WebNN row "+row+" column "+j+
+          ": "+c[row*n+j]+" != "+want[j]);
+      }
+    }
+    return {c:c,ms:performance.now()-t0};
+  }
+  async function solveTensorV(){
+    const n=tenN();
+    let root=null, makeWit=null, ms=0;
+    let ex=null, cnn=null, nnMs=0;
+    // WebNN first: the point of the tier is the GEMM on a GPU or an NPU.
+    if(!forcedJs && typeof navigator!=="undefined" && navigator.ml){
+      try{
+        const r=await tensorVWebNN(n);
+        if(r){ cnn=r.c; nnMs=r.ms; }
+      }catch(e){ console.warn("tensor-v WebNN path failed, trying wasm:",e); }
+    }
+    if(!forcedJs && typeof WebAssembly==="object"){
+      try{ ex=await tvWasmLoad(); }
+      catch(e){ console.warn("tensor-v wasm kernel unavailable:",e); }
+    }
+    if(cnn && ex){
+      try{
+        say("building the tensor-v tree from the WebNN matrix (wasm)");
+        new Int32Array(ex.memory.buffer,ex.c_ptr(),n*n).set(cnn);
+        const t0=performance.now();
+        if((ex.tv_solve_from_c(n)>>>0)!==0) throw new Error("tv_solve_from_c rejected the matrix");
+        ms=nnMs+performance.now()-t0;
+        root=tohex(new Uint8Array(ex.memory.buffer,ex.tv_root_ptr(),32));
+        makeWit=tvWasmWitness(ex);
+        say("tensor-v: WebNN GEMM + wasm tree in "+ms.toFixed(0)+" ms");
+      }catch(e){ console.warn("tensor-v wasm tree failed, using the JS tree:",e); root=null; }
+    }
+    if(!root && cnn){
+      say("building the tensor-v tree in JavaScript");
+      const t0=performance.now();
+      const tree=tvTree(cnn,n);
+      ms=nnMs+performance.now()-t0;
+      root=tohex(tree.root);
+      makeWit=(blocks,positions)=>tvWitnessJS(tree,cnn,n,blocks,positions);
+      say("tensor-v: WebNN GEMM + JavaScript tree in "+ms.toFixed(0)+" ms");
+    }
+    if(!root && ex){
+      try{
+        say("computing the tensor-v commitment (wasm)");
+        const t0=performance.now();
+        if((ex.tv_solve(diff)>>>0)!==0) throw new Error("tv_solve rejected the challenge");
+        ms=performance.now()-t0;
+        root=tohex(new Uint8Array(ex.memory.buffer,ex.tv_root_ptr(),32));
+        makeWit=tvWasmWitness(ex);
+        say("tensor-v commitment in "+ms.toFixed(0)+" ms (wasm)");
+      }catch(e){ console.warn("tensor-v wasm path failed, using JavaScript:",e); root=null; }
+    }
+    if(!root){
+      const {a,b}=tensorExpand(ch.randomData,n);
+      const c=new Int32Array(n*n);
+      const t0=performance.now(), rows=Math.max(1,n>>4), macs=n*n*n;
+      workShow("tensor-v: "+n+"x"+n+"x"+n+" int8 GEMM ("+
+               (macs/1e9).toFixed(1)+" GMAC, "+rows+" row blocks)");
+      for(let s=0;s<rows;s++){
+        tensorVRows(a,b,c,n,Math.floor(n*s/rows),Math.floor(n*(s+1)/rows));
+        workUpdate((s+1)/rows,macs*(s+1)/rows,performance.now()-t0,macs,"MAC");
+        await new Promise(r=>setTimeout(r,0));
+      }
+      say("building the commitment tree");
+      const tree=tvTree(c,n);
+      workDone();
+      ms=performance.now()-t0;
+      root=tohex(tree.root);
+      makeWit=(blocks,positions)=>tvWitnessJS(tree,c,n,blocks,positions);
+    }
+    const su=new URL("/.within.website/x/cmd/anubis/api/pass-challenge",location.origin);
+    su.searchParams.set("id",ch.id);
+    su.searchParams.set("response",root);
+    su.searchParams.set("nonce","0");
+    const sr=await fetch(su.toString(),{credentials:"include"});
+    if(!sr.ok) throw new Error("commit response "+sr.status+": "+await sr.text());
+    const sample=await sr.json();
+    if(!sample||!sample.audit||!sample.audit.blocks) throw new Error("no audit in the response");
+    const audit=makeWit(sample.audit.blocks,sample.audit.positions);
+    const body=JSON.stringify({id:ch.id,root:root,audit:audit,
+                               redir:location.pathname+location.search});
+    const ar=await fetch("/.within.website/x/cmd/anubis/api/audit-tensor",{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      credentials:"include",body:body});
+    const j=await ar.json().catch(()=>({}));
+    if(!ar.ok||!j.ok) throw new Error("audit rejected: "+(j.error||ar.status));
+    say("tensor-v passed in "+ms.toFixed(0)+" ms");
+    location.replace(j.redir||location.pathname);
+  }
+
   const shaAlgo=algo==="sha256"||algo==="wasm-sha256";
   // A URL ending in #pure-js asks for the JavaScript solvers explicitly; they
   // are also the automatic fallback when WebAssembly is not available at all.
   const forcedJs=location.hash.toLowerCase().replace(/^#\/?/,"")==="pure-js";
   const noWasm=forcedJs || typeof WebAssembly!=="object";
+  if(algo==="tensor-v"){
+    solveTensorV().catch(e=>say("tensor-v solver failed: "+e));
+    return;
+  }
   if(algo==="tensor"){
     solveTensor().then(r=>{ if(r) pass(r.hash,0,r.ms); })
                  .catch(e=>say("tensor solver failed: "+e));
@@ -13091,8 +13406,8 @@ static const char *policy_digest(void) { return policy_digest_value; }
  * the thing this project is avoiding.
  */
 static const char *const known_algorithms[] = {"fast", "slow", "sha256", "wasm-sha256",
-                                              "argon2id", "hashx", "tensor", "metarefresh",
-                                              "preact", NULL};
+                                              "argon2id", "hashx", "tensor", "tensor-v",
+                                              "metarefresh", "preact", NULL};
 
 static int algorithm_known(const char *name) {
     for (int i = 0; known_algorithms[i]; i++)
@@ -15265,6 +15580,67 @@ static void handle_parsed(conn *c, request *req_in, const char *peer_ip) {
                 goto done;
             }
 
+            /* tensor-v step 1: the client has committed to C and asks which
+             * blocks to open. Nothing is consumed here; the audit endpoint
+             * spends the challenge. The sample depends on a server secret, so
+             * the client cannot know it before it commits the root. */
+            if (!strcasecmp(algorithm, "tensor-v")) {
+                char tv_rd[65] = "";
+                int tv_d = cfg.difficulty;
+                int tv_have = 0;
+                if (cfg.stateful) {
+                    ch_entry pe;
+                    if (ch_peek_entry(id, &pe) == 1) {
+                        snprintf(tv_rd, sizeof tv_rd, "%s", pe.rd);
+                        tv_d = pe.difficulty;
+                        tv_have = pe.algorithm[0] &&
+                                  !strcasecmp(pe.algorithm, "tensor-v");
+                    }
+                } else if (have_challenge) {
+                    snprintf(tv_rd, sizeof tv_rd, "%s", rd_hex);
+                    tv_have = 1;
+                }
+                if (!tv_have) {
+                    logmsg("rejecting: tensor-v id %s is not a challenge we issued", id);
+                    __atomic_fetch_add(&m_failed, 1, __ATOMIC_RELAXED);
+                    const char *msg = "betterAnusbis: that is not a tensor-v challenge\n";
+                    respond(c, 403, "Forbidden", NULL, NULL, msg, strlen(msg));
+                } else if (!looks_like_digest(response)) {
+                    __atomic_fetch_add(&m_failed, 1, __ATOMIC_RELAXED);
+                    const char *msg = "betterAnusbis: tensor-v wants a 64-hex root\n";
+                    respond(c, 400, "Bad Request", NULL, NULL, msg, strlen(msg));
+                } else {
+                    uint32_t blocks[TENSOR_V_K], positions[TENSOR_V_K];
+                    char secret[65];
+                    char body[4096];
+                    size_t off = 0;
+                    int i;
+
+                    tensor_v_secret(secret);
+                    if (anubis_tensor_v_sample(tv_rd, tv_d, response, secret, TENSOR_V_K,
+                                               blocks, positions) != ANUBIS_OK) {
+                        respond(c, 500, "Internal Server Error", NULL, NULL, "sample\n", 7);
+                        goto done;
+                    }
+                    off += (size_t)snprintf(body + off, sizeof body - off,
+                                            "{\"audit\":{\"count\":%d,\"blocks\":[",
+                                            TENSOR_V_K);
+                    for (i = 0; i < TENSOR_V_K; i++) {
+                        off += (size_t)snprintf(body + off, sizeof body - off,
+                                                "%s%u", i ? "," : "", blocks[i]);
+                    }
+                    off += (size_t)snprintf(body + off, sizeof body - off,
+                                            "],\"positions\":[");
+                    for (i = 0; i < TENSOR_V_K; i++) {
+                        off += (size_t)snprintf(body + off, sizeof body - off,
+                                                "%s%u", i ? "," : "", positions[i]);
+                    }
+                    off += (size_t)snprintf(body + off, sizeof body - off, "]}}\n");
+                    respond(c, 200, "OK", "application/json", NULL, body, off);
+                }
+                goto done;
+            }
+
             if (cfg.stateful) {
                 char stored[65], taken_algo[24] = "";
                 int stored_difficulty = 0;
@@ -15339,6 +15715,138 @@ static void handle_parsed(conn *c, request *req_in, const char *peer_ip) {
                     logmsg("challenge passed (nonce %llu, %s, difficulty %d)", nonce,
                            algorithm, used_difficulty);
                 }
+            }
+        }
+    } else if (!strcmp(route, API_PREFIX "audit-tensor")) {
+        /* tensor-v step 2: the client opens the blocks the step-1 sample
+         * asked for. The sample is re-derived from the root, so this endpoint
+         * is stateless; the witness is checked against it before any dot
+         * product runs, which is what stops a client from choosing its own
+         * blocks. */
+        __atomic_fetch_add(&m_requests[M_API], 1, __ATOMIC_RELAXED);
+        char id[1024], root[128], redir[2048];
+        const char *audit = NULL;
+        size_t audit_len = 0;
+        if (strcmp(req.method, "POST") != 0 || req.body == NULL ||
+            req.body_len == 0) {
+            const char *msg = "betterAnusbis: audit-tensor wants a JSON POST\n";
+            respond(c, 405, "Method Not Allowed", NULL, NULL, msg, strlen(msg));
+            goto done;
+        }
+        if (!json_get_str(req.body, "id", id, sizeof id) ||
+            !json_get_str(req.body, "root", root, sizeof root) ||
+            !json_raw_span(req.body, "audit", &audit, &audit_len) ||
+            audit_len == 0 || (audit_len & 1) || audit_len > (1u << 20)) {
+            const char *msg = "betterAnusbis: audit-tensor needs id, root and audit\n";
+            respond(c, 400, "Bad Request", NULL, NULL, msg, strlen(msg));
+            goto done;
+        }
+        if (!json_get_str(req.body, "redir", redir, sizeof redir)) redir[0] = 0;
+
+        char rd[65] = "";
+        char algo[24] = "";
+        int tv_d = cfg.difficulty;
+        int tv_ok = 0;
+        if (cfg.stateful) {
+            int rc = ch_take(id, rd, sizeof rd, &tv_d, algo, sizeof algo);
+            if (rc == 1) {
+                tv_ok = 1;
+            } else if (rc == -2) {
+                logmsg("rejecting: tensor-v challenge %s was already spent", id);
+            } else if (rc == -1) {
+                logmsg("rejecting: tensor-v challenge %s expired", id);
+            } else {
+                logmsg("rejecting: tensor-v id %s is not a challenge we issued", id);
+            }
+        } else {
+            char *dot = strrchr(id, '.');
+            if (dot) {
+                size_t n = (size_t)(dot - id);
+                if (n > 0 && n < sizeof rd) {
+                    memcpy(rd, id, n);
+                    rd[n] = 0;
+                    long long issued_at = atoll(dot + 1);
+                    if (strlen(rd) % 2 == 0 && strlen(rd) >= 2 &&
+                        issued_at && time(NULL) - issued_at <= COOKIE_TTL) {
+                        tv_ok = 1;
+                    }
+                }
+            }
+            snprintf(algo, sizeof algo, "%s", cfg.algorithm);
+        }
+
+        if (!tv_ok || strcasecmp(algo, "tensor-v") != 0) {
+            __atomic_fetch_add(&m_failed, 1, __ATOMIC_RELAXED);
+            const char *msg = "betterAnusbis: that is not a live tensor-v challenge\n";
+            respond(c, 403, "Forbidden", NULL, NULL, msg, strlen(msg));
+            goto done;
+        }
+
+        {
+            uint32_t blocks[TENSOR_V_K], positions[TENSOR_V_K];
+            char secret[65];
+            char err[256] = "";
+            char *audit_hex = malloc(audit_len + 1);
+
+            if (audit_hex == NULL) {
+                respond(c, 500, "Internal Server Error", NULL, NULL, "oom\n", 4);
+                goto done;
+            }
+            memcpy(audit_hex, audit, audit_len);
+            audit_hex[audit_len] = 0;
+
+            tensor_v_secret(secret);
+            if (anubis_tensor_v_sample(rd, tv_d, root, secret, TENSOR_V_K, blocks,
+                                       positions) != ANUBIS_OK) {
+                free(audit_hex);
+                const char *msg = "betterAnusbis: cannot derive the tensor-v sample\n";
+                respond(c, 500, "Internal Server Error", NULL, NULL, msg, strlen(msg));
+                goto done;
+            }
+            if (anubis_tensor_v_check_sample(audit_hex, blocks, positions,
+                                             TENSOR_V_K) != ANUBIS_OK) {
+                free(audit_hex);
+                logmsg("rejecting: tensor-v witness is not for this sample");
+                __atomic_fetch_add(&m_failed, 1, __ATOMIC_RELAXED);
+                const char *msg = "betterAnusbis: the witness does not answer this sample\n";
+                respond(c, 403, "Forbidden", NULL, NULL, msg, strlen(msg));
+                goto done;
+            }
+            if (anubis_tensor_v_verify(rd, tv_d, root, audit_hex, err,
+                                       sizeof err) != ANUBIS_OK) {
+                free(audit_hex);
+                logmsg("rejecting: tensor-v witness failed: %s", err);
+                __atomic_fetch_add(&m_failed, 1, __ATOMIC_RELAXED);
+                const char *msg = "betterAnusbis: that tensor-v witness did not verify\n";
+                respond(c, 403, "Forbidden", NULL, NULL, msg, strlen(msg));
+                goto done;
+            }
+            free(audit_hex);
+
+            {
+                char token[2048];
+                char redir_safe[2048];
+                const char *go = safe_redirect(&req, redir, redir_safe,
+                                               sizeof redir_safe);
+                char esc[4096];
+                char jbody[4352];
+                char attrs[512];
+                char extra[4096];
+                if (sign_token(token, sizeof token, id, bind_to, "tensor-v", tv_d) != 0) {
+                    respond(c, 500, "Internal Server Error", NULL, NULL, "cannot sign\n", 13);
+                    goto done;
+                }
+                cookie_attrs(attrs, sizeof attrs,
+                             cfg.cookie_ttl > 0 ? cfg.cookie_ttl : -1);
+                snprintf(extra, sizeof extra,
+                         "Set-Cookie: %s=%s%s\r\n"
+                         "Set-Cookie: %s=; Path=/; Max-Age=0\r\n",
+                         cfg.cookie_name, token, attrs, cfg.verify_name);
+                json_escape_into(go, esc, sizeof esc);
+                snprintf(jbody, sizeof jbody, "{\"ok\":true,\"redir\":\"%s\"}\n", esc);
+                respond(c, 200, "OK", "application/json", extra, jbody, strlen(jbody));
+                __atomic_fetch_add(&m_validated, 1, __ATOMIC_RELAXED);
+                logmsg("tensor-v passed (%d samples, difficulty %d)", TENSOR_V_K, tv_d);
             }
         }
     } else if (!strncmp(route, API_PREFIX "honeypot/",
@@ -18436,7 +18944,7 @@ static void usage(FILE *out) {
         "  --strip-base-prefix    strip it again before the target sees the request\n"
         "\n"
         "the challenge\n"
-        "  --algorithm NAME       fast, slow, sha256, argon2id, hashx, tensor, metarefresh\n"
+        "  --algorithm NAME       fast, slow, sha256, argon2id, hashx, tensor, tensor-v, metarefresh\n"
         "                         or preact\n"
         "                         (default sha256)\n"
         "  --difficulty N         difficulty; bits for sha256/argon2id/hashx,\n"

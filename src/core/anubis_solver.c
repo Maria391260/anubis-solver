@@ -2575,6 +2575,706 @@ int anubis_verify_tensor(const char *challenge_hex, uint32_t nonce, int difficul
     return anubis_tensor_digest(challenge_hex, difficulty, out_hex);
 }
 
+/* ------------------------------------------------------------------ */
+/* Public API: tensor-v, the sampled-proof tensor tier                 */
+/* ------------------------------------------------------------------ */
+/*
+ * `tensor` asks the server to recompute the whole GEMM, so the cost is 1:1.
+ * `tensor-v` keeps the client's work at one GEMM but makes the server check
+ * only a random sample of committed output elements:
+ *
+ *   N          = 64 * clamp(difficulty, 2, 16)          (same as tensor)
+ *   seed       = SHA256(raw challenge bytes)
+ *   stream     = SHA256(seed || u32le(counter)) for counter = 0, 1, ...
+ *   A[i][k]    = stream[i*N + k] & 0x7f                 uint8,  row-major
+ *   BT[j][k]   = int8(stream[N*N + j*N + k])            int8,   row-major
+ *   C[i][j]    = sum_k A[i][k] * BT[j][k]               exact int32
+ *
+ * BT is the transpose of the `tensor` tier's B, which makes one column of B
+ * one contiguous row here: a verifier that only needs C[i][j] hashes N/32
+ * stream blocks, not the whole matrix.
+ *
+ * The client commits to C in blocks of 32 int32 values:
+ *
+ *   chal  = SHA256("ANUBIS-TENSOR-VC" || raw)
+ *   leaf  = SHA256("ANUBIS-TENSOR-VL" || chal || u32le(block) || block bytes)
+ *   node  = SHA256("ANUBIS-TENSOR-VN" || left || right)   (odd last duplicated)
+ *   root  = the top node
+ *
+ * The server samples k block indices and one element inside each from
+ * SHA256("ANUBIS-TENSOR-VS" || secret || challenge || root). The client sends
+ * the sampled blocks with Merkle proofs; the server hashes them up to the
+ * root and recomputes only those elements, O(k*N) work against the client's
+ * N^3. A client that computed a fraction f of the elements passes with
+ * probability f^k, so k is the security parameter.
+ *
+ * Nothing here changes the `tensor` tier: same challenge bytes, same A, and
+ * the same deterministic integer arithmetic. Only the proof is different.
+ */
+
+#define TV_BLOCK 32
+#define TV_MAGIC 0x31565654u   /* "TVV1" little-endian */
+#define TV_MAX_DEPTH 32
+#define TV_MAX_SAMPLES 1024
+
+static const uint8_t tv_dom_leaf[16] = {
+    'A', 'N', 'U', 'B', 'I', 'S', '-', 'T',
+    'E', 'N', 'S', 'O', 'R', '-', 'V', 'L'};
+static const uint8_t tv_dom_node[16] = {
+    'A', 'N', 'U', 'B', 'I', 'S', '-', 'T',
+    'E', 'N', 'S', 'O', 'R', '-', 'V', 'N'};
+static const uint8_t tv_dom_chal[16] = {
+    'A', 'N', 'U', 'B', 'I', 'S', '-', 'T',
+    'E', 'N', 'S', 'O', 'R', '-', 'V', 'C'};
+static const uint8_t tv_dom_samp[16] = {
+    'A', 'N', 'U', 'B', 'I', 'S', '-', 'T',
+    'E', 'N', 'S', 'O', 'R', '-', 'V', 'S'};
+
+static void tv_put_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static uint32_t tv_get_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+/* Bytes [off, off+len) of the counter-mode stream. Random access is O(len/32)
+ * hashes because the counter is part of the message. */
+static void tv_stream_bytes(const uint8_t seed[32], size_t off, size_t len,
+                            uint8_t *out) {
+    while (len > 0) {
+        uint8_t block[32];
+        uint8_t ctr[4];
+        sha256_ctx c;
+        size_t start = off % 32;
+        size_t take = 32 - start;
+
+        if (take > len) {
+            take = len;
+        }
+        tv_put_u32(ctr, (uint32_t)(off / 32));
+        sha256_init(&c);
+        sha256_update(&c, seed, 32);
+        sha256_update(&c, ctr, sizeof ctr);
+        sha256_final(&c, block);
+        memcpy(out, block + start, take);
+        out += take;
+        off += take;
+        len -= take;
+    }
+}
+
+/* Fill A and BT from the stream, sequentially. */
+static void tv_expand(const uint8_t seed[32], uint8_t *a, int8_t *bt,
+                      size_t cells) {
+    size_t pos = 0;
+    uint32_t counter = 0;
+    sha256_ctx base;
+
+    sha256_init(&base);
+    sha256_update(&base, seed, 32);
+    while (pos < 2 * cells) {
+        uint8_t block[32];
+        uint8_t ctr[4];
+        sha256_ctx c;
+        size_t i;
+
+        tv_put_u32(ctr, counter);
+        c = base;
+        sha256_update(&c, ctr, sizeof ctr);
+        sha256_final(&c, block);
+        for (i = 0; i < 32 && pos < 2 * cells; i++, pos++) {
+            if (pos < cells) {
+                a[pos] = (uint8_t)(block[i] & 0x7f);
+            } else {
+                bt[pos - cells] = (int8_t)block[i];
+            }
+        }
+        counter++;
+    }
+}
+
+typedef struct {
+    const uint8_t *a;
+    const int8_t *bt;
+    int32_t *c;
+    int n;
+    int begin;
+    int end;
+} tv_job;
+
+/* i-j-k dot products: A row i and BT row j are both contiguous. */
+static void tv_gemm_rows(const tv_job *job) {
+    const int n = job->n;
+    int i;
+
+    for (i = job->begin; i < job->end; i++) {
+        const uint8_t *arow = job->a + (size_t)i * (size_t)n;
+        int32_t *crow = job->c + (size_t)i * (size_t)n;
+        int j;
+
+        for (j = 0; j < n; j++) {
+            const int8_t *brow = job->bt + (size_t)j * (size_t)n;
+            int32_t sum = 0;
+            int k;
+
+            for (k = 0; k < n; k++) {
+                sum += (int32_t)arow[k] * (int32_t)brow[k];
+            }
+            crow[j] = sum;
+        }
+    }
+}
+
+static void *tv_gemm_thread(void *p) {
+    tv_gemm_rows((const tv_job *)p);
+    return NULL;
+}
+
+static void tv_gemm(const uint8_t *a, const int8_t *bt, int32_t *c, int n) {
+    tv_job jobs[16];
+    pthread_t tids[16];
+    int threads = anubis_default_threads();
+    int started = 0;
+    int t;
+
+    if (threads > n / 32) threads = n / 32;
+    if (threads > 16) threads = 16;
+    if (threads < 1) threads = 1;
+
+    for (t = 0; t < threads; t++) {
+        jobs[t].a = a;
+        jobs[t].bt = bt;
+        jobs[t].c = c;
+        jobs[t].n = n;
+        jobs[t].begin = n * t / threads;
+        jobs[t].end = n * (t + 1) / threads;
+    }
+    if (threads == 1) {
+        tv_gemm_rows(&jobs[0]);
+        return;
+    }
+    for (t = 0; t < threads; t++) {
+        if (pthread_create(&tids[t], NULL, tv_gemm_thread, &jobs[t]) != 0) break;
+        started++;
+    }
+    for (t = started; t < threads; t++) tv_gemm_rows(&jobs[t]);
+    for (t = 0; t < started; t++) pthread_join(tids[t], NULL);
+}
+
+static void tv_leaf(const uint8_t chal[32], uint32_t block,
+                    const uint8_t bytes[TV_BLOCK * 4], uint8_t out[32]) {
+    sha256_ctx c;
+    uint8_t idx[4];
+
+    tv_put_u32(idx, block);
+    sha256_init(&c);
+    sha256_update(&c, tv_dom_leaf, sizeof tv_dom_leaf);
+    sha256_update(&c, chal, 32);
+    sha256_update(&c, idx, sizeof idx);
+    sha256_update(&c, bytes, TV_BLOCK * 4);
+    sha256_final(&c, out);
+}
+
+static void tv_node(const uint8_t left[32], const uint8_t right[32],
+                    uint8_t out[32]) {
+    sha256_ctx c;
+
+    sha256_init(&c);
+    sha256_update(&c, tv_dom_node, sizeof tv_dom_node);
+    sha256_update(&c, left, 32);
+    sha256_update(&c, right, 32);
+    sha256_final(&c, out);
+}
+
+typedef struct {
+    int n;
+    size_t cells;
+    size_t leaves;
+    int levels;
+    size_t off[TV_MAX_DEPTH];
+    size_t cnt[TV_MAX_DEPTH];
+    uint8_t *tree;
+    uint8_t *chal;
+    int32_t *c;
+} tv_tree;
+
+static void tv_tree_free(tv_tree *t) {
+    if (t == NULL) return;
+    free(t->tree);
+    free(t->chal);
+    free(t->c);
+    memset(t, 0, sizeof *t);
+}
+
+/* Build C and its Merkle tree. The client needs `c` only to serialize the
+ * sampled blocks; the server builds the same leaves from the witness. */
+static int tv_tree_build(const char *challenge_hex, int difficulty, tv_tree *t) {
+    uint8_t raw[4096];
+    size_t raw_len = 0;
+    uint8_t seed[32];
+    uint8_t *a = NULL;
+    int8_t *bt = NULL;
+    size_t cells, total = 0;
+    int n, l, i;
+    sha256_ctx sc;
+    uint8_t block[TV_BLOCK * 4];
+
+    memset(t, 0, sizeof *t);
+    if (challenge_hex == NULL || difficulty < 0) return ANUBIS_ERR_ARG;
+    if (hex_decode(challenge_hex, raw, sizeof raw, &raw_len) != ANUBIS_OK) {
+        return ANUBIS_ERR_ARG;
+    }
+
+    n = tensor_dim(difficulty);
+    cells = (size_t)n * (size_t)n;
+    if (cells % TV_BLOCK != 0) return ANUBIS_ERR_INTERNAL;
+
+    t->n = n;
+    t->cells = cells;
+    t->leaves = cells / TV_BLOCK;
+    t->chal = malloc(32);
+    t->c = malloc(cells * sizeof *t->c);
+    a = malloc(cells);
+    bt = malloc(cells);
+    if (t->chal == NULL || t->c == NULL || a == NULL || bt == NULL) {
+        free(a);
+        free(bt);
+        tv_tree_free(t);
+        return ANUBIS_ERR_INTERNAL;
+    }
+
+    sha256_init(&sc);
+    sha256_update(&sc, raw, raw_len);
+    sha256_final(&sc, seed);
+
+    sha256_init(&sc);
+    sha256_update(&sc, tv_dom_chal, sizeof tv_dom_chal);
+    sha256_update(&sc, raw, raw_len);
+    sha256_final(&sc, t->chal);
+
+    tv_expand(seed, a, bt, cells);
+    tv_gemm(a, bt, t->c, n);
+    free(a);
+    free(bt);
+
+    /* levels: leaves, then ceil(n/2), ... until one node */
+    t->levels = 0;
+    t->cnt[0] = t->leaves;
+    total = t->leaves;
+    while (t->cnt[t->levels] > 1) {
+        t->levels++;
+        if (t->levels >= TV_MAX_DEPTH) {
+            tv_tree_free(t);
+            return ANUBIS_ERR_INTERNAL;
+        }
+        t->cnt[t->levels] = (t->cnt[t->levels - 1] + 1) / 2;
+        total += t->cnt[t->levels];
+    }
+    t->levels++; /* number of levels, including the root level */
+    t->off[0] = 0;
+    for (l = 1; l < t->levels; l++) {
+        t->off[l] = t->off[l - 1] + t->cnt[l - 1];
+    }
+    t->tree = malloc(total * 32);
+    if (t->tree == NULL) {
+        tv_tree_free(t);
+        return ANUBIS_ERR_INTERNAL;
+    }
+
+    for (i = 0; i < (int)t->leaves; i++) {
+        size_t e = (size_t)i * TV_BLOCK;
+        size_t j;
+
+        for (j = 0; j < TV_BLOCK; j++) {
+            tv_put_u32(block + 4 * j, (uint32_t)t->c[e + j]);
+        }
+        tv_leaf(t->chal, (uint32_t)i, block,
+                t->tree + (t->off[0] + (size_t)i) * 32);
+    }
+    for (l = 1; l < t->levels; l++) {
+        size_t count = t->cnt[l];
+        size_t prev = t->cnt[l - 1];
+        size_t j;
+
+        for (j = 0; j < count; j++) {
+            const uint8_t *left = t->tree + (t->off[l - 1] + 2 * j) * 32;
+            const uint8_t *right = (2 * j + 1 < prev)
+                                       ? t->tree + (t->off[l - 1] + 2 * j + 1) * 32
+                                       : left;
+            tv_node(left, right, t->tree + (t->off[l] + j) * 32);
+        }
+    }
+    return ANUBIS_OK;
+}
+
+/* Write the sibling path for `block` (levels-1 hashes, level 0 first). */
+static void tv_proof(const tv_tree *t, uint32_t block, uint8_t *out) {
+    int l;
+
+    for (l = 0; l + 1 < t->levels; l++) {
+        size_t idx = (size_t)block >> l;
+        size_t sib = idx ^ 1;
+        const uint8_t *node;
+
+        if (sib >= t->cnt[l]) sib = idx; /* duplicated last node */
+        node = t->tree + (t->off[l] + sib) * 32;
+        memcpy(out + (size_t)l * 32, node, 32);
+    }
+}
+
+static int tv_seed_and_chal(const char *challenge_hex, uint8_t seed[32],
+                            uint8_t chal[32], uint8_t raw[4096], size_t *raw_len) {
+    sha256_ctx c;
+
+    if (hex_decode(challenge_hex, raw, 4096, raw_len) != ANUBIS_OK) {
+        return ANUBIS_ERR_ARG;
+    }
+    sha256_init(&c);
+    sha256_update(&c, raw, *raw_len);
+    sha256_final(&c, seed);
+    sha256_init(&c);
+    sha256_update(&c, tv_dom_chal, sizeof tv_dom_chal);
+    sha256_update(&c, raw, *raw_len);
+    sha256_final(&c, chal);
+    return ANUBIS_OK;
+}
+
+ANUBIS_EXPORT
+int anubis_tensor_v_root(const char *challenge_hex, int difficulty, char *root_hex) {
+    tv_tree t;
+    int rc;
+
+    if (root_hex == NULL) return ANUBIS_ERR_ARG;
+    rc = tv_tree_build(challenge_hex, difficulty, &t);
+    if (rc != ANUBIS_OK) return rc;
+    to_hex(t.tree + t.off[t.levels - 1] * 32, 32, root_hex);
+    tv_tree_free(&t);
+    return ANUBIS_OK;
+}
+
+/* The verifier's sample. `secret` is server-side and never leaves the box;
+ * `count` blocks and one element position per block are returned. */
+ANUBIS_EXPORT
+int anubis_tensor_v_sample(const char *challenge_hex, int difficulty,
+                           const char *root_hex, const char *secret, int count,
+                           uint32_t *blocks, uint32_t *positions) {
+    uint8_t raw[4096], root[32], material[32], word_block[32];
+    size_t raw_len = 0, root_len = 0;
+    sha256_ctx c;
+    uint32_t words[8];
+    int wi = 8;
+    uint32_t counter = 0;
+    size_t nleaves;
+    int i;
+
+    if (!challenge_hex || !root_hex || !secret || count <= 0 ||
+        count > TV_MAX_SAMPLES || !blocks || !positions) {
+        return ANUBIS_ERR_ARG;
+    }
+    if (hex_decode(root_hex, root, sizeof root, &root_len) != ANUBIS_OK ||
+        root_len != 32) {
+        return ANUBIS_ERR_ARG;
+    }
+    if (hex_decode(challenge_hex, raw, sizeof raw, &raw_len) != ANUBIS_OK) {
+        return ANUBIS_ERR_ARG;
+    }
+    nleaves = ((size_t)tensor_dim(difficulty) * (size_t)tensor_dim(difficulty)) /
+              TV_BLOCK;
+
+    sha256_init(&c);
+    sha256_update(&c, tv_dom_samp, sizeof tv_dom_samp);
+    sha256_update(&c, secret, strlen(secret));
+    sha256_update(&c, raw, raw_len);
+    sha256_update(&c, root, 32);
+    sha256_final(&c, material);
+
+    /* used[] is small: at most TV_MAX_SAMPLES entries, checked linearly. */
+    for (i = 0; i < count; i++) {
+        uint32_t candidate;
+        int tries;
+
+        for (tries = 0; tries < 4096; tries++) {
+            int j, dup = 0;
+
+            if (wi == 8) {
+                uint8_t ctr[4];
+                sha256_ctx wc;
+                tv_put_u32(ctr, counter++);
+                sha256_init(&wc);
+                sha256_update(&wc, material, 32);
+                sha256_update(&wc, ctr, sizeof ctr);
+                sha256_final(&wc, word_block);
+                for (j = 0; j < 8; j++) {
+                    words[j] = tv_get_u32(word_block + 4 * j);
+                }
+                wi = 0;
+            }
+            candidate = words[wi++] % (uint32_t)nleaves;
+            for (j = 0; j < i; j++) {
+                if (blocks[j] == candidate) { dup = 1; break; }
+            }
+            if (!dup) break;
+        }
+        if (tries == 4096) return ANUBIS_ERR_INTERNAL;
+        blocks[i] = candidate;
+        if (wi == 8) {
+            uint8_t ctr[4];
+            sha256_ctx wc;
+            tv_put_u32(ctr, counter++);
+            sha256_init(&wc);
+            sha256_update(&wc, material, 32);
+            sha256_update(&wc, ctr, sizeof ctr);
+            sha256_final(&wc, word_block);
+            {
+                int j;
+                for (j = 0; j < 8; j++) words[j] = tv_get_u32(word_block + 4 * j);
+            }
+            wi = 0;
+        }
+        positions[i] = words[wi++] % TV_BLOCK;
+    }
+    return ANUBIS_OK;
+}
+
+ANUBIS_EXPORT
+int anubis_tensor_v_witness(const char *challenge_hex, int difficulty,
+                            const uint32_t *blocks, const uint32_t *positions,
+                            int count, char *out_hex, size_t out_cap) {
+    tv_tree t;
+    int rc;
+    int i, l;
+    size_t proof_len, blob_len, pos;
+    uint8_t *blob = NULL;
+
+    if (!challenge_hex || !blocks || !positions || count <= 0 ||
+        count > TV_MAX_SAMPLES || !out_hex) {
+        return ANUBIS_ERR_ARG;
+    }
+    rc = tv_tree_build(challenge_hex, difficulty, &t);
+    if (rc != ANUBIS_OK) return rc;
+
+    for (i = 0; i < count; i++) {
+        if (blocks[i] >= t.leaves || positions[i] >= TV_BLOCK) {
+            tv_tree_free(&t);
+            return ANUBIS_ERR_ARG;
+        }
+    }
+    proof_len = (size_t)(t.levels - 1) * 32;
+    blob_len = 16 + (size_t)count * 12 + (size_t)count * proof_len +
+               (size_t)count * TV_BLOCK * 4;
+    if (out_cap < blob_len * 2 + 1) {
+        tv_tree_free(&t);
+        return ANUBIS_ERR_ARG;
+    }
+    blob = malloc(blob_len);
+    if (blob == NULL) {
+        tv_tree_free(&t);
+        return ANUBIS_ERR_INTERNAL;
+    }
+
+    tv_put_u32(blob + 0, TV_MAGIC);
+    tv_put_u32(blob + 4, (uint32_t)t.n);
+    tv_put_u32(blob + 8, (uint32_t)count);
+    tv_put_u32(blob + 12, (uint32_t)t.leaves);
+    pos = 16;
+    for (i = 0; i < count; i++) {
+        tv_put_u32(blob + pos, blocks[i]); pos += 4;
+        tv_put_u32(blob + pos, positions[i]); pos += 4;
+        tv_put_u32(blob + pos, (uint32_t)(t.levels - 1)); pos += 4;
+    }
+    for (i = 0; i < count; i++) {
+        tv_proof(&t, blocks[i], blob + pos);
+        pos += proof_len;
+    }
+    for (i = 0; i < count; i++) {
+        size_t e = (size_t)blocks[i] * TV_BLOCK;
+        for (l = 0; l < TV_BLOCK; l++) {
+            tv_put_u32(blob + pos, (uint32_t)t.c[e + l]);
+            pos += 4;
+        }
+    }
+    to_hex(blob, blob_len, out_hex);
+    free(blob);
+    tv_tree_free(&t);
+    return ANUBIS_OK;
+}
+
+/* The verifier must check that the witness answers *its* sample, not a set of
+ * blocks the client chose. This parses only the descriptors. */
+ANUBIS_EXPORT
+int anubis_tensor_v_check_sample(const char *witness_hex,
+                                 const uint32_t *blocks,
+                                 const uint32_t *positions, int count) {
+    uint8_t *w = NULL;
+    size_t wlen;
+    uint32_t magic, nw, wcount;
+    int i, rc = ANUBIS_ERR_ARG;
+
+    if (!witness_hex || !blocks || !positions || count <= 0) return ANUBIS_ERR_ARG;
+    wlen = strlen(witness_hex);
+    if (wlen == 0 || (wlen & 1)) return ANUBIS_ERR_ARG;
+    w = malloc(wlen / 2);
+    if (w == NULL) return ANUBIS_ERR_INTERNAL;
+    if (hex_decode(witness_hex, w, wlen / 2, &wlen) != ANUBIS_OK || wlen < 16) {
+        goto out;
+    }
+    magic = tv_get_u32(w + 0);
+    nw = tv_get_u32(w + 4);
+    wcount = tv_get_u32(w + 8);
+    if (magic != TV_MAGIC || nw == 0 || wcount != (uint32_t)count) goto out;
+    for (i = 0; i < count; i++) {
+        if (tv_get_u32(w + 16 + (size_t)i * 12) != blocks[i] ||
+            tv_get_u32(w + 16 + (size_t)i * 12 + 4) != positions[i]) {
+            goto out;
+        }
+    }
+    rc = ANUBIS_OK;
+out:
+    free(w);
+    return rc;
+}
+
+/* Server side: check the proofs and recompute the sampled elements. The cost
+ * is O(count * N) hashes/MACs, never the whole N^3 product. */
+ANUBIS_EXPORT
+int anubis_tensor_v_verify(const char *challenge_hex, int difficulty,
+                           const char *root_hex, const char *witness_hex,
+                           char *err, size_t err_cap) {
+    uint8_t raw[4096], seed[32], chal[32], root[32];
+    size_t raw_len = 0, root_len = 0, wlen;
+    uint8_t *w = NULL;
+    size_t proof_len;
+    uint32_t magic, nw, count, leaves;
+    int i, l, rc = ANUBIS_ERR_ARG;
+    size_t nleaves;
+    uint8_t arow[4096], brow[4096];
+
+    if (err && err_cap) err[0] = '\0';
+    if (!challenge_hex || !root_hex || !witness_hex) return ANUBIS_ERR_ARG;
+    if (hex_decode(root_hex, root, sizeof root, &root_len) != ANUBIS_OK ||
+        root_len != 32) {
+        if (err) snprintf(err, err_cap, "root is not 32 bytes");
+        return ANUBIS_ERR_ARG;
+    }
+    if (tv_seed_and_chal(challenge_hex, seed, chal, raw, &raw_len) != ANUBIS_OK) {
+        if (err) snprintf(err, err_cap, "challenge is not hex");
+        return ANUBIS_ERR_ARG;
+    }
+    wlen = strlen(witness_hex);
+    if (wlen == 0 || (wlen & 1)) {
+        if (err) snprintf(err, err_cap, "witness is not hex");
+        return ANUBIS_ERR_ARG;
+    }
+    w = malloc(wlen / 2);
+    if (w == NULL) return ANUBIS_ERR_INTERNAL;
+    if (hex_decode(witness_hex, w, wlen / 2, &wlen) != ANUBIS_OK) {
+        if (err) snprintf(err, err_cap, "witness is not hex");
+        goto out;
+    }
+    if (wlen < 16) {
+        if (err) snprintf(err, err_cap, "witness is too short");
+        goto out;
+    }
+    magic = tv_get_u32(w + 0);
+    nw = tv_get_u32(w + 4);
+    count = tv_get_u32(w + 8);
+    leaves = tv_get_u32(w + 12);
+    if (magic != TV_MAGIC || nw != (uint32_t)tensor_dim(difficulty)) {
+        if (err) snprintf(err, err_cap, "witness header mismatch");
+        goto out;
+    }
+    nleaves = ((size_t)nw * (size_t)nw) / TV_BLOCK;
+    if (count == 0 || count > TV_MAX_SAMPLES || leaves != nleaves) {
+        if (err) snprintf(err, err_cap, "witness sample count mismatch");
+        goto out;
+    }
+    {
+        int levels = 0;
+        size_t c = nleaves;
+        while (c > 1) { c = (c + 1) / 2; levels++; }
+        proof_len = (size_t)levels * 32;
+        if (wlen != 16 + (size_t)count * 12 + (size_t)count * proof_len +
+                       (size_t)count * TV_BLOCK * 4) {
+            if (err) snprintf(err, err_cap, "witness length mismatch");
+            goto out;
+        }
+    }
+
+    /* descriptors */
+    for (i = 0; i < (int)count; i++) {
+        uint32_t block = tv_get_u32(w + 16 + (size_t)i * 12);
+        uint32_t depth = tv_get_u32(w + 16 + (size_t)i * 12 + 8);
+        if (block >= nleaves || depth != proof_len / 32) {
+            if (err) snprintf(err, err_cap, "witness descriptor %d is invalid", i);
+            goto out;
+        }
+    }
+
+    {
+        size_t proof_off = 16 + (size_t)count * 12;
+        size_t block_off = proof_off + (size_t)count * proof_len;
+
+        for (i = 0; i < (int)count; i++) {
+            uint32_t block = tv_get_u32(w + 16 + (size_t)i * 12);
+            uint32_t at = tv_get_u32(w + 16 + (size_t)i * 12 + 4);
+            const uint8_t *block_bytes = w + block_off + (size_t)i * TV_BLOCK * 4;
+            uint8_t cur[32];
+            size_t idx = block;
+
+            if (at >= TV_BLOCK) {
+                if (err) snprintf(err, err_cap, "sample %d has a bad position", i);
+                goto out;
+            }
+            tv_leaf(chal, block, block_bytes, cur);
+            for (l = 0; l < (int)(proof_len / 32); l++) {
+                const uint8_t *sib = w + proof_off + (size_t)i * proof_len +
+                                     (size_t)l * 32;
+                uint8_t next[32];
+                if ((idx & 1) != 0) {
+                    tv_node(sib, cur, next);
+                } else {
+                    tv_node(cur, sib, next);
+                }
+                memcpy(cur, next, 32);
+                idx >>= 1;
+            }
+            if (memcmp(cur, root, 32) != 0) {
+                if (err) snprintf(err, err_cap, "sample %d does not match the root", i);
+                goto out;
+            }
+
+            /* Recompute C[block*32+at] from the stream. */
+            {
+                size_t global = (size_t)block * TV_BLOCK + at;
+                size_t row = global / nw;
+                size_t col = global % nw;
+                int32_t want = (int32_t)tv_get_u32(block_bytes + at * 4);
+                int32_t sum = 0;
+                int k;
+
+                tv_stream_bytes(seed, row * nw, nw, arow);
+                tv_stream_bytes(seed, (size_t)nw * nw + col * nw, nw, brow);
+                for (k = 0; k < (int)nw; k++) {
+                    sum += (int32_t)(arow[k] & 0x7f) * (int32_t)(int8_t)brow[k];
+                }
+                if (sum != want) {
+                    if (err) snprintf(err, err_cap, "sample %d element mismatch", i);
+                    goto out;
+                }
+            }
+        }
+    }
+    rc = ANUBIS_OK;
+out:
+    free(w);
+    return rc;
+}
+
 /* CUDA solve for the tensor tier. The GPU produces C; the digest, and unless
  * GPU verification was disabled the comparison that proves the GPU honest,
  * stay on the CPU. That is the same rule the other backends follow: a GPU

@@ -28,6 +28,12 @@
  *   ANUBIS_PTX_DIR    directory holding the cubins (default ".")
  *   ANUBIS_PTX_ILP    1, 2 or 4; selects sha256_opt_ilp<N>.cubin (default 2)
  *   ANUBIS_PTX_CHUNK  nonces per launch per device (default 1<<22)
+ *   ANUBIS_PTX_BLOCK  threads per block (default 256, clamp 32..1024)
+ *   ANUBIS_PTX_IMAD   1 = use sha256_opt_imad_ilp<N>.cubin, the variant that
+ *                     issues its adds on the FMA pipe (default 0)
+ *   ANUBIS_PTX_LOOP   nonce groups per thread, using sha256_opt_loop_ilp<N>
+ *                     (default 1 = one group per thread; fall back to the
+ *                     non-loop cubin if it is missing)
  */
 
 #define _POSIX_C_SOURCE 199309L
@@ -69,6 +75,11 @@ static CUresult (*p_cuLaunchKernel)(CUfunction, unsigned int, unsigned int,
                                     unsigned int, unsigned int, unsigned int,
                                     unsigned int, unsigned int, void *,
                                     void **, void **);
+static CUresult (*p_cuEventCreate)(CUevent *, unsigned int);
+static CUresult (*p_cuEventRecord)(CUevent, CUstream);
+static CUresult (*p_cuEventSynchronize)(CUevent);
+static CUresult (*p_cuEventElapsedTime)(float *, CUevent, CUevent);
+static CUresult (*p_cuEventDestroy_v2)(CUevent);
 
 #define cuInit p_cuInit
 #define cuDeviceGetCount p_cuDeviceGetCount
@@ -85,6 +96,11 @@ static CUresult (*p_cuLaunchKernel)(CUfunction, unsigned int, unsigned int,
 #define cuModuleGetFunction p_cuModuleGetFunction
 #define cuModuleUnload p_cuModuleUnload
 #define cuLaunchKernel p_cuLaunchKernel
+#define cuEventCreate p_cuEventCreate
+#define cuEventRecord p_cuEventRecord
+#define cuEventSynchronize p_cuEventSynchronize
+#define cuEventElapsedTime p_cuEventElapsedTime
+#define cuEventDestroy cuEventDestroy_v2
 
 static int load_libcuda(void)
 {
@@ -112,7 +128,12 @@ static int load_libcuda(void)
         {"cuModuleLoadData", (void **)(void *)&p_cuModuleLoadData},
         {"cuModuleGetFunction", (void **)(void *)&p_cuModuleGetFunction},
         {"cuModuleUnload", (void **)(void *)&p_cuModuleUnload},
-        {"cuLaunchKernel", (void **)(void *)&p_cuLaunchKernel}
+        {"cuLaunchKernel", (void **)(void *)&p_cuLaunchKernel},
+        {"cuEventCreate", (void **)(void *)&p_cuEventCreate},
+        {"cuEventRecord", (void **)(void *)&p_cuEventRecord},
+        {"cuEventSynchronize", (void **)(void *)&p_cuEventSynchronize},
+        {"cuEventElapsedTime", (void **)(void *)&p_cuEventElapsedTime},
+        {"cuEventDestroy_v2", (void **)(void *)&p_cuEventDestroy_v2}
     };
     size_t i, j;
 
@@ -159,13 +180,21 @@ static struct {
     int available;
     int ndev;
     int have_opt;
+    int have_loop;
+    int imad;
     int ilp;
+    int loop;
+    int block;
     pthread_mutex_t mu;
     CUcontext ctx[PTX_MAX_DEV];
     CUmodule mod_pow[PTX_MAX_DEV];
     CUmodule mod_opt[PTX_MAX_DEV];
     CUfunction fn_pow[PTX_MAX_DEV];
     CUfunction fn_opt[PTX_MAX_DEV];
+    CUevent ev0[PTX_MAX_DEV];
+    CUevent ev1[PTX_MAX_DEV];
+    int have_ev;
+    double last_kernel_ms;
     int have_hx;
     CUmodule mod_hx[PTX_MAX_DEV];
     CUfunction fn_hx[PTX_MAX_DEV];
@@ -213,6 +242,20 @@ static int read_file(const char *path, void **out, size_t *size) {
     *out = data;
     *size = (size_t)n;
     return 0;
+}
+
+/* Is <dir>/<name> present? Used to pick the loop cubin before touching a
+ * device, so a build without it behaves exactly like the old loader. */
+static int file_exists(const char *name) {
+    char path[1024];
+    FILE *f;
+    snprintf(path, sizeof(path), "%s/%s", g_ptx.dir, name);
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+    fclose(f);
+    return 1;
 }
 
 /* Load one cubin and resolve its entry point. Returns 0 on success. */
@@ -287,7 +330,53 @@ static int ptx_init(void) {
     if (g_ptx.ilp != 1 && g_ptx.ilp != 2 && g_ptx.ilp != 4) {
         g_ptx.ilp = 2;
     }
-    snprintf(opt_name, sizeof(opt_name), "sha256_opt_ilp%d.cubin", g_ptx.ilp);
+    g_ptx.block = (int)env_u32("ANUBIS_PTX_BLOCK", PTX_BLOCK);
+    if (g_ptx.block < 32) {
+        g_ptx.block = 32;
+    }
+    if (g_ptx.block > 1024) {
+        g_ptx.block = 1024;
+    }
+    g_ptx.block &= ~31;
+    if (g_ptx.block == 0) {
+        g_ptx.block = PTX_BLOCK;
+    }
+    g_ptx.loop = (int)env_u32("ANUBIS_PTX_LOOP", 1);
+    if (g_ptx.loop < 1) {
+        g_ptx.loop = 1;
+    }
+    if (g_ptx.loop > 4096) {
+        g_ptx.loop = 4096;
+    }
+    g_ptx.imad = (int)env_u32("ANUBIS_PTX_IMAD", 0) != 0;
+    if (g_ptx.imad) {
+        char iname[64];
+        snprintf(iname, sizeof(iname), "sha256_opt_imad_ilp%d.cubin", g_ptx.ilp);
+        if (!file_exists(iname)) {
+            /* asked for the FMA-pipe variant but it was never built: fall back
+             * to the plain kernel rather than failing the solve */
+            g_ptx.imad = 0;
+        }
+    }
+    if (g_ptx.imad) {
+        snprintf(opt_name, sizeof(opt_name), "sha256_opt_imad_ilp%d.cubin",
+                 g_ptx.ilp);
+    } else {
+        snprintf(opt_name, sizeof(opt_name), "sha256_opt_ilp%d.cubin", g_ptx.ilp);
+    }
+    if (g_ptx.loop > 1) {
+        char loop_name[64];
+        snprintf(loop_name, sizeof(loop_name), "sha256_opt_loop_ilp%d.cubin",
+                 g_ptx.ilp);
+        if (file_exists(loop_name)) {
+            snprintf(opt_name, sizeof(opt_name), "%s", loop_name);
+            g_ptx.have_loop = 1;
+        } else {
+            /* no loop cubin built: keep the measurement honest and run one
+             * group per thread rather than silently under-covering the range */
+            g_ptx.loop = 1;
+        }
+    }
 
     for (int i = 0; i < count; i++) {
         CUdevice dev;
@@ -321,6 +410,15 @@ static int ptx_init(void) {
                      "device %d: cuMemAlloc failed", i);
             return 0;
         }
+        /* Timing events are optional: without them out_ms still works, it just
+         * includes the host round trip. */
+        if (cuEventCreate(&g_ptx.ev0[i], CU_EVENT_DEFAULT) == CUDA_SUCCESS &&
+            cuEventCreate(&g_ptx.ev1[i], CU_EVENT_DEFAULT) == CUDA_SUCCESS) {
+            g_ptx.have_ev = 1;
+        } else {
+            g_ptx.ev0[i] = NULL;
+            g_ptx.ev1[i] = NULL;
+        }
         /* HashX is optional: a build without hashx_interp.cubin still gives
          * the SHA-256 kernels. */
         if (load_one("hashx_interp.cubin", &g_ptx.mod_hx[i], "hashx_kernel",
@@ -338,8 +436,11 @@ static int ptx_init(void) {
     g_ptx.have_opt = all_opt;
     g_ptx.available = 1;
     snprintf(g_ptx.info, sizeof(g_ptx.info),
-             "PTX cubins: %d device(s), %s, ILP=%d%s", count,
-             all_opt ? "pow+opt" : "pow only", g_ptx.ilp,
+             "PTX cubins: %d device(s), %s, ILP=%d, block=%d, loop=%d%s%s%s",
+             count, all_opt ? "pow+opt" : "pow only", g_ptx.ilp, g_ptx.block,
+             g_ptx.have_loop ? g_ptx.loop : 1,
+             g_ptx.imad ? ", imad-add" : "",
+             g_ptx.have_ev ? ", events" : "",
              have_hx ? ", hashx" : "");
     return 1;
 }
@@ -379,6 +480,7 @@ int anubis_ptx_solve(const uint32_t mid[8], uint32_t prefix_len, int mode,
     uint64_t base = 0;
     uint32_t chunk;
     double t0;
+    double kern_ms = 0.0;
     int rc = 1;
     int use_opt;
 
@@ -390,6 +492,7 @@ int anubis_ptx_solve(const uint32_t mid[8], uint32_t prefix_len, int mode,
     }
     pthread_mutex_lock(&g_ptx.mu);
     t0 = ptx_now();
+    g_ptx.last_kernel_ms = 0.0;
 
     maxn = max_nonce > 0xFFFFFFFFull ? 0xFFFFFFFFull : max_nonce;
     chunk = env_u32("ANUBIS_PTX_CHUNK", 1u << 22);
@@ -415,7 +518,8 @@ int anubis_ptx_solve(const uint32_t mid[8], uint32_t prefix_len, int mode,
             uint32_t m[8];
             uint64_t resptr;
             unsigned blocks;
-            void *args[16];
+            void *args[18];
+            uint32_t one = 1;
 
             if (dev_base > maxn) {
                 break;
@@ -434,6 +538,11 @@ int anubis_ptx_solve(const uint32_t mid[8], uint32_t prefix_len, int mode,
                 rc = -1;
                 goto done;
             }
+            /* start the clock after the memset, before the launch: this is the
+             * number that is comparable to hashcat's, the wall clock is not */
+            if (g_ptx.have_ev && g_ptx.ev0[d] != NULL) {
+                (void)cuEventRecord(g_ptx.ev0[d], NULL);
+            }
 
             args[0] = &m[0];  args[1] = &m[1];  args[2] = &m[2];  args[3] = &m[3];
             args[4] = &m[4];  args[5] = &m[5];  args[6] = &m[6];  args[7] = &m[7];
@@ -444,19 +553,32 @@ int anubis_ptx_solve(const uint32_t mid[8], uint32_t prefix_len, int mode,
             args[12] = &check_bits;
             args[13] = &dbase;
             args[14] = &cnt;
-            args[15] = &resptr;
-
-            if (use_opt) {
-                blocks = (cnt + (uint32_t)PTX_BLOCK * (uint32_t)g_ptx.ilp - 1u) /
-                         ((uint32_t)PTX_BLOCK * (uint32_t)g_ptx.ilp);
+            if (g_ptx.imad) {
+                /* the variant takes a `one` parameter so ptxas cannot fold the
+                 * mad.lo.u32 adds back into IADD3 */
+                args[15] = &one;
+                args[16] = &resptr;
             } else {
-                blocks = (cnt + PTX_BLOCK - 1u) / PTX_BLOCK;
+                args[15] = &resptr;
+            }
+
+            {
+                /* nonces per block: block * ILP lanes, times the loop depth when
+                 * the grid-stride cubin is in use */
+                uint32_t per = (uint32_t)g_ptx.block;
+                if (use_opt) {
+                    per *= (uint32_t)g_ptx.ilp;
+                    if (g_ptx.have_loop) {
+                        per *= (uint32_t)g_ptx.loop;
+                    }
+                }
+                blocks = (cnt + per - 1u) / per;
             }
             if (blocks == 0) {
                 blocks = 1;
             }
             if (cuLaunchKernel(use_opt ? g_ptx.fn_opt[d] : g_ptx.fn_pow[d],
-                               blocks, 1, 1, PTX_BLOCK, 1, 1,
+                               blocks, 1, 1, (unsigned)g_ptx.block, 1, 1,
                                0, NULL, args, NULL) != CUDA_SUCCESS) {
                 rc = -1;
                 goto done;
@@ -467,31 +589,54 @@ int anubis_ptx_solve(const uint32_t mid[8], uint32_t prefix_len, int mode,
             break;
         }
 
-        for (int d = 0; d < launched; d++) {
-            if (cuCtxSetCurrent(g_ptx.ctx[d]) != CUDA_SUCCESS ||
-                cuCtxSynchronize() != CUDA_SUCCESS ||
-                cuMemcpyDtoH(&g_ptx.h_res, g_ptx.d_res[d],
-                             sizeof(ptx_results)) != CUDA_SUCCESS) {
-                rc = -1;
-                goto done;
-            }
-            /* Hits are stored by whichever thread claimed a slot first, not
-             * in nonce order, so pick the smallest of the eight. */
-            {
-                uint32_t hits = g_ptx.h_res.count;
-                if (hits > PTX_RESULT_SLOTS) {
-                    hits = PTX_RESULT_SLOTS;
+        /* Devices run concurrently, so a wave costs the slowest device, not the
+         * sum: adding both event deltas halves the reported throughput on a
+         * two-GPU box even though the wall clock is correct. */
+        {
+            double wave_ms = 0.0;
+            for (int d = 0; d < launched; d++) {
+                if (cuCtxSetCurrent(g_ptx.ctx[d]) != CUDA_SUCCESS) {
+                    rc = -1;
+                    goto done;
                 }
-                for (uint32_t s = 0; s < hits; s++) {
-                    uint32_t n = g_ptx.h_res.nonces[s];
-                    if (!found || n < best_nonce) {
-                        found = 1;
-                        best_nonce = n;
-                        memcpy(best_hash, g_ptx.h_res.hashes[s],
-                               sizeof(best_hash));
+                if (g_ptx.have_ev && g_ptx.ev1[d] != NULL) {
+                    (void)cuEventRecord(g_ptx.ev1[d], NULL);
+                }
+                if (cuCtxSynchronize() != CUDA_SUCCESS) {
+                    rc = -1;
+                    goto done;
+                }
+                if (g_ptx.have_ev && g_ptx.ev0[d] != NULL && g_ptx.ev1[d] != NULL) {
+                    float ms = 0.0f;
+                    if (cuEventElapsedTime(&ms, g_ptx.ev0[d], g_ptx.ev1[d]) ==
+                        CUDA_SUCCESS && (double)ms > wave_ms) {
+                        wave_ms = (double)ms;
+                    }
+                }
+                if (cuMemcpyDtoH(&g_ptx.h_res, g_ptx.d_res[d],
+                                 sizeof(ptx_results)) != CUDA_SUCCESS) {
+                    rc = -1;
+                    goto done;
+                }
+                /* Hits are stored by whichever thread claimed a slot first, not
+                 * in nonce order, so pick the smallest of the eight. */
+                {
+                    uint32_t hits = g_ptx.h_res.count;
+                    if (hits > PTX_RESULT_SLOTS) {
+                        hits = PTX_RESULT_SLOTS;
+                    }
+                    for (uint32_t s = 0; s < hits; s++) {
+                        uint32_t n = g_ptx.h_res.nonces[s];
+                        if (!found || n < best_nonce) {
+                            found = 1;
+                            best_nonce = n;
+                            memcpy(best_hash, g_ptx.h_res.hashes[s],
+                                   sizeof(best_hash));
+                        }
                     }
                 }
             }
+            kern_ms += wave_ms;
         }
 
         if (found) {
@@ -514,11 +659,20 @@ done:
     if (out_ms != NULL) {
         *out_ms = (ptx_now() - t0) * 1000.0;
     }
+    g_ptx.last_kernel_ms = kern_ms;
     for (int d = 0; d < g_ptx.ndev; d++) {
         (void)cuCtxSetCurrent(g_ptx.ctx[d]);
     }
     pthread_mutex_unlock(&g_ptx.mu);
     return rc;
+}
+
+/* Time spent inside the kernel(s) of the most recent anubis_ptx_solve(), from
+ * the CUDA events that bracket each launch. Excludes the results memset, the
+ * context synchronisation and the copy-back, so it is the number to compare
+ * with a hashcat-style kernel-only benchmark. 0 when events are unavailable. */
+double anubis_ptx_last_kernel_ms(void) {
+    return g_ptx.last_kernel_ms;
 }
 
 /* ------------------------------------------------------------------ *
@@ -649,11 +803,11 @@ int anubis_ptx_hashx_solve(int difficulty, uint64_t start,
             args[8] = &a_cnt;
             args[9] = &a_res;
 
-            blocks = (cnt + PTX_BLOCK - 1u) / PTX_BLOCK;
+            blocks = (cnt + (uint32_t)g_ptx.block - 1u) / (uint32_t)g_ptx.block;
             if (blocks == 0) {
                 blocks = 1;
             }
-            if (cuLaunchKernel(g_ptx.fn_hx[d], blocks, 1, 1, PTX_BLOCK, 1, 1,
+            if (cuLaunchKernel(g_ptx.fn_hx[d], blocks, 1, 1, (unsigned)g_ptx.block, 1, 1,
                                0, NULL, args, NULL) != CUDA_SUCCESS) {
                 rc = -1;
                 goto hx_done;

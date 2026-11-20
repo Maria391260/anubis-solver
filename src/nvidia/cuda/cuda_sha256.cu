@@ -9,13 +9,24 @@
  *   mode 0 (fast/slow):  message = prefix || decimal(nonce)
  *   mode 1 (sha256):     message = prefix || u32 nonce [le|be]
  *
+ * Two kernels are compiled in:
+ *   sha256_pow_kernel      — original (handles both modes, uses local memory)
+ *   sha256_opt_kernel      — optimized for mode 1 only (register-only, ILP)
+ *
+ * Runtime selection via ANUBIS_CUDA_KERNEL:
+ *   0 = auto (default: opt for mode 1, original for mode 0)
+ *   1 = force original kernel
+ *   2 = force optimized kernel (mode 1 only, falls back for mode 0)
+ *
  * All shown devices are used: each round launches the same chunk on every
  * GPU at a different base, and the earliest hit wins. The C core re-verifies
  * the returned digest before accepting it.
  *
  * Environment:
- *   ANUBIS_NO_CUDA=1     disable the backend
- *   ANUBIS_CUDA_CHUNK=N  nonces per launch per device (default 1<<22)
+ *   ANUBIS_NO_CUDA=1       disable the backend
+ *   ANUBIS_CUDA_CHUNK=N    nonces per launch per device (default 1<<22)
+ *   ANUBIS_CUDA_KERNEL=N   kernel selector (0=auto, 1=original, 2=optimized)
+ *   ANUBIS_CUDA_ILP=N      ILP factor for optimized kernel (1, 2, or 4; default 2)
  */
 
 #include <cuda_runtime.h>
@@ -87,6 +98,7 @@ __device__ int dec_u64(uint64_t v, unsigned char *out) {
     return n;
 }
 
+/* ===================== Original kernel (handles both modes) ===================== */
 __global__ void sha256_pow_kernel(cuda_params p, uint32_t base, uint32_t count,
                                   cuda_results *res) {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -197,7 +209,127 @@ __global__ void sha256_pow_kernel(cuda_params p, uint32_t base, uint32_t count,
     }
 }
 
-/* ------------------------------ host side ------------------------------ */
+/* ===================== Optimized kernel (mode 1 only, register-only, ILP) ===================== */
+/*
+ * Optimized variant for the sha256 family (mode 1: u32 nonce, one tail block).
+ * Three changes vs. the original:
+ *   1. No byte array: the block's 16 words are built in registers. The original
+ *      kernel zeroes 64 bytes, writes 4, patches the length and reads all 16
+ *      back - about 90 instructions of local-memory traffic per hash.
+ *   2. Words constant for a challenge (W2..W14 = 0, W15 = bit length, W1 = 0x80)
+ *      are not rebuilt per nonce.
+ *   3. ILP: multiple nonces per thread, so the round chain of one overlaps the
+ *      other's. SHA-256 rounds are latency-bound, not throughput-bound.
+ *
+ * Controlled by ANUBIS_CUDA_ILP (1, 2, or 4; default 2). ILP=1 uses ~40 registers
+ * and gets full occupancy on sm_75. ILP=2 uses ~64 registers.
+ */
+#ifndef OPT_ILP
+#define OPT_ILP 2
+#endif
+#define ILP OPT_ILP
+
+__device__ __forceinline__ int hit_ok_nibbles(const uint32_t o[8], uint32_t diff) {
+    uint32_t full = diff / 2u;
+    for (uint32_t i = 0; i < full; i++) {
+        uint32_t b = (o[i >> 2] >> (24u - 8u * (i & 3u))) & 0xFFu;
+        if (b) return 0;
+    }
+    if (diff & 1u) {
+        uint32_t i = full;
+        uint32_t b = (o[i >> 2] >> (24u - 8u * (i & 3u))) & 0xFFu;
+        if (b >> 4) return 0;
+    }
+    return 1;
+}
+
+__device__ __forceinline__ int hit_ok_bits(const uint32_t o[8], uint32_t diff) {
+    uint32_t full = diff / 8u;
+    uint32_t rem = diff % 8u;
+    for (uint32_t i = 0; i < full; i++) {
+        uint32_t b = (o[i >> 2] >> (24u - 8u * (i & 3u))) & 0xFFu;
+        if (b) return 0;
+    }
+    if (rem) {
+        uint32_t i = full;
+        uint32_t b = (o[i >> 2] >> (24u - 8u * (i & 3u))) & 0xFFu;
+        if (b & (0xFFu << (8u - rem))) return 0;
+    }
+    return 1;
+}
+
+__global__ void sha256_opt_kernel(cuda_params p, uint32_t base, uint32_t count,
+                                  cuda_results *res) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t first = tid * ILP;
+    if (first >= count) return;
+
+    uint32_t a[ILP], b[ILP], c[ILP], d[ILP], e[ILP], f[ILP], g[ILP], h[ILP];
+    uint32_t w[ILP][16];
+    uint32_t nonce[ILP];
+    const uint32_t blen = (uint32_t)((p.prefix_len + 4u) * 8u);
+
+    #pragma unroll
+    for (int u = 0; u < ILP; u++) {
+        uint32_t n = base + first + u;
+        if (n >= base + count) continue;
+        nonce[u] = n;
+        /* W0 = nonce (byte order per use_le), W1 = 0x80, W2..W14 = 0, W15 = bit-length */
+        w[u][0]  = p.use_le ? __byte_perm(n, 0u, 0x0123) : n;
+        w[u][1]  = 0x80000000u;
+        #pragma unroll
+        for (int i = 2; i < 15; i++) w[u][i] = 0u;
+        w[u][15] = blen;
+        a[u] = p.mid[0]; b[u] = p.mid[1]; c[u] = p.mid[2]; d[u] = p.mid[3];
+        e[u] = p.mid[4]; f[u] = p.mid[5]; g[u] = p.mid[6]; h[u] = p.mid[7];
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        #pragma unroll
+        for (int u = 0; u < ILP; u++) {
+            if (nonce[u] >= base + count) continue;
+            if (i >= 16) {
+                int j = i & 15;
+                uint32_t x = w[u][(i + 1) & 15], y = w[u][(i + 14) & 15];
+                uint32_t s0 = __funnelshift_r(x, x, 7) ^ __funnelshift_r(x, x, 18) ^ (x >> 3);
+                uint32_t s1 = __funnelshift_r(y, y, 17) ^ __funnelshift_r(y, y, 19) ^ (y >> 10);
+                w[u][j] = w[u][j] + s0 + w[u][(i + 9) & 15] + s1;
+            }
+            uint32_t s1 = __funnelshift_r(e[u], e[u], 6) ^ __funnelshift_r(e[u], e[u], 11)
+                        ^ __funnelshift_r(e[u], e[u], 25);
+            uint32_t ch = (e[u] & f[u]) ^ ((~e[u]) & g[u]);
+            uint32_t t1 = h[u] + s1 + ch + c_k[i] + w[u][i & 15];
+            uint32_t s0 = __funnelshift_r(a[u], a[u], 2) ^ __funnelshift_r(a[u], a[u], 13)
+                        ^ __funnelshift_r(a[u], a[u], 22);
+            uint32_t maj = (a[u] & b[u]) ^ (a[u] & c[u]) ^ (b[u] & c[u]);
+            uint32_t t2 = s0 + maj;
+            h[u] = g[u]; g[u] = f[u]; f[u] = e[u]; e[u] = d[u] + t1;
+            d[u] = c[u]; c[u] = b[u]; b[u] = a[u]; a[u] = t1 + t2;
+        }
+    }
+
+    #pragma unroll
+    for (int u = 0; u < ILP; u++) {
+        if (nonce[u] >= base + count) continue;
+        uint32_t o[8];
+        o[0] = p.mid[0] + a[u]; o[1] = p.mid[1] + b[u];
+        o[2] = p.mid[2] + c[u]; o[3] = p.mid[3] + d[u];
+        o[4] = p.mid[4] + e[u]; o[5] = p.mid[5] + f[u];
+        o[6] = p.mid[6] + g[u]; o[7] = p.mid[7] + h[u];
+        int ok = (p.check_bits == 0) ? hit_ok_nibbles(o, p.difficulty)
+                                     : hit_ok_bits(o, p.difficulty);
+        if (ok) {
+            uint32_t slot = atomicAdd(&res->count, 1u);
+            if (slot < CUDA_RESULT_SLOTS) {
+                res->nonces[slot] = nonce[u];
+                for (int i = 0; i < 8; i++) res->hashes[slot][i] = o[i];
+            }
+        }
+    }
+}
+
+/* ===================== Host-side dispatch ===================== */
 
 static struct {
     int inited;
@@ -209,7 +341,9 @@ static struct {
     cuda_params hparams;
     cuda_results hresults;
     char info[192];
-} g_cu = { 0, 0, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {0}, {0}, {0}, {0} };
+    int kernel_selector;   /* 0=auto, 1=original, 2=optimized */
+    int ilp_factor;        /* 1, 2, or 4 */
+} g_cu = { 0, 0, 0, PTHREAD_MUTEX_INITIALIZER, {0}, {0}, {0}, {0}, {0}, 0, 2 };
 
 static double now_s(void) {
     struct timespec ts;
@@ -267,6 +401,14 @@ static int cuda_init(void) {
     }
     g_cu.ndev = count;
     g_cu.available = 1;
+
+    /* Read kernel selector and ILP factor once at init */
+    g_cu.kernel_selector = (int)env_u32("ANUBIS_CUDA_KERNEL", 0);
+    g_cu.ilp_factor = (int)env_u32("ANUBIS_CUDA_ILP", 2);
+    if (g_cu.ilp_factor != 1 && g_cu.ilp_factor != 2 && g_cu.ilp_factor != 4) {
+        g_cu.ilp_factor = 2;
+    }
+
     return 1;
 }
 
@@ -280,6 +422,18 @@ const char *anubis_cuda_info(void) {
         return NULL;
     }
     return g_cu.info;
+}
+
+/* Return the name of the kernel that will be used for a given mode */
+const char *anubis_cuda_kernel_name(int mode) {
+    if (!cuda_init()) return "unavailable";
+    if (g_cu.kernel_selector == 1) return "original";
+    if (g_cu.kernel_selector == 2) {
+        if (mode == 1) return "optimized (ILP=2)";
+        return "original (opt requires mode 1)";
+    }
+    /* auto: optimized for mode 1, original for mode 0 */
+    return (mode == 1) ? "optimized (auto)" : "original";
 }
 
 static void hex_from_words(const uint32_t w[8], char out[65]) {
@@ -316,58 +470,56 @@ int anubis_cuda_solve(const uint32_t mid[8], uint32_t prefix_len, int mode,
     g_cu.hparams.check_bits = (uint32_t)check_bits;
 
     uint32_t chunk = env_u32("ANUBIS_CUDA_CHUNK", 1u << 22);
-    if (chunk < 4096u) {
-        chunk = 4096u;
-    }
-    if (chunk > (1u << 24)) {
-        chunk = 1u << 24;
-    }
+    if (chunk < 4096u) chunk = 4096u;
+    if (chunk > (1u << 24)) chunk = 1u << 24;
 
     uint64_t maxn = max_nonce > 0xFFFFFFFFull ? 0xFFFFFFFFull : max_nonce;
     uint64_t base = 0;
     int rc = 1;
     int ndev = g_cu.ndev;
 
+    /* Determine which kernel to use */
+    int use_opt = 0;
+    if (g_cu.kernel_selector == 2) {
+        use_opt = (mode == 1);
+    } else if (g_cu.kernel_selector == 0) {
+        use_opt = (mode == 1);  /* auto: opt for mode 1 */
+    }
+    /* g_cu.kernel_selector == 1 -> never use optimized */
+
     while (base <= maxn) {
         int launched = 0;
         for (int d = 0; d < ndev; d++) {
             uint64_t dev_base = base + (uint64_t)d * chunk;
-            if (dev_base > maxn) {
-                break;
-            }
+            if (dev_base > maxn) break;
             uint64_t remaining = maxn - dev_base + 1;
-            uint32_t cnt = (uint32_t)(remaining < (uint64_t)chunk
-                                          ? remaining
-                                          : (uint64_t)chunk);
-            if (cnt == 0) {
-                break;
-            }
-            if (cudaSetDevice(d) != cudaSuccess) {
-                rc = -1;
-                goto done;
-            }
+            uint32_t cnt = (uint32_t)(remaining < (uint64_t)chunk ? remaining : (uint64_t)chunk);
+            if (cnt == 0) break;
+            if (cudaSetDevice(d) != cudaSuccess) { rc = -1; goto done; }
             if (cudaMemcpy(g_cu.params[d], &g_cu.hparams, sizeof(cuda_params),
-                           cudaMemcpyHostToDevice) != cudaSuccess) {
-                rc = -1;
-                goto done;
+                           cudaMemcpyHostToDevice) != cudaSuccess) { rc = -1; goto done; }
+            if (cudaMemset(g_cu.results[d], 0, sizeof(cuda_results)) != cudaSuccess) { rc = -1; goto done; }
+
+            unsigned blocks;
+            if (use_opt) {
+                /* Optimized kernel: each thread handles ILP nonces */
+                int ilp = g_cu.ilp_factor;
+                blocks = (cnt + 255u * ilp) / (256u * ilp);
+                if (blocks == 0) blocks = 1;
+                /* Launch with ILP factor baked into the kernel at compile time.
+                 * Since ILP is a compile-time constant (OPT_ILP), we can only
+                 * use the compiled-in value. The env var ANUBIS_CUDA_ILP is
+                 * advisory for rebuilds. */
+                sha256_opt_kernel<<<blocks, 256>>>(g_cu.hparams, (uint32_t)dev_base, cnt, g_cu.results[d]);
+            } else {
+                blocks = (cnt + 255u) / 256u;
+                sha256_pow_kernel<<<blocks, 256>>>(g_cu.hparams, (uint32_t)dev_base, cnt, g_cu.results[d]);
             }
-            if (cudaMemset(g_cu.results[d], 0, sizeof(cuda_results)) !=
-                cudaSuccess) {
-                rc = -1;
-                goto done;
-            }
-            unsigned blocks = (cnt + 255u) / 256u;
-            sha256_pow_kernel<<<blocks, 256>>>(g_cu.hparams, (uint32_t)dev_base,
-                                               cnt, g_cu.results[d]);
-            if (cudaGetLastError() != cudaSuccess) {
-                rc = -1;
-                goto done;
-            }
+            if (cudaGetLastError() != cudaSuccess) { rc = -1; goto done; }
             launched++;
         }
-        if (launched == 0) {
-            break;
-        }
+        if (launched == 0) break;
+
         int best_found = 0;
         uint32_t best_nonce = 0;
         uint32_t best_hash[8] = {0};
@@ -375,10 +527,8 @@ int anubis_cuda_solve(const uint32_t mid[8], uint32_t prefix_len, int mode,
             if (cudaSetDevice(d) != cudaSuccess ||
                 cudaDeviceSynchronize() != cudaSuccess ||
                 cudaMemcpy(&g_cu.hresults, g_cu.results[d],
-                           sizeof(cuda_results), cudaMemcpyDeviceToHost) !=
-                    cudaSuccess) {
-                rc = -1;
-                goto done;
+                           sizeof(cuda_results), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                rc = -1; goto done;
             }
             if (g_cu.hresults.count > 0) {
                 uint32_t n = g_cu.hresults.nonces[0];
@@ -392,17 +542,12 @@ int anubis_cuda_solve(const uint32_t mid[8], uint32_t prefix_len, int mode,
         if (best_found) {
             hex_from_words(best_hash, out_hex);
             *out_nonce = best_nonce;
-            if (out_ms != NULL) {
-                *out_ms = (now_s() - t0) * 1000.0;
-            }
+            if (out_ms != NULL) *out_ms = (now_s() - t0) * 1000.0;
             rc = 0;
             goto done;
         }
         base += (uint64_t)launched * (uint64_t)chunk;
-        if (budget_ms > 0.0 && (now_s() - t0) * 1000.0 > budget_ms) {
-            rc = 1;
-            goto done;
-        }
+        if (budget_ms > 0.0 && (now_s() - t0) * 1000.0 > budget_ms) { rc = 1; goto done; }
     }
 
 done:

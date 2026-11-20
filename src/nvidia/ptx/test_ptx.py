@@ -110,6 +110,32 @@ for i in range(min(cnt, 8)):
         ok = False
 check(ok, "found %d hit(s), digests correct" % cnt)
 
+print("== sha256_opt_loop.ptx: grid-stride loop covers the range exactly ==")
+loop_k = Kernel(PTX + '/sha256_opt_loop.ptx')
+# count <= 8 so every nonce fits in the 8 result slots and can be checked
+for le in (1, 0):
+    for count, ilp, lp in ((8, 2, 1), (8, 2, 2), (8, 1, 3), (5, 2, 4), (1, 2, 8)):
+        p = params_for(st, PL, 1, le, 0, 0, 0, count)
+        gm = launch(loop_k, p, count, blockdim=8, ilp=ilp, loop=lp)
+        cnt, nonces, hashes = results(gm)
+        good = cnt == count and sorted(nonces[:min(cnt, 8)]) == list(range(count))
+        for i in range(min(cnt, 8)):
+            if hashes[i] != exp1(nonces[i], le):
+                good = False
+        check(good, "le=%d count=%d ilp=%d loop=%d -> %d nonce(s)"
+              % (le, count, ilp, lp, cnt))
+
+print("== sha256_opt_loop.ptx: bit difficulty filters (4 bits, 64 nonces) ==")
+p = params_for(st, PL, 1, 1, 4, 1, 0, 64)
+gm = launch(loop_k, p, 64, blockdim=8, ilp=2, loop=2)
+cnt, nonces, hashes = results(gm)
+ok = cnt >= 1
+for i in range(min(cnt, 8)):
+    e = exp1(nonces[i], 1)
+    if hashes[i] != e or (e[0] >> 4) != 0:
+        ok = False
+check(ok, "found %d hit(s), digests correct" % cnt)
+
 print()
 if fails:
     print("FAILURES:", fails)

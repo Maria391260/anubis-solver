@@ -1,0 +1,53 @@
+{
+  "date": "2026-11-18",
+  "kernel": "monktelv31/anubis-ptx-t4-ab",
+  "hardware": "Tesla T4 (sm_75), 40 SM, clocks.sm 1425-1485 MHz under load, max 1590 MHz",
+  "what": "First same-session A/B of the PTX SHA-256 kernel: grid-stride loop depth, threads per block, ILP and a register cap. Kernel-only time from CUDA events; every configuration verified against hashlib.",
+  "pass": 1,
+  "method": {
+    "kernel_ms": "cuEventRecord around each launch; excludes results memset, context sync and copy-back",
+    "nonces": 536870912,
+    "reps": 3,
+    "chunk": 16777216,
+    "gpu": "one T4 per process (CUDA_VISIBLE_DEVICES=0)",
+    "clock_logged": true
+  },
+  "results_ghs_single_t4": [
+    {"ilp": 2, "loop": 1, "block": 512, "maxrreg": 0, "clock_mhz": 1470, "ghs": 2.75},
+    {"ilp": 2, "loop": 2, "block": 512, "maxrreg": 0, "clock_mhz": 1425, "ghs": 2.74},
+    {"ilp": 1, "loop": 1, "block": 512, "maxrreg": 0, "clock_mhz": 1455, "ghs": 2.74},
+    {"ilp": 2, "loop": 2, "block": 256, "maxrreg": 0, "clock_mhz": 1425, "ghs": 2.73},
+    {"ilp": 2, "loop": 8, "block": 256, "maxrreg": 0, "clock_mhz": 1425, "ghs": 2.71},
+    {"ilp": 1, "loop": 2, "block": 512, "maxrreg": 0, "clock_mhz": 1425, "ghs": 2.71},
+    {"ilp": 2, "loop": 1, "block": 256, "maxrreg": 0, "clock_mhz": 1440, "ghs": 2.71},
+    {"ilp": 2, "loop": 32, "block": 256, "maxrreg": 0, "clock_mhz": 1440, "ghs": 2.70},
+    {"ilp": 1, "loop": 8, "block": 512, "maxrreg": 0, "clock_mhz": 1440, "ghs": 2.70},
+    {"ilp": 1, "loop": 2, "block": 256, "maxrreg": 0, "clock_mhz": 1440, "ghs": 2.70},
+    {"ilp": 1, "loop": 1, "block": 256, "maxrreg": 0, "clock_mhz": 1440, "ghs": 2.69},
+    {"ilp": 1, "loop": 8, "block": 256, "maxrreg": 0, "clock_mhz": 1440, "ghs": 2.69},
+    {"ilp": 2, "loop": 8, "block": 512, "maxrreg": 0, "clock_mhz": 1425, "ghs": 2.68},
+    {"ilp": 1, "loop": 32, "block": 256, "maxrreg": 0, "clock_mhz": 1440, "ghs": 2.68},
+    {"ilp": 1, "loop": 32, "block": 512, "maxrreg": 0, "clock_mhz": 1440, "ghs": 2.66},
+    {"ilp": 1, "loop": 8, "block": 1024, "maxrreg": 0, "clock_mhz": 1485, "ghs": 2.65},
+    {"ilp": 1, "loop": 8, "block": 128, "maxrreg": 0, "clock_mhz": 1425, "ghs": 2.65},
+    {"ilp": 2, "loop": 32, "block": 512, "maxrreg": 0, "clock_mhz": 1455, "ghs": 2.63},
+    {"ilp": 1, "loop": 8, "block": 256, "maxrreg": 40, "clock_mhz": 1410, "ghs": 2.57},
+    {"ilp": 1, "loop": 8, "block": 256, "maxrreg": 32, "clock_mhz": 1425, "ghs": 2.56}
+  ],
+  "correctness": "test_ptx.py passed on the GPU host (ptxsim, both kernels incl. the grid-stride loop); every benchmark configuration also verified a 20-bit hit and the nonce-0 digest against hashlib",
+  "findings": [
+    "The whole matrix spans 2.56-2.75 GH/s, i.e. 7 %. The kernel is at a plateau: neither the in-kernel nonce loop nor occupancy moves it.",
+    "The grid-stride loop is neutral (2.71 vs 2.73 at ilp2/block256). Its expected benefit was retracted: only w17, w19 and w21 of the expanded schedule are non-varying, so there is nothing for ptxas to hoist (SASS is 1448 vs 1440 instructions).",
+    "Capping at 32 registers (full 64 warps/SM occupancy) is 5 % *slower* than letting ptxas pick 42, so the kernel is not occupancy-starved.",
+    "512 threads per block is ~1 % better than 256 and 1024 is worse.",
+    "Normalised for clock the best configuration is 1.87 MH/s per MHz (2.75 GH/s at 1470 MHz). Published hashcat mode-1400 T4 numbers (3.0-3.34 GH/s) are 2.0-2.1 MH/s per MHz, i.e. 10-12 % more per clock, and were almost certainly taken at the 1590 MHz maximum while this session sat at 1425-1485.",
+    "Static floor check: 64 rounds x 15 instructions + 48 schedule words x 10 = 1440, exactly the SASS count. ptxas already fuses Ch and Maj into one LOP3 each and folds two of the three schedule adds into IADD3, so there is no scalar instruction left to remove."
+  ],
+  "rejected": [
+    {"idea": "move adds to the FMA pipe with mad.lo.u32 d, a, 1, b", "why": "ptxas canonicalises multiply-by-one back to IADD3; SASS mix identical"},
+    {"idea": "hoist the warp-uniform half of the message schedule out of a nonce loop", "why": "the schedule has only three non-varying words (w17, w19, w21); the parity argument in the plan was wrong"},
+    {"idea": "precompute the uniform schedule on the host and pass it in constant memory", "why": "same reason - three constants, not twenty-four"},
+    {"idea": "-maxrregcount=32 for more occupancy", "why": "measured 5 % slower"},
+    {"idea": "grid-stride loop (loop 2..32)", "why": "measured neutral"}
+  ]
+}

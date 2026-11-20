@@ -1,0 +1,39 @@
+{
+  "id": "miku6/anubis-solver-benchmarks",
+  "licenses": [
+    {
+      "name": "MIT"
+    }
+  ],
+  "title": "anubis-solver CPU/GPU Benchmark Results",
+  "subtitle": "Performance benchmarks of the anubis-solver across all challenge tiers (fast, slow, sha256, hashx, argon2id) with thread scaling, AVX comparison, and GPU backend analysis",
+  "description": "This dataset contains comprehensive benchmark results for the anubis-solver proof-of-work engine. It includes:\n\n1. **CPU Benchmarks**: All challenge tiers (fast, slow, sha256, hashx, argon2id) at light/medium/hard difficulties\n2. **Thread Scaling**: Performance scaling from 1 to 16 threads\n3. **AVX Comparison**: Native dispatch (AVX-512) vs forced AVX2 performance\n4. **GPU Backend Comparison**: CUDA, Level Zero, Vulkan, OpenCL, CPU fallback (when run on GPU-enabled systems)\n\nThe solver implements proof-of-work for TecharoHQ/anubis challenges including:\n- fast/slow (nibble-based, 16^d difficulty)\n- sha256 (bit-based, 2^d difficulty)  \n- hashx (bit-based, dynamic WASM kernel)\n- argon2id (memory-hard, parameterized)\n\nAll digests are verified against hashlib to ensure correctness.",
+  "tags": [
+    "benchmark",
+    "proof-of-work",
+    "anubis",
+    "cpu-performance",
+    "gpu-computing",
+    "avx2",
+    "avx-512",
+    "cuda",
+    "level-zero",
+    "vulkan",
+    "opencl",
+    "sha256",
+    "argon2id",
+    "hashx"
+  ],
+  "data_source": "Generated using anubis-solver tools/kaggle_bench.py",
+  "version": "1.0.0",
+  "files": [
+    {
+      "description": "Raw benchmark results in CSV format",
+      "name": "kaggle_bench.csv"
+    },
+    {
+      "description": "Full benchmark results with host metadata in JSON format",
+      "name": "kaggle_bench.json"
+    }
+  ]
+}

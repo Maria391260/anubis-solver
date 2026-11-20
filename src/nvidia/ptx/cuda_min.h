@@ -18,9 +18,12 @@ typedef int CUdevice;
 typedef struct CUctx_st *CUcontext;
 typedef struct CUmod_st *CUmodule;
 typedef struct CUfunc_st *CUfunction;
+typedef struct CUevent_st *CUevent;
+typedef struct CUstream_st *CUstream;
 typedef unsigned long long CUdeviceptr;
 
 #define CUDA_SUCCESS 0
+#define CU_EVENT_DEFAULT 0u
 
 CUresult cuInit(unsigned int Flags);
 CUresult cuDeviceGetCount(int *count);
@@ -42,11 +45,17 @@ CUresult cuLaunchKernel(CUfunction f,
                         unsigned int blockDimY, unsigned int blockDimZ,
                         unsigned int sharedMemBytes, void *hStream,
                         void **kernelParams, void **extra);
+CUresult cuEventCreate(CUevent *phEvent, unsigned int Flags);
+CUresult cuEventRecord(CUevent hEvent, CUstream hStream);
+CUresult cuEventSynchronize(CUevent hEvent);
+CUresult cuEventElapsedTime(float *pMilliseconds, CUevent hStart, CUevent hEnd);
+CUresult cuEventDestroy_v2(CUevent hEvent);
 
 /* same aliases cuda.h provides */
 #define cuMemAlloc cuMemAlloc_v2
 #define cuMemcpyDtoH cuMemcpyDtoH_v2
 #define cuMemcpyHtoD cuMemcpyHtoD_v2
 #define cuMemsetD8 cuMemsetD8_v2
+#define cuEventDestroy cuEventDestroy_v2
 
 #endif /* ANUBIS_CUDA_MIN_H */

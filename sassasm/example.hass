@@ -1,0 +1,117 @@
+# Example HASS Program - SHA-256 Kernel
+# ========================================
+# This is a human-writable SASS (HASS) example showing the format.
+# 
+# HASS Features:
+# - Named labels (not .L_x_123)
+# - Preserved comments
+# - Readable operand formatting
+# - Optional byte offset annotations (// @0x100)
+# - Direct binary assembly via hass2sass.py
+
+# ========================================
+# Kernel Entry Point
+# ========================================
+kernel_entry:
+    # Thread setup
+    S2R     R0, SR_CTAID.X          ; Block ID X
+    S2R     R3, SR_TID.X            ; Thread ID X
+    IMAD    R0, R0, c[0x0][0x0], R3 ; Global thread index
+    
+    # Bounds check
+    ISETP.GE.U32.AND  P0, PT, R0, c[0x0][0x198], PT
+    @P0     EXIT                      ; Exit if out of bounds
+    
+    # Initialize local memory
+    STL.128 [R1], RZ                ; Clear 128-bit at R1
+    STL.128 [R1+0x10], RZ
+    STL.128 [R1+0x20], RZ
+    STL.128 [R1+0x30], RZ
+
+# ========================================
+# Main Loop
+# ========================================
+main_loop:
+    # Load message block
+    LDC.U8  R5, c[0x3][R6+0x10]    ; Load constant from cbank
+    SHF.R.U32.HI  R3, RZ, 0x8, R0   ; Shift right high
+    UMOV    UR4, URZ                ; Move uniform register
+    PRMT    R3, R3, 0x7604, R0      ; Permute bytes
+    
+    # SHA-256 round computation
+    IMAD.MOV.U32  R2, RZ, RZ, 0x4
+    PRMT    R4, R4, 0x654, R3
+    STL     [R1], R4                ; Store result
+
+# ========================================
+# Conditional Branch Example
+# ========================================
+    ISETP.NE.AND  P0, PT, R0, RZ, PT
+    BMOV.32.CLEAR  RZ, B0           ; Clear barrier
+    BSSY    B0, `barrier_sync       ; Barrier sync with sync
+    
+    @!P0    BRA  `exit_loop         ; Exit if condition met
+    
+    # Wide multiply for SHA-256
+    IMAD.WIDE.U32  R4, R3, -0x33333333, RZ
+    IMAD.WIDE.U32  R6, P0, R0, -0x33333334, R4
+    IMAD.WIDE.U32  R4, R0, -0x33333333, RZ
+    IMAD.X  R9, RZ, RZ, RZ, P0      ; Extended IMAD
+    
+    IADD3   RZ, P0, R5, R6, RZ      ; Three-input add with predicate
+    IMAD.MOV.U32  R8, RZ, RZ, R7
+    IMAD.MOV.U32  R6, RZ, RZ, 0x1
+
+# ========================================
+# Barrier Synchronization
+# ========================================
+barrier_sync:
+    ISETP.GE.U32.AND  P0, PT, R0, 0xa, PT
+    @P0     BRA  `continue_work
+    
+    IMAD.MOV.U32  R8, RZ, RZ, RZ
+    SHF.R.U64  R7, R4, 0x3, R5      ; 64-bit shift funnel
+    ISETP.GE.U32.AND.EX  P0, PT, R3, RZ, PT, P0
+    IMAD    R2, R7, -0xa, R0
+    
+    LOP3.LUT  R2, R2, 0x30, RZ, 0xfc, !PT  ; Logic op with LUT
+    PRMT    R4, R2, 0x7610, R4
+    STL.U8  [R1+0x40], R2           ; Store byte
+
+# ========================================
+# Loop Continue / Exit
+# ========================================
+continue_work:
+    SHF.R.U32.HI  R11, RZ, 0x2, R3  ; Shift with reuse
+    IMAD.WIDE.U32  R4, R11, 0x5c28f5c3, RZ
+    IMAD.WIDE.U32  R6, P0, R9, 0x28f5c28f, R4
+    
+    @!P0    BRA  `main_loop          ; Loop back
+
+exit_loop:
+    EXIT                            ; Terminate thread
+
+# ========================================
+# Uniform Register Example
+# ========================================
+# Uniform registers (UR0-UR7) for constant/uniform data
+# ULDC    UR4, c[0x0][0x178]        ; Load uniform constant
+# USHF.L.U32  UR5, UR4, 0x8, UR6    ; Uniform shift
+# UIADD3  UR7, UR5, UR6, UR4        ; Uniform integer add
+# UIMAD   UR8, UR5, UR6, UR7        ; Uniform multiply-add
+
+# ========================================
+# 64-bit System Memory Access
+# ========================================
+# LDG.E.64.SYS  R2, [R16]           ; Load 64-bit from sys mem
+# STG.E.64.SYS  [R16+0x300800], R2  ; Store 64-bit to sys mem
+# LDG.E.U8.SYS  R0, [R2.64+UR6]     ; Load 8-bit with 64-bit addr + UR
+# STG.E.SYS     [R2+0x10], R17      ; Store to sys mem
+
+# ========================================
+# Vote Operations
+# ========================================
+# VOTEU.ANY   UR6, UPT, PT          ; Any thread votes true
+# VOTEU.ALL   P0, PT, P1            ; All threads vote true
+
+# End of program

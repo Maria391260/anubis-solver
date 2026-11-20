@@ -430,6 +430,37 @@ class _Native:
         fn.restype = ctypes.c_int
         return bool(fn())
 
+    def force_nvidia_boost_max(self) -> int:
+        """Lock every NVIDIA GPU at its maximum SM clock (needs root).
+
+        Returns 0 on success, or the negative code documented in the header:
+        -1 no NVML, -2 no device, -3 needs root, -4 unsupported, -5 refused.
+        """
+        fn = getattr(self.lib, "anubis_nvidia_force_boost_max", None)
+        if fn is None:
+            return -1
+        fn.argtypes = []
+        fn.restype = ctypes.c_int
+        return int(fn())
+
+    def nvidia_clock_mhz(self) -> int:
+        """Current SM clock of the first NVIDIA GPU, or -1."""
+        fn = getattr(self.lib, "anubis_nvidia_clock_mhz", None)
+        if fn is None:
+            return -1
+        fn.argtypes = []
+        fn.restype = ctypes.c_int
+        return int(fn())
+
+    def nvidia_boost_info(self) -> str:
+        fn = getattr(self.lib, "anubis_nvidia_boost_info", None)
+        if fn is None:
+            return "not available"
+        fn.argtypes = []
+        fn.restype = ctypes.c_char_p
+        raw = fn()
+        return raw.decode() if raw else "not available"
+
     def set_tpu_verify(self, enable: bool) -> None:
         fn = getattr(self.lib, "anubis_set_tpu_verify", None)
         if fn is not None:
@@ -650,6 +681,45 @@ class _Native:
             "anubis_verify_tensor", challenge_hex, nonce, difficulty
         )
 
+    def tensor_v_root(self, challenge_hex: str, difficulty: int) -> tuple[str, float]:
+        """The `tensor-v` commitment: one GEMM and a Merkle root (hex)."""
+        fn = getattr(self.lib, "anubis_tensor_v_root", None)
+        if fn is None:
+            raise SolverError("this libanubis_solver.so has no tensor-v support")
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
+        fn.restype = ctypes.c_int
+        out = ctypes.create_string_buffer(65)
+        started = time.perf_counter()
+        rc = fn(challenge_hex.encode(), int(difficulty), out)
+        elapsed = (time.perf_counter() - started) * 1000.0
+        if rc != ANUBIS_OK:
+            raise SolverError(f"tensor-v root failed: {_RC_TEXT.get(rc, rc)}")
+        return out.value.decode(), elapsed
+
+    def tensor_v_witness(
+        self, challenge_hex: str, difficulty: int, blocks: list[int],
+        positions: list[int]
+    ) -> str:
+        """The sampled blocks and their Merkle proofs, as the server's hex blob."""
+        fn = getattr(self.lib, "anubis_tensor_v_witness", None)
+        if fn is None:
+            raise SolverError("this libanubis_solver.so has no tensor-v support")
+        n = len(blocks)
+        b = (ctypes.c_uint32 * n)(*[int(x) for x in blocks])
+        p = (ctypes.c_uint32 * n)(*[int(x) for x in positions])
+        cap = 1 << 22
+        out = ctypes.create_string_buffer(cap)
+        fn.argtypes = [
+            ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32), ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        fn.restype = ctypes.c_int
+        rc = fn(challenge_hex.encode(), int(difficulty), b, p, n, out, cap)
+        if rc != ANUBIS_OK:
+            raise SolverError(f"tensor-v witness failed: {_RC_TEXT.get(rc, rc)}")
+        return out.value.decode()
+
     def verify_bits(self, challenge_hex: str, nonce: int, difficulty: int) -> tuple[bool, str]:
         out = ctypes.create_string_buffer(65)
         rc = self.lib.anubis_verify_bits(
@@ -707,7 +777,8 @@ class AnubisSolver:
     """Solve anubis challenges using the native C engine."""
 
     ALGORITHMS = frozenset(
-        {"fast", "slow", "sha256", "wasm-sha256", "argon2id", "hashx", "tensor"}
+        {"fast", "slow", "sha256", "wasm-sha256", "argon2id", "hashx", "tensor",
+         "tensor-v"}
     )
 
     def __init__(
@@ -745,6 +816,18 @@ class AnubisSolver:
     def backends_compiled(self) -> list[str]:
         """All backends compiled into this .so, usable here or not."""
         return self._native.backends_compiled()
+
+    def force_nvidia_boost_max(self) -> int:
+        """Pin every NVIDIA GPU at its max SM clock (root). 0 = locked."""
+        return self._native.force_nvidia_boost_max()
+
+    def nvidia_clock_mhz(self) -> int:
+        """Current SM clock of the first NVIDIA GPU, or -1."""
+        return self._native.nvidia_clock_mhz()
+
+    def nvidia_boost_info(self) -> str:
+        """What the last force_nvidia_boost_max() call did."""
+        return self._native.nvidia_boost_info()
 
     def backend_report(self) -> str:
         """Human table of every backend, compiled or not, available or not."""
@@ -814,6 +897,8 @@ class AnubisSolver:
             nonce, response, elapsed = self._native.solve_tensor(
                 challenge.random_data, difficulty, self.threads, self.budget_ms
             )
+        elif algorithm == "tensor-v":
+            return self.solve_tensor_v(challenge)
         else:
             raise UnsupportedAlgorithm(f"unknown challenge algorithm {algorithm!r}")
 
@@ -823,6 +908,31 @@ class AnubisSolver:
             elapsed_ms=elapsed,
             algorithm=algorithm,
             difficulty=difficulty,
+        )
+
+    def solve_tensor_v(self, challenge: AnubisChallenge) -> Solution:
+        """The commitment half of `tensor-v`.
+
+        The response is the Merkle root of C. The sample is server-chosen and
+        arrives in the pass-challenge JSON, so the HTTP client completes the
+        audit; a bare `Solution` cannot be verified on its own.
+        """
+        root, elapsed = self._native.tensor_v_root(
+            challenge.random_data, int(challenge.difficulty)
+        )
+        return Solution(
+            nonce=0,
+            response=root,
+            elapsed_ms=elapsed,
+            algorithm="tensor-v",
+            difficulty=int(challenge.difficulty),
+        )
+
+    def tensor_v_witness(
+        self, challenge: AnubisChallenge, blocks: list[int], positions: list[int]
+    ) -> str:
+        return self._native.tensor_v_witness(
+            challenge.random_data, int(challenge.difficulty), blocks, positions
         )
 
     # -- verification helpers --------------------------------------------
@@ -860,6 +970,7 @@ class AnubisSolver:
 # ---------------------------------------------------------------------------
 
 CHALLENGE_PATH = "/.within.website/x/cmd/anubis/api/pass-challenge"
+AUDIT_PATH = "/.within.website/x/cmd/anubis/api/audit-tensor"
 MAKE_CHALLENGE_PATH = "/.within.website/x/cmd/anubis/api/make-challenge"
 
 # CVE-2026-62314: paths covered by the shipped
@@ -1075,6 +1186,41 @@ class AnubisClient:
     def _solve_and_pass(self, url: str, challenge: AnubisChallenge) -> Solution:
         solution = self.solver.solve(challenge)
         self.solutions.append(solution)
+
+        if challenge.algorithm == "tensor-v":
+            # Step 1: send the root, receive the sample. The gate returns JSON.
+            params = {"response": solution.response, "nonce": "0", "redir": url}
+            if challenge.id:
+                params["id"] = challenge.id
+            probe = self.session.get(
+                self._abs(CHALLENGE_PATH), params=params, timeout=self.timeout,
+                allow_redirects=False,
+            )
+            try:
+                audit = probe.json()["audit"]
+                blocks = audit["blocks"]
+                positions = audit["positions"]
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ChallengeError(
+                    "the gate did not return a tensor-v sample; is it a "
+                    "tensor-v challenge on a gate that supports the audit endpoint?"
+                ) from exc
+
+            # Step 2: open the sampled blocks. The cookie is set on this response.
+            witness = self.solver.tensor_v_witness(challenge, blocks, positions)
+            body = {"root": solution.response, "audit": witness, "redir": url}
+            if challenge.id:
+                body["id"] = challenge.id
+            done = self.session.post(
+                self._abs(AUDIT_PATH), json=body, timeout=self.timeout,
+                allow_redirects=False,
+            )
+            if done.status_code != 200:
+                raise ChallengeError(
+                    f"tensor-v audit was rejected ({done.status_code}): "
+                    f"{done.text[:200]}"
+                )
+            return solution
 
         params = {
             "response": solution.response,

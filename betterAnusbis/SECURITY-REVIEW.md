@@ -182,6 +182,69 @@ reason `tensor` ships with difficulty 8 as the documented default rather than
 16. Deployments that need a hard cap should put a per-IP request limit in front
 of the gate, or use `--stateful` so each challenge can be spent once.
 
+## `tensor-v`: sampled verification
+
+`tensor-v` keeps the client's work (one `N = 64 * clamp(difficulty, 2, 16)`
+integer GEMM) and removes the server's: the client commits to `C` in
+32-element blocks with a Merkle root, and the server verifies a random sample.
+
+The protocol is two requests:
+
+1. `GET .../pass-challenge?id&response=<root>&nonce=0`. The gate derives 96
+   block indices and one element position inside each from a sampler key (an
+   HMAC of `cfg.secret`, domain-separated from the cookie key) and
+   `SHA256("ANUBIS-TENSOR-VS" || key || randomData || root)`, and returns them
+   as JSON. It does not spend the challenge.
+2. `POST .../api/audit-tensor` with `{id, root, audit, redir}`. The gate
+   re-derives the same sample, requires the witness to describe exactly that
+   sample (`anubis_tensor_v_check_sample`), then checks the Merkle proofs and
+   recomputes only those elements (`anubis_tensor_v_verify`). It spends the
+   challenge here.
+
+Cost, measured on one machine (16-thread C client, same core):
+
+| difficulty | N | client `root` + tree | server `audit` |
+|---|---|---|---|
+| 8 | 512 | 18 ms | 2.4 ms |
+| 12 | 768 | 32 ms | 3.0 ms |
+| 16 | 1024 | 69 ms | 3.6 ms |
+
+In a browser the same work is 82 ms (d=8) to 538 ms (d=16) in the wasm kernel,
+so at the top difficulty the ratio is about **1:150**. The server's cost is
+`O(k*N)` stream hashes and one dot product per sample, not `O(N^3)`; the ~3 ms
+is mostly SHA-256 for the 96 rows and their proofs.
+
+What makes it sound:
+
+- **The sample is chosen after the commitment and from a server secret.** A
+  client must know the sampled elements before it sends the root; the index list
+  is only revealed afterwards. A client that computed a fraction `f` of `C`
+  passes with probability `f^k`. At `k = 96`, computing 90% of the matrix and
+  skipping the rest is accepted with probability 4e-5.
+- **The witness is bound to the sample.** `anubis_tensor_v_check_sample` runs
+  before any verification, so a valid witness for a different (cheaper) set of
+  blocks is rejected. Without that check the server would verify whatever the
+  client chose.
+- **The root is bound to the challenge.** Every leaf hashes
+  `SHA256("ANUBIS-TENSOR-VL" || SHA256("ANUBIS-TENSOR-VC" || randomData) ||
+  u32le(block) || block bytes)`, and the root is part of the sample derivation,
+  so a root from another challenge or another matrix does not transfer.
+- **Replays are spent challenges.** With `--stateful` (the default) the audit
+  endpoint retires the id; the protocol test asserts that a replay is refused.
+
+What it does *not* remove:
+
+- **Online grinding of the sample oracle.** Step 1 is cheap and stateless, so
+  a client can ask for samples for many candidate roots. It cannot use a sample
+  with a root it did not commit to, and each root requires the sampled blocks to
+  have been computed first, but a patient attacker can compute the revealed
+  blocks (about 3 M multiply-adds each) and retry. The acceptance probability per
+  root is still `f^k`; put a per-IP limit on step 1 if that matters.
+- **Outsourcing.** As with every proof of work, a client can rent the GEMM.
+- **The server still hashes** `2*N/32` stream blocks per sample. That is the
+  floor for a verifier that does not trust the client, and it is why the
+  server's cost is "a few milliseconds" rather than zero.
+
 ## Known open items
 
 - **`policyRule` is hardcoded to `"rule-0"`.** Upstream puts a hash of the matched rule in the

@@ -151,10 +151,12 @@ class Kernel:
     def local(self):
         return self._local
 
-    def run_thread(self, params, global_mem, ntid, ctaid, tid, stop_pc=None):
+    def run_thread(self, params, global_mem, ntid, ctaid, tid, stop_pc=None,
+                   nctaid=1):
         self.r = {n: 0 for n in self.regs}
         self.p = {n: False for n in self.preds}
         self.r['%ntid.x'] = ntid
+        self.r['%nctaid.x'] = nctaid
         self.r['%ctaid.x'] = ctaid
         self.r['%tid.x'] = tid
         self._local = bytearray(self.local_size)
@@ -312,12 +314,12 @@ class Kernel:
         return None
 
 
-def launch(k, params, count, blockdim=256, ilp=1, base=0):
-    blocks = (count + blockdim * ilp - 1) // (blockdim * ilp)
+def launch(k, params, count, blockdim=256, ilp=1, base=0, loop=1):
+    blocks = (count + blockdim * ilp * loop - 1) // (blockdim * ilp * loop)
     gm = bytearray(304)
     for b in range(blocks):
         for tx in range(blockdim):
-            k.run_thread(params, gm, blockdim, b, tx)
+            k.run_thread(params, gm, blockdim, b, tx, nctaid=blocks)
     return gm
 
 

@@ -301,23 +301,35 @@ copy-back included, nothing extrapolated:
 | PTX `sha256`, ILP=2 | **2687 MH/s** | 5265 MH/s | 1.96× |
 | PTX `sha256`, ILP=4 | 2673 MH/s | **5291 MH/s** | 1.98× |
 
-ILP makes almost no difference, and that is the interesting result: the
-message schedule is not the limit here, so widening it buys nothing. Two
-devices split the range and scale to ~1.96×, i.e. the PCIe copies are not on
+A later run with kernel-only timing (CUDA events around each launch, so the
+results memset, the sync and the copy-back are excluded) and with the grid-stride
+loop, threads per block and a register cap all varied, put the same kernel at
+**2750 MH/s kernel-only** on one T4 at 1470 MHz, and showed why every knob is
+flat: 21 configurations sit inside 7 % of each other, and 32 registers
+(full occupancy) is 5 % *slower* than the default 42. The integer pipe is the
+wall — 40 SM × 1.47 GHz × 2 warp-instr/clk × 32 lanes ÷ 1440 SASS instructions
+per hash = 2.6 GH/s, and 1440 is exactly the arithmetic floor for scalar
+SHA-256 (64 rounds × 15 + 48 schedule words × 10) after `ptxas` fuses Ch and Maj
+into one `LOP3` each. Per clock that is 1.87 MH/s per MHz, against 2.0–2.1 for
+published hashcat 1400 numbers, so compare per clock and per session, never
+across them: a T4 idles at 300 MHz and boosts to 1590.
+
+Two devices split the range and scale to ~1.96×, i.e. the PCIe copies are not on
 the critical path for a range this size (1–4 M nonces per launch).
 
 These are scan rates from a standalone kernel, like the WASM and SASS tables;
 the CUDA rows above are timings of a real search through the library, with
 per-chunk dispatch and verification, so the two are not directly comparable —
 read the PTX column as "what this kernel does on its own". Verification ran in
-the same job: `test_ptx.py` executes both kernels in `ptxsim.py` and matches
+the same job: `test_ptx.py` executes every kernel in `ptxsim.py` and matches
 every digest against `hashlib` (mode 1 little- and big-endian, decimal nonces
-of 1–10 digits, nibble and bit difficulty, both ILP lanes).
+of 1–10 digits, nibble and bit difficulty, both ILP lanes, and the grid-stride
+loop at depths 1–8 including ranges that are not a multiple of the block width).
 
-Raw data: [`results/ptx-t4-2026-11-17.json`](results/ptx-t4-2026-11-17.json).
-Reproduce with `python3 src/nvidia/ptx/kaggle_bench_ptx.py` on any CUDA
-machine, or `kaggle kernels push -p src/nvidia/ptx/kaggle_hashx` for the
-HashX job.
+Raw data: [`results/ptx-t4-2026-11-17.json`](results/ptx-t4-2026-11-17.json) and
+[`results/ptx-t4-ab-2026-11-18.json`](results/ptx-t4-ab-2026-11-18.json).
+Reproduce with `python3 src/nvidia/ptx/kaggle_ab.py` on any CUDA machine, or
+`kaggle kernels push -p src/nvidia/ptx/kaggle_hashx` for the HashX job.
 
 ## Intel GPU: oneAPI Level Zero vs Vulkan
 
@@ -1176,7 +1188,9 @@ different sum for every tiling, vector width and backend. The digest would then
 depend on which kernel computed it and the server could not verify anything.
 Integer accumulation in a fixed order is exact everywhere: the wasm kernel, the
 JavaScript GEMM, WebNN and the C verifier produce identical bytes, and a digest
-mismatch is a real failure, not rounding.
+mismatch is a real failure, not rounding. WebNN is the one exception in form —
+its `gemm()` is float-only — but the page widens to float32, where every
+partial sum below 2^24 is still exact (see below).
 
 **A is masked to seven bits.** A pair of products then always fits an i16
 (2 x 127 x 127 = 32,258 < 32,767), which is what allows the wasm
@@ -1191,15 +1205,20 @@ That is a different cost model from the hash tiers, where verification is one
 hash and the client pays `2^difficulty`; it is the price of making the tier a
 real proof of compute rather than a lottery.
 
-The page runs a **WebNN** int8 `gemm` when `navigator.ml` exists, then the
+The page runs a **WebNN** `gemm` when `navigator.ml` exists, then the
 wasm kernel, then the pure-JavaScript GEMM (also forced by `#pure-js`). WebNN
 is the tier's real target: it is a JavaScript API that reaches NPUs and
 integrated GPUs where a WebGPU dispatch is either slow or absent, and its
 result is checked before it is trusted — the page recomputes two output rows in
 JavaScript (0.4% of the work) and rejects the whole path if they disagree.
-That check exists because backend int8 support is uneven; a backend that
-returns floats, saturates, or silently drops to a wrong quantisation must not
+That check exists because backend `gemm` support is uneven; a backend that
+returns nonsense, saturates, or silently drops to a wrong precision must not
 be able to produce a digest the server would reject anyway.
+
+The spec's `gemm()` only accepts float32/float16/bfloat16, so the page widens
+the integer matrices to float32. That is still exact: every partial sum is an
+integer bounded by `1024 * 127 * 128 < 2^24`, and float32 represents every
+integer up to 2^24. The output is narrowed back to int32 after the read.
 
 Correctness: the wasm kernel is checked in 48 cases against an independent
 Node reference (`wasm/verify-tensor.mjs`, including all-127 and all--128
@@ -1213,6 +1232,62 @@ Reproduce: `node betterAnusbis/bench-js-tensor.mjs --wasm` for the JS-vs-wasm
 comparison on the same challenge, `node wasm/bench-tensor.mjs` for kernel-only
 rates. Raw data:
 [`results/js-tensor-2026-11-15.json`](results/js-tensor-2026-11-15.json).
+
+### `tensor-v`: the same GEMM, a sampled server check
+
+The 1:1 cost model above is the one thing about `tensor` that does not scale:
+at difficulty 16 the gate spends 130 ms of CPU per accepted pass. `tensor-v`
+keeps the client's work and makes the check proportional to the *output size*
+rather than to the product:
+
+```
+BT[j][k] = int8(stream[N*N + j*N + k])   // B transposed: rows are contiguous
+C[i][j]  = sum_k A[i][k] * BT[j][k]
+leaf[b]  = SHA256("ANUBIS-TENSOR-VL" || chal || u32le(b) || C[b*32 .. b*32+31])
+root     = binary Merkle root over the leaves, odd last duplicated
+sample   = k blocks and one element per block, from SHA256(secret || challenge || root)
+```
+
+The client sends the root, receives the sample, and opens those blocks with
+Merkle proofs. The server hashes each opened block to the root and recomputes
+the one sampled element with a length-`N` dot product: `O(k*N)`, no GEMM.
+Because the sample is chosen after the root and from a secret the client cannot
+predict, a client that computed a fraction `f` of the elements passes with
+probability `f^k` (`k = 96` → 4e-5 at `f = 0.9`).
+
+Measured on the same machine (16-thread C client, single-thread verifier):
+
+| difficulty | N | client root + tree | wasm client (`tv_solve`) | server audit | ratio |
+|---|---|---|---|---|---|
+| 8 | 512 | 18 ms | 82 ms | 2.4 ms | 1:34 |
+| 12 | 768 | 32 ms | 269 ms | 3.0 ms | 1:90 |
+| 16 | 1024 | 69 ms | 538 ms | 3.6 ms | 1:150 |
+
+The transposed layout is what makes a sampled element check cheap: one column
+of B is one contiguous row, so fetching `BT[j][*]` is `N/32` hashes instead of
+`N` separate stream seeks. The server's ~3 ms at difficulty 16 is mostly those
+stream hashes and the 15-level proofs; the dot products are noise.
+
+Reproduce: `python3 tools/bench_tensor_v.py` (C client and verifier) and the
+wasm timing in that section's `node` one-liner; the JSON is
+[`results/tensor-v-2026-11-19.json`](results/tensor-v-2026-11-19.json).
+
+The browser builds the tree in the wasm kernel (`tv_solve`, `tv_make_witness`);
+the pure-JavaScript fallback (`tvTree`, `tvWitnessJS` in the page) is the same
+tree written with the page's SHA-256, and `wasm/verify-tensor-v.mjs` +
+`tests/test_tensor_v.py` pin that the two produce the same root and witness
+bytes as the C core. The gate side is `tests/test_tensor_v_gate.py`: a real
+backend, a real gate, an honest audit, a replay, a tampered block, and a
+witness for a different sample.
+
+The page's `tensor-v` path is: WebNN GEMM (when `navigator.ml` exists) into
+the wasm `C` buffer, then `tv_solve_from_c` for the tree and `tv_make_witness`
+for the sample. The same wasm module is the fallback GEMM. Without WebAssembly
+the page builds the tree in JavaScript over whichever `C` it has (WebNN or its
+own GEMM), so a browser with WebNN but no wasm still works. The WebNN result is
+checked against two JavaScript rows before the tree sees it, and the tree/wasm
+integration is exercised by `betterAnusbis/tests_js_tensor_v.mjs` with a fake
+backend (bTranspose path, explicit-transpose retry, and a garbage matrix).
 
 ### WebGPU: three algorithms, three different verdicts
 

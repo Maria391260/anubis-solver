@@ -132,6 +132,12 @@ accepted by `known_algorithms`, by per-rule `algorithm:` lines and by the
 (`N = 64*clamp(d,2,16)`), not nibbles or bits, so a policy that switches an
 existing rule to `tensor` should also set its difficulty.
 
+`--algorithm tensor-v` is the sampled-proof variant (same work, a two-request
+commit/audit protocol, a few milliseconds to verify). It is likewise repo-only
+and uses the same difficulty unit. Unlike the other algorithms it cannot be
+solved by a client that only knows how to POST one digest: it needs the
+`audit-tensor` endpoint and keeps the committed tree between the two requests.
+
 ### Environment variables upstream reads
 
 `flagenv.Parse()` runs before `flag.Parse()` (`cmd/anubis/main.go:236-237`), so every flag above is also an environment

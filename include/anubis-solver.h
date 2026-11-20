@@ -77,6 +77,12 @@ ANUBIS_API const char *easter(void);
 /* Name of the active GPU backend (e.g. "CUDA: Tesla T4 x2"), or NULL. */
 ANUBIS_API const char *anubis_gpu_info(void);
 
+/* CUDA kernel selector: returns the name of the kernel that will be used for
+ * the given mode (0 = fast/slow decimal nonce, 1 = sha256 u32 nonce).
+ * Values: "original", "optimized (auto)", "optimized (ILP=N)",
+ * "original (opt requires mode 1)", or "unavailable". */
+ANUBIS_API const char *anubis_cuda_kernel_name(int mode);
+
 /* Sensible default worker count (physical cores). */
 ANUBIS_API int anubis_default_threads(void);
 
@@ -90,6 +96,25 @@ ANUBIS_API int anubis_batch_width(void);
  * and skips one reference hash per hit; useful for benchmarking only. */
 ANUBIS_API void anubis_set_gpu_verify(int enable);
 ANUBIS_API int anubis_gpu_verify(void);
+
+/* Pin every NVIDIA GPU at its maximum SM clock through NVML.
+ *
+ * A Tesla T4 idles at 300 MHz and boosts to ~1.5 GHz only under sustained
+ * load, so a short benchmark measures the ramp rather than the kernel. Call
+ * this once before timing, and anubis_nvidia_clock_mhz() between rows.
+ *
+ * Clock control needs root (CAP_SYS_ADMIN). Returns 0 when at least one device
+ * was locked, otherwise -1 (no libnvidia-ml.so), -2 (no devices), -3 (needs
+ * root), -4 (driver older than R450 / unsupported GPU) or -5 (driver refused
+ * the value: power or thermal policy). See anubis_nvidia_boost_info().
+ *
+ * The lock lasts until the process exits or the driver is reset. Only NVML is
+ * touched -- no nvidia-smi, no external process, no writes outside the driver.
+ */
+ANUBIS_API int anubis_nvidia_force_boost_max(void);
+ANUBIS_API int force_nvidia_boost_max(void);   /* same, for plain ctypes */
+ANUBIS_API int anubis_nvidia_clock_mhz(void);  /* first device, or -1 */
+ANUBIS_API const char *anubis_nvidia_boost_info(void);
 /* TPU hit verification (default on). Resolves as: the value set here, then
  * ANUBIS_TPU_NO_VERIFY=1, then anubis_gpu_verify(). Pass -1 to clear the
  * override and fall back to the env / inherited switch. "Off" skips only the
@@ -175,6 +200,40 @@ ANUBIS_API int anubis_solve_tensor(const char *challenge_hex, int difficulty,
                                    int threads, double budget_ms,
                                    uint32_t *out_nonce, char *out_hex,
                                    double *out_ms);
+
+/* `tensor-v`: the sampled-proof tensor tier.
+ *
+ * The client computes the same integer GEMM as `tensor` (A row-major uint8,
+ * BT row-major int8 -- BT is the transpose of the stream's second matrix) and
+ * commits to C in 32-element blocks with a Merkle root. The server samples k
+ * blocks from a secret and verifies those blocks and one element inside each,
+ * O(k*N) instead of the whole N^3 product. A client that computed a fraction
+ * f of the elements is accepted with probability f^k.
+ *
+ * anubis_tensor_v_root()       client: C's Merkle root, 64 hex characters.
+ * anubis_tensor_v_sample()     server: derive k (block, element) samples.
+ * anubis_tensor_v_witness()    client: hex(blocks + proofs), for one sample.
+ * anubis_tensor_v_verify()     server: check the witness against the root.
+ *                              Returns ANUBIS_OK or ANUBIS_ERR_ARG.
+ */
+ANUBIS_API int anubis_tensor_v_root(const char *challenge_hex, int difficulty,
+                                    char *root_hex);
+ANUBIS_API int anubis_tensor_v_sample(const char *challenge_hex, int difficulty,
+                                      const char *root_hex, const char *secret,
+                                      int count, uint32_t *blocks,
+                                      uint32_t *positions);
+ANUBIS_API int anubis_tensor_v_witness(const char *challenge_hex, int difficulty,
+                                       const uint32_t *blocks,
+                                       const uint32_t *positions, int count,
+                                       char *out_hex, size_t out_cap);
+ANUBIS_API int anubis_tensor_v_check_sample(const char *witness_hex,
+                                            const uint32_t *blocks,
+                                            const uint32_t *positions,
+                                            int count);
+ANUBIS_API int anubis_tensor_v_verify(const char *challenge_hex, int difficulty,
+                                      const char *root_hex,
+                                      const char *witness_hex, char *err,
+                                      size_t err_cap);
 
 /* ------------------------------------------------------------------ *
  * Google TPU (PJRT C API), the `sha256` tier

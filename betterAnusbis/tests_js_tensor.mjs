@@ -80,7 +80,7 @@ function fakeWebNN({ garbage = false } = {}) {
         createTensor: (d) => ({ dataType: d.dataType, shape: d.shape }),
         writeTensor: (t, data) => { t.data = data; },
         dispatch: (graph, inputs, outputs) => { pending = { graph, inputs, outputs }; },
-        readTensor: async (t) => t.data ?? (t.data = pending && pending.graph.run(pending.inputs, pending.outputs)),
+        readTensor: async (t) => t.data ?? (t.data = Float32Array.from(pending && pending.graph.run(pending.inputs, pending.outputs))),
     };
     const builder = {
         input: (name, desc) => ({ kind: 'input', name, desc }),

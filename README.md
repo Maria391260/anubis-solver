@@ -93,6 +93,12 @@ make test-impersonate         # local TLS server: GREASE present/absent per prof
 - **A sixth, ours: `tensor`** — one integer int8 GEMM whose digest is the
   proof, run in the browser on WebNN, on a wasm kernel, or in plain JavaScript.
   The one tier where acceleration is the point rather than a bonus.
+- **`tensor-v`, the sampled proof** — same GEMM, but the client commits to the
+  output with a Merkle root and opens only the 96 blocks the server picks after
+  seeing the root. The server checks those elements instead of recomputing the
+  product, so its cost is a few milliseconds at difficulty 16 against the
+  client's several hundred (measured: 3.6 ms vs 538 ms in wasm, ~1:150). See
+  [betterAnusbis/SECURITY-REVIEW.md](betterAnusbis/SECURITY-REVIEW.md).
 - **CPU kernels**: hand-written AVX2, SHA-NI, AVX-512 and AArch64 NEON/SHA-2
   assembly, with runtime dispatch down to a portable C fallback.
 - **GPU backends** (all opt-in except SHA-256): CUDA, oneAPI Level Zero,
@@ -124,7 +130,7 @@ make test-impersonate         # local TLS server: GREASE present/absent per prof
   **1.02-1.05x**. All bit-exact against the C reference and against Anubis's own
   modules, which are asked to accept our answers.
 - **Two ways to put the wall up**: `betterAnusbis/`, an Anubis-compatible gate in
-  one C file (all six algorithms, the honeypot included), and
+  one C file (every algorithm, the honeypot included), and
   `firefox-extension/`, which lets the browser solve with the native library over
   native messaging — **10x** the in-page wasm at difficulty 20.
 - **`libanubis_solver.so` is 22x lighter than Anubis's server and half the CPU**
@@ -269,8 +275,8 @@ It builds for Linux x86-64, Linux aarch64 and Windows x86-64; the Windows releas
 is a native mingw-w64 build that ships `betterAnusbis.exe` + `anubis_solver.dll`
 as a zip and an MSI installer (`betterAnusbis/win32/build-windows.sh`).
 
-All seven algorithms are gated and verified (fast, slow, sha256, argon2id, hashx,
-tensor, metarefresh), `./test-all-algorithms.sh` asserts the protected page comes
+All eight algorithms are gated and verified (fast, slow, sha256, argon2id, hashx,
+tensor, tensor-v, metarefresh), `./test-all-algorithms.sh` asserts the protected page comes
 back for each, and tampering gets a 403.
 
 It also has the pieces a real deployment asks for: a **policy file** (allow /

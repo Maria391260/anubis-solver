@@ -86,7 +86,7 @@ LINK     ?= $(CC)
 
 LIB      := libanubis_solver.so
 BUILD    := build
-CORE_SRC := src/core/anubis_solver.c src/hashx/hashx.c
+CORE_SRC := src/core/anubis_solver.c src/core/nvidia_boost.c src/hashx/hashx.c
 
 # Optional Vulkan backend (SHA-256 challenges). Auto-detects the headers;
 # the library dlopen()s libvulkan.so.1 at runtime, so there is no hard
@@ -372,6 +372,8 @@ test-tpu:
 
 test: $(LIB) test-tpu
 	python3 tests/test_core.py
+	python3 tests/test_tensor_v.py
+	python3 tests/test_tensor_v_gate.py
 
 shader:
 	bash tools/build_shader.sh

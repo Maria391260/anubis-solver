@@ -52,6 +52,16 @@ def main() -> int:
     got_easter = solver.easter()
     check("easter() answers", got_easter == want_easter, repr(got_easter))
 
+    # The clock-pinning helper must exist and fail cleanly where there is no
+    # driver: 0 (locked) on a GPU box as root, negative otherwise.
+    rc = solver.force_nvidia_boost_max()
+    check(
+        "force_nvidia_boost_max()",
+        rc in (0, -1, -2, -3, -4, -5),
+        f"rc={rc} info={solver.nvidia_boost_info()!r} clock={solver.nvidia_clock_mhz()}",
+    )
+    print(f"       ({solver.nvidia_boost_info()})")
+
     print("SHA-256 correctness")
     for data in [b"", b"abc", b"a" * 55, b"a" * 56, b"a" * 64, b"a" * 1000]:
         want = hashlib.sha256(data).hexdigest()

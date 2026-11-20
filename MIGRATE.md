@@ -289,6 +289,13 @@ is a 512x512x512 int8 product (about 40 ms in wasm, 0.4-0.7 s in JavaScript,
 browser that can run WebNN or wasm SIMD, and the only one whose proof is
 deterministic rather than a nonce search.
 
+`tensor-v` is the same product with a cheaper server check: the browser commits
+to the result and opens the 96 blocks the gate samples, so verification is a few
+milliseconds instead of 20-130 ms. It needs the bundled challenge page (the
+two-request commit/audit flow is in its JavaScript); stock Anubis solvers cannot
+solve it. Use `tensor` if you need the classic one-request digest, `tensor-v` if
+gate CPU is the constraint.
+
 **Keep the cookie settings stable.** `--dynamic-cookie-suffix` (on by default)
 puts a hash of your cookie settings in the cookie's *name*. Change a cookie flag
 and every client solves again. Decide the settings once, then leave them.
