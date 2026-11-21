@@ -1,6 +1,7 @@
 #!/bin/sh
 # Argon2id graph debugging on a TPU: print word 0 of every block so the
-# matrix can be compared word-for-word with the Python/ref model offline.
+# matrix can be compared word-for-word with the Python/ref model offline,
+# plus truncated fills to find the first round count that diverges.
 set -e
 cd "$(dirname "$0")"
 CC=${CC:-cc}
@@ -19,3 +20,10 @@ echo "== schedule only (rounds removed on both sides), m=8 t=2 lanes=1"
 
 echo "== full fill, m=8 t=1 lanes=1"
 "$OUT" --lib "$LIBTPU_PATH" --run-matrix --m 8 --t 1 --lanes 1
+
+echo "== truncated fills: 1 column round, row round, then 2/4/8 of each"
+"$OUT" --lib "$LIBTPU_PATH" --run-matrix --filltest1 --m 8 --t 1 --lanes 1
+"$OUT" --lib "$LIBTPU_PATH" --run-matrix --filltest2 --m 8 --t 1 --lanes 1
+"$OUT" --lib "$LIBTPU_PATH" --run-matrix --filltest --rounds 2 --m 8 --t 1 --lanes 1
+"$OUT" --lib "$LIBTPU_PATH" --run-matrix --filltest --rounds 4 --m 8 --t 1 --lanes 1
+"$OUT" --lib "$LIBTPU_PATH" --run-matrix --filltest --rounds 8 --m 8 --t 1 --lanes 1

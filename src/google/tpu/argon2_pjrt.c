@@ -2207,6 +2207,57 @@ int main(int argc, char **argv)
             a2_inputs(raw, raw_len, (uint32_t)l, (uint32_t)m, (uint32_t)t,
                       b0 + (size_t)l * 256, b1 + (size_t)l * 256);
         }
+        if (g_filltest) {
+            /* one fill (or a truncated one): print the 128 output words */
+            char *mod = build_module(1, m, t);
+            int compile_ms = 0;
+            PJRT_LoadedExecutable *ex;
+            PJRT_Buffer *args[3] = {NULL, NULL, NULL};
+            PJRT_Buffer *res;
+            int32_t ob[256];
+            int64_t d1[2] = {1, 256};
+            int64_t d2[1] = {(int64_t)(m / 2)};
+            double ms = 0;
+
+            ex = compile(mod, &compile_ms);
+            upload_into(&args[0], b0, d1, 2);
+            upload_into(&args[1], b1, d1, 2);
+            upload_into(&args[2], addr, d2, 1);
+            res = execute(ex, args, 3, &ms);
+            read_back(res, ob, 1024);
+            printf("# fill m=%d t=%d rounds=%d mode=%d compile %d ms run %.2f "
+                   "ms\n", m, t, g_rounds, g_filltest1, compile_ms, ms);
+            printf("F");
+            for (int k = 0; k < 128; k++) {
+                uint64_t w = (uint32_t)ob[2 * k] |
+                             ((uint64_t)(uint32_t)ob[2 * k + 1] << 32);
+
+                printf(" %016llx", (unsigned long long)w);
+            }
+            printf("\n");
+            for (int i = 0; i < 3; i++) {
+                buffer_destroy(args[i]);
+            }
+            buffer_destroy(res);
+            {
+                PJRT_LoadedExecutable_Destroy_Args ed = {0};
+
+                ed.struct_size = sizeof ed;
+                ed.executable = ex;
+                api->PJRT_LoadedExecutable_Destroy(&ed);
+            }
+            free(b0);
+            free(b1);
+            free(addr);
+            free(outmem);
+            {
+                PJRT_Client_Destroy_Args cd = {0};
+
+                cd.struct_size = sizeof cd;
+                api->PJRT_Client_Destroy(&cd);
+            }
+            return 0;
+        }
         g_dump_mem = 1;
         {
             char *mod = build_module(lanes, m, t);
