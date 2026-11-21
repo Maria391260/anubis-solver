@@ -69,6 +69,7 @@ static int g_filltest;   /* --filltest: one block fill, no loop (debug) */
 static int g_filltest1;  /* --filltest1: one BLAKE2 round, for a cheap check */
 static int g_rounds = 8; /* --rounds N: truncate the fill, for a cheap check */
 static int g_sched;      /* --sched: the schedule without the fill (debug) */
+static int g_host_sched; /* --host-sched: the host reference without the fill */
 static char SH_VEC[64], SH_BLK[64], SH_IDX[64], SH_MEM[64], SH_PRED[64],
     SH_PREDB[64];
 
@@ -966,7 +967,7 @@ static void a2_fill_block(const a2block *prev, const a2block *ref,
         }
     }
     for (int k = 0; k < 128; k++) {
-        next->v[k] = q[k] ^ v[k];
+        next->v[k] = g_host_sched ? q[k] : (q[k] ^ v[k]);
     }
 }
 
@@ -2086,6 +2087,8 @@ int main(int argc, char **argv)
             serialize_path = argv[++i];
         } else if (strcmp(argv[i], "--dump-all") == 0) {
             g_dump_mem = 1;
+        } else if (strcmp(argv[i], "--selftest-sched") == 0) {
+            mode = 6;
         } else if (strcmp(argv[i], "--sched") == 0) {
             g_sched = 1;
         } else if (strcmp(argv[i], "--rounds") == 0 && i + 1 < argc) {
@@ -2185,6 +2188,35 @@ int main(int argc, char **argv)
     pjrt_open(lib);
     if (init_timeout > 0) {
         alarm(0);
+    }
+
+    if (mode == 6) {
+        int cm = 8, ct = 2, cl = 4;
+        int32_t *b0 = malloc((size_t)cl * 1024);
+        int32_t *b1 = malloc((size_t)cl * 1024);
+        uint32_t *addr = calloc((size_t)cm / 2, 4);
+
+        if (b0 == NULL || b1 == NULL || addr == NULL) {
+            return 1;
+        }
+        a2_addr_table((uint32_t)cm, (uint32_t)ct, addr);
+        for (int l = 0; l < cl; l++) {
+            a2_inputs(raw, raw_len, (uint32_t)l, (uint32_t)cm, (uint32_t)ct,
+                      b0 + (size_t)l * 256, b1 + (size_t)l * 256);
+        }
+        g_sched = 1;
+        g_host_sched = 1;
+        diag_case(cm, ct, cl, raw, raw_len, addr, b0, b1);
+        free(b0);
+        free(b1);
+        free(addr);
+        {
+            PJRT_Client_Destroy_Args cd = {0};
+
+            cd.struct_size = sizeof cd;
+            api->PJRT_Client_Destroy(&cd);
+        }
+        return 0;
     }
 
     if (mode == 5) {

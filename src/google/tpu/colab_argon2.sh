@@ -33,7 +33,10 @@ echo "== host reference (no TPU)"
 "$OUT" --unit
 "$OUT" --hosttest
 
-echo "== graph vs host reference, several sizes"
+echo "== schedule only (no fill), to separate the loop from the arithmetic"
+"$OUT" --lib "$LIBTPU_PATH" --selftest-sched
+
+echo "== graph vs host reference"
 "$OUT" --lib "$LIBTPU_PATH" --selftest
 
 # One compile serves every challenge and every nonce: the shapes only depend
