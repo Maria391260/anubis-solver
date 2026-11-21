@@ -527,6 +527,34 @@ correct (same nonces as the CPU) but slower than one CPU thread on the Iris Xe:
 Gated behind `ANUBIS_VULKAN_HASHX=1`. Raw data:
 [`results/hashx-vulkan-irisxe.json`](results/hashx-vulkan-irisxe.json).
 
+### HashX on a TPU (Colab, PJRT)
+
+One Colab TPU device, one StableHLO module generated from the challenge's
+program ([`src/google/tpu/hashx_pjrt.c`](src/google/tpu/hashx_pjrt.c)), 32,768
+nonces per window:
+
+| | HashX |
+|---|---:|
+| 1 CPU thread | 9.7 MH/s |
+| 4 CPU threads | ~35 MH/s |
+| **TPU (this run)** | **75.3 MH/s** |
+| 2x T4, PTX interpreter | 115.4 MH/s |
+
+2,097,152 hashes in 27.8 ms; the module compiled in 14.6 s. That is 7.8x one
+CPU thread, 2.2x a four-thread CPU, and ~65% of the two-T4 PTX interpreter on
+a single device.
+
+The 64-bit registers are emulated in i32 pairs and each of the 16 program blocks
+runs its body twice for the branch, so HashX lands at ~22% of the TPU `sha256`
+tier's 343 MHash/s. The serialized executable (`--serialize`) is a
+`xla.TpuExecutableProto` carrying a `jellyfish.TpuCompilationEnvironment`.
+Raw data: [`results/hashx-tpu-colab-2026-11-21.json`](results/hashx-tpu-colab-2026-11-21.json).
+
+```bash
+./hashx_pjrt --lib libtpu.so --data HEX --difficulty 32 --window 32768 \
+    --bench-hashes 2097152 --json
+```
+
 ## CUDA: the `tensor` tier on a Tesla T4
 
 One Kaggle session, 2x Tesla T4 (15,360 MiB each), CUDA 13.0, built with

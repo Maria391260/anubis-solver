@@ -69,9 +69,12 @@ to be paid instead:
   so the loop body is emitted twice and the second pass is blended in with a
   per-lane `select` on the branch condition - branch-free, and exact.
 
-Not implemented: it would be a third module builder next to `sha256_pjrt.c`,
-compiled and cached once per challenge like `tpu_backend.c` does for `sha256`,
-and it needs a TPU to measure.
+Implemented in [`hashx_pjrt.c`](hashx_pjrt.c), compiled once per challenge and
+measured on one Colab TPU device: **75.3 MHash/s** (2,097,152 hashes in 27.8 ms,
+compile 14.6 s), 7.8x one CPU thread and ~65% of the two-T4 PTX interpreter.
+The serialized executable is a `xla.TpuExecutableProto` with a
+`jellyfish.TpuCompilationEnvironment`. See
+[`SPEED.md`](../../../SPEED.md#hashx-on-a-tpu-colab-pjrt).
 
 ## Library ABI
 

@@ -1,0 +1,22 @@
+{
+  "when": "2026-11-21",
+  "where": "Google Colab, TPU runtime (one addressable device)",
+  "tier": "hashx",
+  "client": "src/google/tpu/hashx_pjrt.c",
+  "window": 32768,
+  "hashes": 2097152,
+  "ms": 27.837,
+  "mhash_s": 75.336,
+  "compile_ms": 14550,
+  "difficulty": 32,
+  "hits": 0,
+  "serialized_bytes": 7015912,
+  "serialized_format": "xla.TpuExecutableProto + xla.jellyfish.TpuCompilationEnvironment",
+  "cross_check": {
+    "difficulty": 18,
+    "nonce": 253314,
+    "digest": "0000265919f60928a856852a53f230dacf64b4909851d01c29282e8ef61a2ca7",
+    "verified": true
+  },
+  "notes": "2M hashes at difficulty 32 so nothing hits; the difficulty-18 solve above was re-derived on the host. A separate 262,144-hash window measured 82.8 MH/s."
+}
