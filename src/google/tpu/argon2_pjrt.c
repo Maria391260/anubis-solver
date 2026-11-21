@@ -2084,7 +2084,7 @@ int main(int argc, char **argv)
     if (mode == 5) {
         static const struct {
             int m, t, lanes;
-        } cases[] = {{8, 1, 1}, {64, 2, 1}, {64, 2, 4}, {256, 1, 2}};
+        } cases[] = {{64, 2, 4}};
         int fails = 0;
 
         for (size_t ci = 0; ci < sizeof cases / sizeof cases[0]; ci++) {

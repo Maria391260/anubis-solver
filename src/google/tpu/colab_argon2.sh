@@ -36,8 +36,8 @@ echo "== host reference (no TPU)"
 echo "== graph vs host reference, several sizes"
 "$OUT" --lib "$LIBTPU_PATH" --selftest
 
-echo "== full size (m=19456, t=2), difficulty 8, verified hit"
-"$OUT" --lib "$LIBTPU_PATH" --difficulty 8 --lanes 8
-
-echo "== throughput"
-"$OUT" --lib "$LIBTPU_PATH" --lanes 32 --difficulty 32 --bench-hashes 64 --json
+# One compile serves every challenge and every nonce: the shapes only depend
+# on (m, t, lanes), so the throughput window and the verified hits come from
+# the same executable.
+echo "== full size (m=19456, t=2), 32 lanes, 128 nonces, difficulty 8"
+"$OUT" --lib "$LIBTPU_PATH" --lanes 32 --difficulty 8 --bench-hashes 128 --json
