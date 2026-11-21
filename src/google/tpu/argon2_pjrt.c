@@ -2105,6 +2105,7 @@ int main(int argc, char **argv)
                 want == NULL) {
                 return 1;
             }
+            a2_addr_table((uint32_t)cm, (uint32_t)ct, addr);
             for (int l = 0; l < cl; l++) {
                 a2block last;
                 static int32_t tb0[256], tb1[256];
@@ -2215,6 +2216,9 @@ int main(int argc, char **argv)
         r.b1 = malloc((size_t)lanes * 1024);
         r.addr = calloc((size_t)m / 2, 4);
         r.out = malloc((size_t)lanes * 1024);
+        if (r.addr != NULL) {
+            a2_addr_table((uint32_t)m, (uint32_t)t, r.addr);
+        }
         if (r.b0 == NULL || r.b1 == NULL || r.addr == NULL || r.out == NULL ||
             tags == NULL) {
             return 1;
