@@ -67,6 +67,8 @@ static int g_m, g_t;
 static int g_dump_mem;   /* --dump-all: return the whole matrix (debug) */
 static int g_filltest;   /* --filltest: one block fill, no loop (debug) */
 static int g_filltest1;  /* --filltest1: one BLAKE2 round, for a cheap check */
+static int g_rounds = 8; /* --rounds N: truncate the fill, for a cheap check */
+static int g_sched;      /* --sched: the schedule without the fill (debug) */
 static char SH_VEC[64], SH_BLK[64], SH_IDX[64], SH_MEM[64], SH_PRED[64],
     SH_PREDB[64];
 
@@ -452,24 +454,21 @@ static int pack_block(const int ids[256])
     return r;
 }
 
-/* gather one i32 per lane from a rank-1 table -> [lanes] */
-static int gather_word(int tab, int idx_vec)
+/* one i32 from a rank-1 table at a scalar index, broadcast to [lanes] */
+static int slice_word_bcast(int tab, int idx_scalar)
 {
-    int idx = reshape_vec_idx(idx_vec);
-    int r = newval(0, 0);
+    int sl = newval(0, 0), sc = newval(0, 0), r = newval(0, 0);
 
-    bprintf(&g_b,
-            "    %%v%d = \"stablehlo.gather\"(%%v%d, %%v%d) {\n"
-            "        dimension_numbers = #stablehlo.gather<offset_dims = [], "
-            "collapsed_slice_dims = [0], operand_batching_dims = [], "
-            "start_indices_batching_dims = [], start_index_map = [0], "
-            "index_vector_dim = 1>,\n"
-            "        slice_sizes = array<i64: 1>,\n"
-            "        indices_are_sorted = false\n"
-            "    } : (tensor<%dxi32>, %s) -> %s\n",
-            r, tab, idx, g_m / 2, SH_IDX, SH_VEC);
+    bprintf(&g_b, "    %%v%d = stablehlo.dynamic_slice %%v%d, %%v%d, "
+                  "sizes = [1] : (tensor<%dxi32>, tensor<i32>) -> "
+                  "tensor<1xi32>\n", sl, tab, idx_scalar, g_m / 2);
+    bprintf(&g_b, "    %%v%d = stablehlo.reshape %%v%d : (tensor<1xi32>) -> "
+                  "tensor<i32>\n", sc, sl);
+    bprintf(&g_b, "    %%v%d = stablehlo.broadcast_in_dim %%v%d, dims = [] : "
+                  "(tensor<i32>) -> %s\n", r, sc, SH_VEC);
     return r;
 }
+
 
 /* ==================================================================== */
 /* u64 as an i32 pair                                                   */
@@ -652,10 +651,10 @@ static void fill_hlo(const u64v prev[128], const u64v ref[128],
         q[k] = qq;
         v[k] = r;
     }
-    for (int r = 0; r < 8; r++) {
+    for (int r = 0; r < g_rounds; r++) {
         round16(&v[16 * r]);
     }
-    for (int r = 0; r < 8; r++) {
+    for (int r = 0; r < g_rounds; r++) {
         u64v t16[16];
 
         for (int j = 0; j < 8; j++) {
@@ -1006,9 +1005,9 @@ static void a2_next_addresses(a2block *address, a2block *input)
  * Returns the tag and, if out_mem != NULL, the final block; if addr != NULL,
  * the low words of the data-independent address sequence for pass 0.
  */
-static int a2_ref(uint32_t m, uint32_t t, const uint8_t *pwd, size_t pwdlen,
-                  const uint8_t salt[8], size_t saltlen, uint8_t tag[32],
-                  a2block *out_last)
+static int a2_ref_mem(uint32_t m, uint32_t t, const uint8_t *pwd,
+                      size_t pwdlen, const uint8_t salt[8], size_t saltlen,
+                      uint8_t tag[32], a2block **mem_out)
 {
     uint32_t seg = m / 4;
     a2block *mem;
@@ -1104,11 +1103,26 @@ static int a2_ref(uint32_t m, uint32_t t, const uint8_t *pwd, size_t pwdlen,
     }
 
     /* finalize: the last block, then H'(block, 32) */
+    block_to_bytes(&mem[m - 1], bytes);
+    blake2b_long(tag, 32, bytes, 1024);
+    *mem_out = mem;
+    return 0;
+}
+
+static int a2_ref(uint32_t m, uint32_t t, const uint8_t *pwd, size_t pwdlen,
+                  const uint8_t salt[8], size_t saltlen, uint8_t tag[32],
+                  a2block *out_last)
+{
+    a2block *mem = NULL;
+    int rc;
+
+    rc = a2_ref_mem(m, t, pwd, pwdlen, salt, saltlen, tag, &mem);
+    if (rc != 0) {
+        return rc;
+    }
     if (out_last != NULL) {
         *out_last = mem[m - 1];
     }
-    block_to_bytes(&mem[m - 1], bytes);
-    blake2b_long(tag, 32, bytes, 1024);
     free(mem);
     return 0;
 }
@@ -1261,7 +1275,7 @@ static char *build_module(int lanes, int m, int t)
         ltp = cmp_cc("LT", i, c32((uint32_t)half));
         dip = andp(p0p, ltp);
         clamp = sel32(ltp, i, c32((uint32_t)(half - 1)));
-        paddrv = gather_word(a2v, clamp);
+        paddrv = slice_word_bcast(a2v, v2s(clamp));
         pseudo = sel32(dip, paddrv, pseudop);
 
         /* index_alpha: rel2 = area-1 - ((area * ((p*p)>>32)) >> 32) */
@@ -1283,6 +1297,10 @@ static char *build_module(int lanes, int m, int t)
             ublock = bsel(predb, bxor(tblock, currblk), tblock);
         }
 
+        if (g_sched) {
+            memx = scatter_block(mem, bin(OP_ADD, base, i), ublock);
+            goto sched_done;
+        }
         unpack_block(prevblk, plo);
         unpack_block(refblk, rlo);
         unpack_block(currblk, clo);
@@ -1304,6 +1322,7 @@ static char *build_module(int lanes, int m, int t)
 
         memx = scatter_block(mem, bin(OP_ADD, base, i), newblk);
 
+sched_done:
         i1v = bin(OP_ADD, i, one);
         wrap = cmp_cc("EQ", i1v, c32((uint32_t)m));
         i2 = sel32(wrap, zero, i1v);
@@ -1935,6 +1954,89 @@ static void lane_tag(const int32_t *out, int lanes, int lane, uint8_t tag[32])
     (void)lanes;
 }
 
+
+/* On a selftest failure: run the same case with the whole matrix as the
+ * output and say which block, and which word in it, differs first. */
+static void diag_case(int cm, int ct, int cl, const uint8_t *raw, size_t raw_len,
+                      const uint32_t *addr, const int32_t *b0,
+                      const int32_t *b1)
+{
+    int old = g_dump_mem;
+    char *mod;
+    int64_t dblk[2] = {cl, 256};
+    int64_t daddr[1] = {cm / 2};
+    PJRT_LoadedExecutable *ex;
+    int32_t *outmem = malloc((size_t)cl * cm * 1024);
+    PJRT_Buffer *args[3] = {NULL, NULL, NULL};
+    PJRT_Buffer *res;
+    int compile_ms = 0;
+    double ms = 0;
+
+    if (outmem == NULL) {
+        return;
+    }
+    g_dump_mem = 1;
+    mod = build_module(cl, cm, ct);
+    g_dump_mem = old;
+    ex = compile(mod, &compile_ms);
+    upload_into(&args[0], (void *)b0, dblk, 2);
+    upload_into(&args[1], (void *)b1, dblk, 2);
+    upload_into(&args[2], (void *)addr, daddr, 1);
+    res = execute(ex, args, 3, &ms);
+    read_back(res, outmem, (size_t)cl * cm * 1024);
+    printf("  diag: m=%d t=%d lanes=%d, whole matrix compiled in %d ms, ran "
+           "in %.2f ms\n", cm, ct, cl, compile_ms, ms);
+    for (int l = 0; l < cl; l++) {
+        a2block *ref = NULL;
+        uint8_t tag[32], salt[8];
+        int shown = 0;
+
+        make_salt(salt, (uint32_t)l);
+        if (a2_ref_mem((uint32_t)cm, (uint32_t)ct, raw, raw_len, salt, 8, tag,
+                       &ref) != 0) {
+            continue;
+        }
+        for (int k = 0; k < cm && shown < 3; k++) {
+            const int32_t *got = outmem + ((size_t)l * cm + k) * 256;
+            int diff = -1;
+            uint64_t g = 0;
+
+            for (int w = 0; w < 128; w++) {
+                g = (uint32_t)got[2 * w] |
+                    ((uint64_t)(uint32_t)got[2 * w + 1] << 32);
+                if (g != ref[k].v[w]) {
+                    diff = w;
+                    break;
+                }
+            }
+            if (diff >= 0) {
+                printf("  lane=%d block=%d word=%d got=%016llx want=%016llx\n",
+                       l, k, diff, (unsigned long long)g,
+                       (unsigned long long)ref[k].v[diff]);
+                shown++;
+            }
+        }
+        if (!shown) {
+            printf("  lane=%d every block matches (the tag is wrong, not the "
+                   "fill)\n", l);
+        }
+        free(ref);
+    }
+    free(outmem);
+    free(mod);
+    for (int i = 0; i < 3; i++) {
+        buffer_destroy(args[i]);
+    }
+    buffer_destroy(res);
+    {
+        PJRT_LoadedExecutable_Destroy_Args ed = {0};
+
+        ed.struct_size = sizeof ed;
+        ed.executable = ex;
+        api->PJRT_LoadedExecutable_Destroy(&ed);
+    }
+}
+
 /* ==================================================================== */
 /* main                                                                 */
 /* ==================================================================== */
@@ -1984,6 +2086,10 @@ int main(int argc, char **argv)
             serialize_path = argv[++i];
         } else if (strcmp(argv[i], "--dump-all") == 0) {
             g_dump_mem = 1;
+        } else if (strcmp(argv[i], "--sched") == 0) {
+            g_sched = 1;
+        } else if (strcmp(argv[i], "--rounds") == 0 && i + 1 < argc) {
+            g_rounds = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--filltest2") == 0) {
             g_filltest1 = 2;
         } else if (strcmp(argv[i], "--filltest1") == 0) {
@@ -2084,7 +2190,7 @@ int main(int argc, char **argv)
     if (mode == 5) {
         static const struct {
             int m, t, lanes;
-        } cases[] = {{64, 2, 4}};
+        } cases[] = {{8, 1, 1}, {64, 2, 4}};
         int fails = 0;
 
         for (size_t ci = 0; ci < sizeof cases / sizeof cases[0]; ci++) {
@@ -2168,6 +2274,9 @@ int main(int argc, char **argv)
                 printf("  %s m=%d t=%d lanes=%d: %d/%d tags, compile %d ms, "
                        "execute %.2f ms\n", bad ? "FAIL" : "ok", cm, ct, cl,
                        cl - bad, cl, compile_ms, ms);
+                if (bad) {
+                    diag_case(cm, ct, cl, raw, raw_len, addr, b0, b1);
+                }
             }
             free(b0);
             free(b1);
