@@ -205,3 +205,62 @@ imports the DLL by name.
 The GPU backends are compiled per machine (CUDA, Level Zero, Vulkan, OpenCL are
 dlopen-based and need local drivers and headers), so the release build is CPU
 only, and says so — on both platforms.
+
+## PyPI
+
+The distribution is `libanubis-solver` (`pip install libanubis-solver`); the
+import name stays `anubis_solver`. The name `anubis-solver` on PyPI is an
+unrelated pure-Python project by another author, so it cannot be used, and
+installing both puts two different `anubis_solver.py` files in one
+site-packages - pick one.
+
+Two artifacts, for two different problems:
+
+| artifact | who it is for | what it does |
+|---|---|---|
+| `libanubis_solver-<v>.tar.gz` | any Linux with a C compiler | runs `make` at install time (CPU kernels only) |
+| `libanubis_solver-<v>-py3-none-manylinux_2_XX_x86_64.whl` | no compiler needed | ships `libanubis_solver.so` inside `_anubis_solver_native/` |
+
+`setup.py` builds the object in a **copy** of the tree with
+`CUDA=0 VULKAN=0 L0=0 OPENCL=0`, so a developer's last `make` cannot leak
+whatever backends they had enabled into the wheel (make does not track flag
+changes). The GPU and TPU backends are `dlopen`ed, so a CPU-only build is the
+right wheel: it still uses a GPU or TPU when the runtime is there.
+
+```sh
+# from a checkout, never from a directory where `python -m build` would
+# shadow the repo's own build/ object directory
+rm -rf dist
+ANUBIS_WHEEL_PLAT=manylinux_2_38_x86_64 \
+    /tmp/buildenv/bin/python -m build --outdir "$PWD/dist" "$PWD"
+
+twine check dist/*
+
+# TestPyPI first, always
+twine upload --repository testpypi dist/*
+python3 -m pip install --index-url https://test.pypi.org/simple/ \
+        --extra-index-url https://pypi.org/simple libanubis-solver
+
+# then the real one
+twine upload dist/*
+```
+
+`TWINE_USERNAME=__token__` and `TWINE_PASSWORD=pypi-...` (or a `~/.pypirc`).
+An API token scoped to the `libanubis-solver` project is better than an account
+token; TestPyPI needs its own.
+
+Two caveats before the first upload:
+
+1. **The platform tag must be honest.** A wheel built on this host needs glibc
+   2.38, so it is named `manylinux_2_38_x86_64` and pip refuses it on anything
+   older (Debian 13+/Ubuntu 24.04+). For a wider wheel, build against the
+   bookworm sysroots above and pass `ANUBIS_WHEEL_PLAT=manylinux_2_34_x86_64`.
+   `linux_x86_64` must not be published: it installs everywhere and then fails
+   at `ctypes.CDLL`.
+2. **OpenSSL 3 is a runtime dependency.** The object links `libssl.so.3` and
+   `libcrypto.so.3`; they are not in the wheel. Debian 12+/Ubuntu 22.04+ and
+   current Fedora have them. `auditwheel show dist/*.whl` lists them if in
+   doubt.
+
+The version lives in two places - `__version__` in `anubis_solver.py` and
+`project.version` in `pyproject.toml`. Bump both, and `git tag v<version>`.

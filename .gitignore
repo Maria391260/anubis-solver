@@ -46,3 +46,6 @@ bindings/rust/target/
 # personal images that are not part of the documentation site
 /meme/
 /mascot/JanusMadeDeepSeek.webp
+
+dist/
+*.egg-info/

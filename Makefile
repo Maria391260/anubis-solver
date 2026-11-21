@@ -477,3 +477,11 @@ clean:
 	@if [ -f src/google/tpu/Makefile ]; then \
 	    $(MAKE) -C src/google/tpu clean >/dev/null 2>&1 || true; \
 	fi
+
+
+# PyPI sdist + wheel. Build from /tmp so the repo's own build/ directory does
+# not shadow the `build` module, and let the caller name the platform tag.
+dist:
+	rm -rf dist
+	cd /tmp && python3 -m build --outdir "$(CURDIR)/dist" "$(CURDIR)"
+	-twine check dist/*

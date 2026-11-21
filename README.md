@@ -473,8 +473,16 @@ been run. Backends are auto-detected:
 | `glslangValidator` | only to regenerate the Vulkan SPIR-V (`make shader`) |
 
 ```bash
+pip install libanubis-solver      # wheel or sdist; the sdist compiles the .so once
 pip install -r requirements.txt   # requests; curl_cffi and argon2-cffi optional
 ```
+
+`pip install libanubis-solver` is this project. The PyPI name `anubis-solver`
+belongs to an unrelated pure-Python project, so do not install that one (the
+import name is `anubis_solver` either way - they collide, so install only one).
+The wheel carries the CPU kernels and `dlopen`s the GPU/TPU runtimes when they
+are present; the sdist builds `libanubis_solver.so` with the repository's
+Makefile at install time.
 
 ## Supported challenges
 

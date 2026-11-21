@@ -1,0 +1,8 @@
+include Makefile
+include LICENSE ATTRIBUTION.md THIRD_PARTY_NOTICES.md README.md
+include pyproject.toml setup.py
+recursive-include include *.h
+recursive-include src *.c *.h *.s *.S *.comp *.cl *.cu *.spv *.spv.h *.xe *.py *.md
+recursive-include third_party *.c *.h *.txt
+recursive-include _anubis_solver_native *.so *.py
+global-exclude *.o *.a *.d *.so *.dylib

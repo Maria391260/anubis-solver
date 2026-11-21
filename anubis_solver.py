@@ -191,6 +191,8 @@ def _candidate_paths() -> list[Path]:
         paths.append(Path(env))
     for name in _LIB_NAMES:
         paths.append(_HERE / name)
+        # the wheel keeps the object in a package so it survives installation
+        paths.append(_HERE / "_anubis_solver_native" / name)
     return paths
 
 
@@ -1360,6 +1362,11 @@ def _main(argv: list[str]) -> int:
     print(f"HTTP {resp.status_code} ({len(resp.content)} bytes)")
     print(resp.text[:2000])
     return 0 if resp.status_code < 400 else 1
+
+
+def cli() -> None:
+    """Console-script entry point: `anubis-solver ...`."""
+    raise SystemExit(_main(sys.argv[1:]))
 
 
 if __name__ == "__main__":
