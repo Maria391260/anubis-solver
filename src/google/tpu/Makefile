@@ -6,7 +6,7 @@
 # it must stay -fPIC and must not depend on libtpu being present.
 CC      ?= cc
 CFLAGS  ?= -O2 -g -Wall -Wextra -std=gnu17
-BINS    := pjrt_probe tensor_pjrt sha256_pjrt hashx_pjrt
+BINS    := pjrt_probe tensor_pjrt sha256_pjrt hashx_pjrt argon2_pjrt
 LIBOBJ  := tpu_backend.o
 SELFTEST := tpu_backend_selftest
 
@@ -23,6 +23,9 @@ sha256_pjrt: sha256_pjrt.c pjrt_c_api.h pjrt_common.h
 
 hashx_pjrt: hashx_pjrt.c pjrt_c_api.h pjrt_common.h ../../hashx/hashx.c ../../hashx/hashx.h
 	$(CC) $(CFLAGS) -I. -I../../hashx -o $@ hashx_pjrt.c ../../hashx/hashx.c -ldl
+
+argon2_pjrt: argon2_pjrt.c pjrt_c_api.h pjrt_common.h
+	$(CC) $(CFLAGS) -I. -o $@ $< -ldl
 
 # Library object for libanubis_solver.so. -fPIC is not optional here.
 $(LIBOBJ): tpu_backend.c tpu_backend.h pjrt_c_api.h pjrt_common.h

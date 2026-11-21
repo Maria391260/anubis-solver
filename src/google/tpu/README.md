@@ -11,6 +11,8 @@ client for libtpu.
 | `pjrt_probe.c` | first contact: `dlopen`, `GetPjrtApi`, plugin init, client, devices, compile a dot |
 | `tensor_pjrt.c` | the real thing: derive A/B, upload as S8, execute, copy back, digest, benchmark |
 | `sha256_pjrt.c` | the `sha256` tier: batched nonces, 343 MHash/s at 262,144 lanes |
+| `argon2_pjrt.c` | the `argon2id` tier: the 19 MiB Argon2id fill as StableHLO, lanes are independent nonces |
+| `colab_argon2.sh` | build + host check + fill selftest + throughput, from one Colab cell |
 | `pjrt_common.h` | host SHA-256, hex and clock, shared by the clients |
 | `kaggle/` | a Kaggle TPU kernel that builds and runs the probe (Kaggle's CLI accepted the TPU accelerator but attached no TPU; Colab did) |
 | `tpu_backend.c` | the same search as library code: no stdout, no `exit()`, one cached executable per challenge, `anubis_tpu_solve()` |
@@ -146,6 +148,54 @@ different way:
 3. **`comparison_type UNSIGNED` did not compare unsigned on this plugin.**
    `H0 < 2^(32-d)` therefore treated every negative word as a pass. The test is
    now `shift_right_logical(H0, 32-d) == 0`, where signedness cannot enter.
+
+## Argon2id: 19 MiB of serial memory on a systolic array
+
+`argon2_pjrt.c` runs the gate's `argon2id` tier (m=19456 KiB, t=2, p=1,
+32-byte tag, salt = the nonce) with the fill on the device.
+
+The matrix is one int32 tensor, `lanes * m * 256`: each 1 KiB block is 256
+int32, laid out as lo/hi pairs of its 128 u64, so a block is already
+little-endian on the wire. A `stablehlo.while` walks the 38,912 block
+computations of a challenge; each iteration
+
+1. gathers the previous block and, from its first word, computes
+   `index_alpha` and the reference block (u64 as an i32 pair, the signed
+   `mulhi32` trick from `sha256_pjrt.c`; no divides, no unsigned compares),
+2. runs the 16 BLAKE2 rounds of `fill_block` (128 `G`s, `fBlaMka`) on 128 u64
+   SSA values, unpacked from and repacked into the block tensor,
+3. scatters the new block back into the matrix.
+
+Two things keep the graph small enough to compile:
+
+- **The addressing schedule is not data.** Argon2id's first pass uses
+  data-independent addressing for the first half of memory, so those
+  pseudo-random words are generated on the host and uploaded once - they only
+  depend on `(m, t)`, not on the challenge or the nonce.
+- **lanes are independent nonces.** All lanes follow the same schedule, so one
+  iteration advances one block in every lane at once; the memory cost is
+  `lanes * 19 MiB`, which is why `--lanes` defaults low and the device limit,
+  not the loop, is what bounds it.
+
+H0, B0 and B1 are BLAKE2b, so they stay on the host (68 bytes of BLAKE2b per
+nonce), and so does the final 1 KiB tag. Unlike `hashx_pjrt`, the module does
+not depend on the challenge: one compiled executable serves every challenge on
+that device.
+
+```sh
+./argon2_pjrt --unit                 # u64 pair primitives, no device
+./argon2_pjrt --hosttest             # the host Argon2id vs fixed vectors
+./argon2_pjrt --lib $LIBTPU --selftest   # the graph vs the host reference
+./argon2_pjrt --lib $LIBTPU --difficulty 8 --lanes 8
+./argon2_pjrt --lib $LIBTPU --lanes 32 --difficulty 32 --bench-hashes 64 --json
+```
+
+`--dump DIR` writes the module plus its inputs and the expected tag, so the
+same StableHLO can be compiled and run on a CPU XLA client (jaxlib's MLIR
+bindings parse it; `jaxlib.xla_client.make_cpu_client()` executes it) before
+spending time on a TPU. `--dump-all` returns the whole matrix instead of the
+last block, and `--filltest` builds a single fill, both for bisecting a
+mismatch.
 
 ## Build and run
 
