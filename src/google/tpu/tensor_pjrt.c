@@ -265,6 +265,98 @@ static void digest_of(const int32_t *c, int n, char out[65]) {
     free(le);
 }
 
+/* tensor-v: C[i][j] = sum_k A[i][k] * B[j][k] */
+static void cpu_gemm_tv(const uint8_t *a, const int8_t *b, int32_t *c, int n) {
+    for (int i = 0; i < n; i++) {
+        int32_t *row = c + (size_t)i * n;
+        const uint8_t *arow = a + (size_t)i * n;
+        for (int j = 0; j < n; j++) {
+            const int8_t *brow = b + (size_t)j * n;
+            int32_t sum = 0;
+            for (int k = 0; k < n; k++) {
+                sum += (int32_t)arow[k] * (int32_t)brow[k];
+            }
+            row[j] = sum;
+        }
+    }
+}
+
+static const uint8_t tv_dom_leaf[16] = {
+    'A', 'N', 'U', 'B', 'I', 'S', '-', 'T',
+    'E', 'N', 'S', 'O', 'R', '-', 'V', 'L'};
+static const uint8_t tv_dom_node[16] = {
+    'A', 'N', 'U', 'B', 'I', 'S', '-', 'T',
+    'E', 'N', 'S', 'O', 'R', '-', 'V', 'N'};
+static const uint8_t tv_dom_chal[16] = {
+    'A', 'N', 'U', 'B', 'I', 'S', '-', 'T',
+    'E', 'N', 'S', 'O', 'R', '-', 'V', 'C'};
+
+static void tv_put_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+/* The client's commitment: one leaf per 32 int32 of C, then a Merkle tree with
+ * the odd last node duplicated. Same bytes as anubis_tensor_v_root(). */
+static void tv_root_of(const int32_t *c, int n, const char *challenge_hex,
+                       char out[65]) {
+    size_t cells = (size_t)n * (size_t)n;
+    size_t leaves = cells / 32;
+    uint8_t raw[4096];
+    size_t raw_len = hex_decode(challenge_hex, raw, sizeof raw);
+    uint8_t chal[32];
+    uint8_t *level;
+    sha256_ctx s;
+
+    sha256_init(&s);
+    sha256_update(&s, tv_dom_chal, sizeof tv_dom_chal);
+    sha256_update(&s, raw, raw_len);
+    sha256_final(&s, chal);
+
+    level = malloc(leaves * 32);
+    if (level == NULL) {
+        out[0] = '\0';
+        return;
+    }
+    for (size_t b = 0; b < leaves; b++) {
+        uint8_t idx[4], bytes[32 * 4];
+        for (int i = 0; i < 32; i++) {
+            uint32_t v = (uint32_t)c[b * 32 + i];
+            bytes[4 * i + 0] = (uint8_t)v;
+            bytes[4 * i + 1] = (uint8_t)(v >> 8);
+            bytes[4 * i + 2] = (uint8_t)(v >> 16);
+            bytes[4 * i + 3] = (uint8_t)(v >> 24);
+        }
+        tv_put_u32(idx, (uint32_t)b);
+        sha256_init(&s);
+        sha256_update(&s, tv_dom_leaf, sizeof tv_dom_leaf);
+        sha256_update(&s, chal, sizeof chal);
+        sha256_update(&s, idx, sizeof idx);
+        sha256_update(&s, bytes, sizeof bytes);
+        sha256_final(&s, level + b * 32);
+    }
+    {
+        size_t cnt = leaves;
+        while (cnt > 1) {
+            size_t next = (cnt + 1) / 2;
+            for (size_t i = 0; i < next; i++) {
+                const uint8_t *l = level + 32 * (2 * i);
+                const uint8_t *r = level + 32 * ((2 * i + 1 < cnt) ? 2 * i + 1 : 2 * i);
+                sha256_init(&s);
+                sha256_update(&s, tv_dom_node, sizeof tv_dom_node);
+                sha256_update(&s, l, 32);
+                sha256_update(&s, r, 32);
+                sha256_final(&s, level + 32 * i);
+            }
+            cnt = next;
+        }
+    }
+    to_hex(level, 32, out);
+    free(level);
+}
+
 /* ==================================================================== */
 /* PJRT                                                                 */
 /* ==================================================================== */
@@ -332,25 +424,29 @@ static int pjrt_open(const char *path) {
  * num_partitions=1 } }: field 3 -> fields 4 and 5, both varint 1. */
 static const unsigned char compile_options[] = {0x1a, 0x04, 0x20, 0x01, 0x28, 0x01};
 
-static char *build_hlo(int n) {
+/* tensor: C = A.B (contract a's k with b's k-row). tensor-v: BT rows are the
+ * contiguous B rows, so C[i][j] = sum_k A[i][k]*BT[j][k], i.e. contract both
+ * second dimensions. */
+static char *build_hlo(int n, int tv) {
     size_t cap = 2048;
     char *s = malloc(cap);
     snprintf(s, cap,
              "module {\n"
              "  func.func @main(%%a: tensor<%dx%dxi8>, %%b: tensor<%dx%dxi8>)\n"
              "      -> tensor<%dx%dxi32> {\n"
-             "    %%0 = stablehlo.dot_general %%a, %%b, contracting_dims = [1] x [0],\n"
+             "    %%0 = stablehlo.dot_general %%a, %%b, contracting_dims = [1] x [%d],\n"
              "        precision = [DEFAULT]\n"
              "        : (tensor<%dx%dxi8>, tensor<%dx%dxi8>) -> tensor<%dx%dxi32>\n"
              "    return %%0 : tensor<%dx%dxi32>\n"
              "  }\n"
              "}\n",
-             n, n, n, n, n, n, n, n, n, n, n, n, n, n);
+             n, n, n, n, n, n, tv ? 1 : 0,
+             n, n, n, n, n, n, n, n);
     return s;
 }
 
-static PJRT_LoadedExecutable *compile_dot(int n, double *compile_ms) {
-    char *hlo = build_hlo(n);
+static PJRT_LoadedExecutable *compile_dot(int n, int tv, double *compile_ms) {
+    char *hlo = build_hlo(n, tv);
     PJRT_Program prog = {0};
     PJRT_Client_Compile_Args cc = {0};
     double t0 = now_s();
@@ -501,7 +597,7 @@ static double median(double *v, int n) {
 }
 
 static int bench_one(int difficulty, int n_override, const char *challenge,
-                     int rounds, int verify, int json) {
+                     int rounds, int verify, int json, int tv) {
     int n = n_override > 0 ? n_override : tensor_dim(difficulty);
     size_t cells = (size_t)n * (size_t)n;
     uint8_t *a = malloc(cells);
@@ -520,7 +616,7 @@ static int bench_one(int difficulty, int n_override, const char *challenge,
         return -1;
     }
     tensor_expand(challenge, n, a, b);
-    ex = compile_dot(n, &compile_ms);
+    ex = compile_dot(n, tv, &compile_ms);
 
     dev_a = upload(a, n, PJRT_Buffer_Type_S8, &upload_ms);
     dev_b = upload(b, n, PJRT_Buffer_Type_S8, NULL);
@@ -534,13 +630,17 @@ static int bench_one(int difficulty, int n_override, const char *challenge,
         t_e2e = now_s();
         dev_c = execute(ex, dev_a, dev_b, &exec_ms);
         read_back(dev_c, c, cells * 4, &read_ms);
-        digest_of(c, n, gpu_hex);
         buffer_destroy(dev_c);
         execs[r] = exec_ms;
         e2es[r] = (now_s() - t_e2e) * 1000.0;
     }
     exec_ms = median(execs, rounds);
     t_e2e = median(e2es, rounds);
+    if (tv) {
+        tv_root_of(c, n, challenge, gpu_hex);
+    } else {
+        digest_of(c, n, gpu_hex);
+    }
 
     if (verify) {
         ref = malloc(cells * sizeof *ref);
@@ -549,8 +649,13 @@ static int bench_one(int difficulty, int n_override, const char *challenge,
         }
     }
     if (verify) {
-        cpu_gemm(a, b, ref, n);
-        digest_of(ref, n, cpu_hex);
+        if (tv) {
+            cpu_gemm_tv(a, b, ref, n);
+            tv_root_of(ref, n, challenge, cpu_hex);
+        } else {
+            cpu_gemm(a, b, ref, n);
+            digest_of(ref, n, cpu_hex);
+        }
         ok = strcmp(gpu_hex, cpu_hex) == 0;
         free(ref);
     } else {
@@ -564,18 +669,21 @@ static int bench_one(int difficulty, int n_override, const char *challenge,
                    "\"upload_ms\":%.2f,\"execute_ms\":%.4f,\"e2e_ms\":%.4f,"
                    "\"io_ms\":%.4f,"
                    "\"gmacs_execute\":%.2f,\"gmacs_e2e\":%.2f,\"digest_ok\":%s,"
-                   "\"digest\":\"%s\"}\n",
+                   "\"digest\":\"%s\",\"tier\":\"%s\"}\n",
                    difficulty, n, macs, compile_ms, upload_ms, exec_ms, t_e2e,
                    t_e2e - exec_ms,
                    macs / (exec_ms / 1000.0) / 1e9,
-                   macs / (t_e2e / 1000.0) / 1e9, ok ? "true" : "false", gpu_hex);
+                   macs / (t_e2e / 1000.0) / 1e9, ok ? "true" : "false", gpu_hex,
+                   tv ? "tensor-v" : "tensor");
         } else {
             printf("d=%2d N=%4d %8.1f MMAC  execute %9.4f ms (%7.1f GMAC/s)  "
                    "e2e %9.4f ms (%7.1f GMAC/s)  compile %6.0f ms  %s\n",
                    difficulty, n, macs / 1e6, exec_ms,
                    macs / (exec_ms / 1000.0) / 1e9, t_e2e,
                    macs / (t_e2e / 1000.0) / 1e9, compile_ms,
-                   verify ? (ok ? "digest ok" : "DIGEST MISMATCH") : "unverified");
+                   verify ? (ok ? (tv ? "root ok" : "digest ok")
+                                : (tv ? "ROOT MISMATCH" : "DIGEST MISMATCH"))
+                          : "unverified");
         }
         fflush(stdout);
     }
@@ -599,7 +707,7 @@ static int bench_one(int difficulty, int n_override, const char *challenge,
 int main(int argc, char **argv) {
     const char *lib = getenv("LIBTPU");
     const char *challenge = DEFAULT_CHALLENGE;
-    int rounds = 5, verify = 1, json = 0, n_override = 0;
+    int rounds = 5, verify = 1, json = 0, n_override = 0, tv = 0, cpu_root = 0;
     int diffs[16], ndiffs = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -624,12 +732,17 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--no-verify") == 0) {
             verify = 0;
+        } else if (strcmp(argv[i], "--tensor-v") == 0) {
+            tv = 1;
+        } else if (strcmp(argv[i], "--cpu-root") == 0) {
+            cpu_root = 1;
         } else if (strcmp(argv[i], "--json") == 0) {
             json = 1;
         } else {
             fprintf(stderr,
                     "usage: %s --lib /path/libtpu.so [--difficulty 4,8,12,16] "
-                    "[--n N] [--rounds 5] [--challenge HEX] [--no-verify] [--json]\n",
+                    "[--n N] [--rounds 5] [--challenge HEX] [--no-verify] [--json]\n"
+                    "       [--tensor-v] [--cpu-root]\n",
                     argv[0]);
             return 2;
         }
@@ -639,6 +752,27 @@ int main(int argc, char **argv) {
     }
     if (rounds < 1) {
         rounds = 1;
+    }
+    if (cpu_root) {
+        for (int i = 0; i < ndiffs; i++) {
+            int n = n_override > 0 ? n_override : tensor_dim(diffs[i]);
+            size_t cells = (size_t)n * (size_t)n;
+            uint8_t *a = malloc(cells);
+            int8_t *b = malloc(cells);
+            int32_t *c = malloc(cells * sizeof *c);
+            char root[65];
+            if (a == NULL || b == NULL || c == NULL) {
+                return 1;
+            }
+            tensor_expand(challenge, n, a, b);
+            cpu_gemm_tv(a, b, c, n);
+            tv_root_of(c, n, challenge, root);
+            printf("d=%2d N=%4d root=%s\n", diffs[i], n, root);
+            free(a);
+            free(b);
+            free(c);
+        }
+        return 0;
     }
     if (lib == NULL) {
         fprintf(stderr, "need --lib or LIBTPU pointing at libtpu.so\n");
@@ -653,7 +787,7 @@ int main(int argc, char **argv) {
     }
     int rc = 0;
     for (int i = 0; i < ndiffs; i++) {
-        int r = bench_one(diffs[i], n_override, challenge, rounds, verify, json);
+        int r = bench_one(diffs[i], n_override, challenge, rounds, verify, json, tv);
         if (r != 0) {
             rc = r;
         }
