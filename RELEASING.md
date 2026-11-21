@@ -264,3 +264,15 @@ Two caveats before the first upload:
 
 The version lives in two places - `__version__` in `anubis_solver.py` and
 `project.version` in `pyproject.toml`. Bump both, and `git tag v<version>`.
+
+### Publishing without a token
+
+`.github/workflows/pypi.yml` builds the sdist and a `manylinux_2_35` wheel on
+an ubuntu-22.04 runner, smoke-tests the wheel (`solve` a sha256 challenge), and
+uploads through PyPI's trusted publishing (OIDC): no API token is stored
+anywhere. It needs a one-time *pending publisher* on PyPI (project name
+`libanubis-solver`, this repository, workflow `pypi.yml`, environment `pypi`)
+and the same on TestPyPI for `workflow_dispatch` runs.
+
+Push a tag (`git tag v2.0.2 && git push origin v2.0.2`) or run the workflow
+manually with `test: true` first.

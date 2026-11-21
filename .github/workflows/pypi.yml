@@ -1,0 +1,97 @@
+name: pypi
+
+# Publishing goes through PyPI's trusted publishing (OIDC): no token in the
+# repository, no `twine` password, nothing to leak. One-time setup, on PyPI:
+#   Your projects -> Publishing -> "Add a pending publisher"
+#     PyPI project name: libanubis-solver
+#     Owner:            <the GitHub user or org that owns this fork>
+#     Repository:       anubis-solver
+#     Workflow name:    pypi.yml
+#     Environment:      pypi
+# and the same on test.pypi.org if the test job is used. Until that exists the
+# workflow fails at the upload step, not before - a build is harmless.
+#
+# The job builds on ubuntu-22.04 so the wheel needs glibc 2.35, not the 2.38 of
+# a 24.04 runner, and names the platform tag to match.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "upload to TestPyPI instead of PyPI"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: build sdist and wheel
+        env:
+          ANUBIS_WHEEL_PLAT: manylinux_2_35_x86_64
+        run: |
+          python -m pip install --upgrade build twine
+          # build from another directory: this repo has a build/ object dir and
+          # `python -m build` would import it instead of the tool
+          cd /tmp
+          python -m build --outdir "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE"
+          python -m twine check "$GITHUB_WORKSPACE"/dist/*
+
+      - name: smoke-test the wheel
+        run: |
+          python -m pip install --find-links dist libanubis-solver
+          cd /tmp
+          python -c "
+          import anubis_solver as A
+          s = A.AnubisSolver()
+          assert 'cpu' in s.backends(), s.backends()
+          ch = A.AnubisChallenge(id='t', random_data='9f3c1a7b24d5e8061c2b3a495867f0e1d2c3b4a5968778695a4b3c2d1e0f1a2b',
+                                 algorithm='sha256', difficulty=6)
+          sol = s.solve(ch)
+          print(A.__version__, s.version, s.backends_compiled(), 'nonce', sol.nonce)
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-test:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.test
+    runs-on: ubuntu-22.04
+    environment: testpypi
+    permissions:
+      id-token: write # OIDC for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    environment: pypi
+    permissions:
+      id-token: write # OIDC for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
