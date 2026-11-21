@@ -648,6 +648,34 @@ Raw data: [`results/tensor-tpu-2026-11-15.json`](results/tensor-tpu-2026-11-15.j
 Reproduce: `cc -O2 -I. -o tensor_pjrt tensor_pjrt.c -ldl` then
 `./tensor_pjrt --lib /path/libtpu.so --difficulty 4,8,12,16 --rounds 5`.
 
+## TPU: `tensor-v`, the GEMM is free
+
+The same client with `--tensor-v` (`src/google/tpu/tensor_pjrt.c`) runs the
+sampled tier's dot as `dot_general` with `contracting_dims = [1] x [1]`
+(`C[i][j] = sum_k A[i][k]*B[j][k]`) on the MXU, copies C back, and builds the
+tensor-v commitment on the host.
+
+| difficulty | N | execute | execute rate | e2e | e2e rate | copy back |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 512 | 0.212 ms | 1.27 TMAC/s | 0.436 ms | 616 GMAC/s | 0.224 ms |
+| 12 | 768 | 0.202 ms | 4.49 TMAC/s | 0.604 ms | 1.50 TMAC/s | 0.402 ms |
+| 16 | 1024 | 0.188 ms | 11.5 TMAC/s | 0.821 ms | 2.62 TMAC/s | 0.634 ms |
+
+Every root matched `anubis_tensor_v_root()` byte for byte:
+`36a0a638...` at d8, `83db3c0b...` at d12, `2478762e...` at d16. Compile is
+232-294 ms, once per challenge.
+
+One caveat before quoting the e2e column: it is execute + copy-back only. The
+Merkle tree runs on the host after the timed loop and is not included; the
+16-thread C client's `root + tree` line above is 69 ms at d16. What the TPU
+removes is the GEMM: execute is flat at ~0.2 ms and the copy-back dominates even
+at N=1024. Hashing the tree on the device is the step that would make `tensor-v`
+a single-device tier.
+
+Raw data: [`results/tensor-v-tpu-2026-11-21.json`](results/tensor-v-tpu-2026-11-21.json).
+Reproduce: `cc -O2 -I. -o tensor_pjrt tensor_pjrt.c -ldl` then
+`./tensor_pjrt --lib /path/libtpu.so --tensor-v --difficulty 8,12,16 --rounds 5 --json`.
+
 ## TPU: the `sha256` tier, 343 MHash/s
 
 The same PJRT client (`src/google/tpu/sha256_pjrt.c`) also runs the `sha256`

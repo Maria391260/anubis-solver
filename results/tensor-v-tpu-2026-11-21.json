@@ -1,0 +1,12 @@
+{
+  "when": "2026-11-21",
+  "where": "Google Colab, TPU runtime (one addressable device)",
+  "tier": "tensor-v",
+  "client": "src/google/tpu/tensor_pjrt.c (--tensor-v)",
+  "note": "e2e is execute + copy-back; the host Merkle tree is built after the timed loop and is not included. digest = the tensor-v root; all three matched anubis_tensor_v_root() byte for byte.",
+  "runs": [
+    {"difficulty": 8,  "n": 512,  "macs": 268435456,  "compile_ms": 258.48, "upload_ms": 0.17, "execute_ms": 0.2122, "e2e_ms": 0.4360, "io_ms": 0.2238, "gmacs_execute": 1265.13,  "gmacs_e2e": 615.72,  "digest_ok": true, "digest": "36a0a638c45ff3bfbcd144ea6f2524c8ba481ee374a252ebf558f6410dbeffc1"},
+    {"difficulty": 12, "n": 768,  "macs": 905969664,  "compile_ms": 232.39, "upload_ms": 0.22, "execute_ms": 0.2019, "e2e_ms": 0.6038, "io_ms": 0.4019, "gmacs_execute": 4486.55,  "gmacs_e2e": 1500.45, "digest_ok": true, "digest": "83db3c0bb8c44e5e29d2c3ef66462a80fc6587415b98f19e7b07c82102735884"},
+    {"difficulty": 16, "n": 1024, "macs": 2147483648, "compile_ms": 294.31, "upload_ms": 0.30, "execute_ms": 0.1875, "e2e_ms": 0.8212, "io_ms": 0.6337, "gmacs_execute": 11456.30, "gmacs_e2e": 2615.09, "digest_ok": true, "digest": "2478762ed371bfaf6cfcf1e5fd7feef0a5a70309336fad3c3a80f96fc3036bf9"}
+  ]
+}
