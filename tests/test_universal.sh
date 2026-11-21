@@ -65,6 +65,20 @@ for sym in anubis_backends_compiled anubis_backends_available \
     check "exports $sym" $?
 done
 
+echo "running the .so directly is handled, not a SIGSEGV"
+DIRECT_OUT="$("$LIB" 2>&1)"
+DIRECT_RC=$?
+[ "$DIRECT_RC" -eq 1 ]
+check "direct run exits 1" $?
+case "$DIRECT_OUT" in
+*"not an executable"*) ok "direct run says it is a shared library" ;;
+*) bad "direct run says it is a shared library" "$(echo "$DIRECT_OUT" | head -1)" ;;
+esac
+case "$DIRECT_OUT" in
+*"celikfana and DeepSeek V4.1 Flash"*) ok "direct run prints the credit line" ;;
+*) bad "direct run prints the credit line" ;;
+esac
+
 echo "no accelerator in DT_NEEDED (everything is dlopen()ed)"
 NEEDED="$(readelf -d "$LIB" 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')"
 printf '       deps: %s\n' "$(echo $NEEDED)"

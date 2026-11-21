@@ -16,6 +16,63 @@ client for libtpu.
 | `tpu_backend.c` | the same search as library code: no stdout, no `exit()`, one cached executable per challenge, `anubis_tpu_solve()` |
 | `tpu_backend_selftest.c` | the graceful path without libtpu (`make test-tpu`) |
 
+## TPU, VPU, or "the other VPU"?
+
+The names collide, so, briefly:
+
+- **The VPU inside a TPU.** Every TensorCore is MXU(s) + a **vector unit** +
+  a scalar unit ([Cloud TPU architecture](https://cloud.google.com/tpu/docs/system-architecture-tpu-vm));
+  TPU 8t's "more balanced vector processing" is that block. It is not a
+  separately addressable device: PJRT exposes the TPU as a whole, StableHLO is
+  the only input, and XLA decides per op whether it lands on an MXU or the
+  vector unit. `sha256_pjrt.c` is 64 rounds of elementwise integer ops and no
+  matmuls - which is exactly the vector unit's job - so this directory already
+  runs on the VPU; it just cannot name it, and there is no "VPU plugin" to
+  load instead of libtpu.
+- **Google's Video Processing Unit (VCU).** A separate, fixed-function video
+  transcoder: the 2018 "VPU" from Google's custom-compute history
+  ([blog](https://cloud.google.com/blog/topics/systems/the-past-present-and-future-of-custom-compute-at-google)),
+  then Argos (2021: two ASICs per PCIe card, ten encoder cores each, H.264 /
+  VP9 / AV1). It lives inside Google's datacenters, with no public driver, no
+  PJRT plugin and no general-purpose compute API - there is nothing here to
+  port a hash onto.
+
+So this backend is TPU-only by construction, and "run sha256 on the Google VPU"
+is already what the `sha256` tier does, through the TPU compiler. The video
+VPU is not reachable, and Intel's VPU is a different device entirely
+([docs/vpu.md](../../../docs/vpu.md)).
+
+## Which unit does the work
+
+| tier | HLO | unit |
+|---|---|---|
+| `tensor` (`tensor_pjrt.c`) | `stablehlo.dot_general` (S8 x S8 -> S32) | MXU |
+| `sha256` (`sha256_pjrt.c`) | elementwise `tensor<Nxi32>` (add / xor / and / shift / compare / convert), no dot | vector unit |
+
+So the 343 MHash/s `sha256` figure is a vector-unit measurement, and the `tensor`
+figure is an MXU one. Neither names the unit: PJRT exposes the TPU as a whole
+and XLA schedules the ops.
+
+HashX would be a vector-unit job too, and a better fit than on the GPUs in this
+tree: its program is fixed per challenge, so the whole (up to) 512-instruction
+program can be unrolled into StableHLO with the 8 virtual registers as SSA
+values - no indexed register file, which is exactly what forces the CUDA and
+Vulkan interpreters into local memory (`r[dst]` is data there). Two costs have
+to be paid instead:
+
+- HashX registers are u64 and the TPU lane is 32-bit, so every register is an
+  i32 pair and mul / umulh / smulh / rotl are emulated in 32-bit ops, the way
+  `src/vulkan/hashx.comp` does with `uvec2`. That is several vector ops per
+  HashX instruction, so expect roughly 2k-6k i32 ops per hash against ~640 for
+  the SHA-256 tier.
+- `INSTR_BRANCH` jumps back to the last `INSTR_TARGET` at most once per lane,
+  so the loop body is emitted twice and the second pass is blended in with a
+  per-lane `select` on the branch condition - branch-free, and exact.
+
+Not implemented: it would be a third module builder next to `sha256_pjrt.c`,
+compiled and cached once per challenge like `tpu_backend.c` does for `sha256`,
+and it needs a TPU to measure.
+
 ## Library ABI
 
 `tpu_backend.c` is linked into `libanubis_solver.so` and its three entry points

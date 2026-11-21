@@ -149,3 +149,14 @@ itself unavailable instead of pretending to have searched.
 
 Mesa's `rusticl` needs `RUSTICL_ENABLE=iris` and is very slow to compile the
 Argon2id kernel; a vendor ICD (Intel NEO, NVIDIA, AMD) is the intended target.
+
+## VPU (Intel NPU): not a backend
+
+Core Ultra's neural accelerator also speaks Level Zero (`ZE_INIT_FLAG_VPU_ONLY`,
+`ZE_DEVICE_TYPE_VPU`), but as **graph blobs** (`zeGraphCreate`) compiled by
+Intel's Driver Compiler, not as modules you can hand SPIR-V to. So unlike
+`levelzero_sha256.c`, there is no kernel to dispatch, and no `vpu` backend
+exists. `make vpu-probe` is the first-contact check — it reports whether the
+machine has a VPU at all and whether its driver would accept our SPIR-V
+sha256 kernel. Details and the measurement that decided this:
+[vpu.md](vpu.md).

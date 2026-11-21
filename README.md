@@ -454,6 +454,10 @@ make VULKAN=0        # force-skip Vulkan
 make L0_INC=/path    # where level_zero/ze_api.h lives
 ```
 
+`./libanubis_solver.so` is a shared library, not a program: run it and it says
+so (and who made it) and exits 1, instead of crashing at address 0. Load it
+from Python, C or one of the services.
+
 The Python module also builds the library on first import if `make` has not
 been run. Backends are auto-detected:
 

@@ -23,6 +23,10 @@ make                 # builds ./libanubis_solver.so
 python3 -c "import anubis_solver; print(anubis_solver.__version__)"   # 2.0.2
 ```
 
+`libanubis_solver.so` is a library, not a program — running it directly just
+prints that reminder (with the credit line) and exits 1. Use it from Python
+or the C services below.
+
 `make` detects what your machine offers:
 
 | found | gets built |

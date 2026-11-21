@@ -1,0 +1,14 @@
+{
+  "id": "monktelv31/anubis-hashx-tpu",
+  "title": "anubis hashx tpu",
+  "code_file": "run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["monktelv31/anubis-hashx-tpu-src"],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "accelerator": "TpuV5E8"
+}

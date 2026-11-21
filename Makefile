@@ -84,9 +84,20 @@ endif
 endif
 LINK     ?= $(CC)
 
+# A '-shared' link leaves the ELF entry point at 0, so `./libanubis_solver.so`
+# loads the file as a static PIE, jumps to address 0 and dies with SIGSEGV.
+# Point the entry at src/core/direct_run.c instead: it prints "this is a shared
+# library, not an executable" plus the credit line through raw syscalls and
+# exits 1. dlopen() ignores the entry point, so loading is unchanged.
+# nvcc is the linker on CUDA builds and wants -Xlinker rather than -Wl,.
+ENTRY_SYM  := anubis_lib_entry
+ENTRY_FLAG := $(if $(findstring nvcc,$(notdir $(LINK))),-Xlinker -e -Xlinker $(ENTRY_SYM),-Wl,-e,$(ENTRY_SYM))
+LDFLAGS    += $(ENTRY_FLAG)
+
 LIB      := libanubis_solver.so
 BUILD    := build
-CORE_SRC := src/core/anubis_solver.c src/core/nvidia_boost.c src/hashx/hashx.c
+CORE_SRC := src/core/anubis_solver.c src/core/nvidia_boost.c src/core/direct_run.c \
+            src/hashx/hashx.c
 
 # Optional Vulkan backend (SHA-256 challenges). Auto-detects the headers;
 # the library dlopen()s libvulkan.so.1 at runtime, so there is no hard
@@ -255,7 +266,7 @@ DEP := $(OBJ:.o=.d)
 .DEFAULT_GOAL := all
 
 .PHONY: all test clean shader windows services test-api test-mcp test-impersonate impersonate-lib \
-        universal report test-universal test-tpu
+        universal report test-universal test-tpu vpu-probe
 
 # The Windows pair and the release zip/msi: a mingw-w64 cross build, no Windows
 # needed. `make windows WIN_ARGS=--smoke` also runs a challenge/pass round trip
@@ -374,6 +385,16 @@ test: $(LIB) test-tpu
 	python3 tests/test_core.py
 	python3 tests/test_tensor_v.py
 	python3 tests/test_tensor_v_gate.py
+
+# First contact with an Intel VPU/NPU ("Versatile Processing Unit", the
+# Meteor Lake+ neural accelerator): does Level Zero see one, and does its
+# driver accept our SPIR-V sha256 kernel? Needs only libze_loader at run time
+# and the vendored ze_api.h at build time, so it builds and runs anywhere -
+# a machine with no VPU reports exactly that. See docs/vpu.md.
+.PHONY: vpu-probe
+vpu-probe: $(BUILD)/vpu-probe
+$(BUILD)/vpu-probe: tools/vpu_probe.c | $(BUILD)
+	$(CC) $(CFLAGS) $(INC) -o $@ $< -ldl
 
 shader:
 	bash tools/build_shader.sh

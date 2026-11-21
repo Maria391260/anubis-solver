@@ -11,6 +11,7 @@ Start with [BEGINNER.md](../BEGINNER.md) if this is your first run.
 | [api-service.md](api-service.md) | the C HTTP API service: `/v1/solve`, `/v1/verify`, `/v1/fetch`, `/v1/fetch_raw`, `/v1/dump_headers`, `/v1/backends` |
 | [cli.md](cli.md) | the command-line interface |
 | [gpu.md](gpu.md) | CUDA, Level Zero, Vulkan, OpenCL and TPU backends, env vars |
+| [vpu.md](vpu.md) | the Intel VPU/NPU: why `sha256` is not ported, and the `make vpu-probe` first contact |
 | [troubleshooting.md](troubleshooting.md) | common build and runtime errors |
 | [development.md](development.md) | layout, building, regenerating kernels, tests |
 
