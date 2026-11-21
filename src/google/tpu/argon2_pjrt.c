@@ -2024,7 +2024,6 @@ static void diag_case(int cm, int ct, int cl, const uint8_t *raw, size_t raw_len
         free(ref);
     }
     free(outmem);
-    free(mod);
     for (int i = 0; i < 3; i++) {
         buffer_destroy(args[i]);
     }
@@ -2087,7 +2086,7 @@ int main(int argc, char **argv)
             serialize_path = argv[++i];
         } else if (strcmp(argv[i], "--dump-all") == 0) {
             g_dump_mem = 1;
-        } else if (strcmp(argv[i], "--selftest-sched") == 0) {
+        } else if (strcmp(argv[i], "--run-matrix") == 0) {
             mode = 6;
         } else if (strcmp(argv[i], "--sched") == 0) {
             g_sched = 1;
@@ -2191,25 +2190,69 @@ int main(int argc, char **argv)
     }
 
     if (mode == 6) {
-        int cm = 8, ct = 2, cl = 4;
-        int32_t *b0 = malloc((size_t)cl * 1024);
-        int32_t *b1 = malloc((size_t)cl * 1024);
-        uint32_t *addr = calloc((size_t)cm / 2, 4);
+        /* run the matrix out and print word 0 of every block, per lane */
+        int64_t dblk[2] = {lanes, 256};
+        int64_t daddr[1] = {(int64_t)(m / 2)};
+        int32_t *b0 = malloc((size_t)lanes * 1024);
+        int32_t *b1 = malloc((size_t)lanes * 1024);
+        uint32_t *addr = calloc((size_t)m / 2, 4);
+        int32_t *outmem = malloc((size_t)lanes * m * 1024);
+        int old = g_dump_mem;
 
-        if (b0 == NULL || b1 == NULL || addr == NULL) {
+        if (b0 == NULL || b1 == NULL || addr == NULL || outmem == NULL) {
             return 1;
         }
-        a2_addr_table((uint32_t)cm, (uint32_t)ct, addr);
-        for (int l = 0; l < cl; l++) {
-            a2_inputs(raw, raw_len, (uint32_t)l, (uint32_t)cm, (uint32_t)ct,
+        a2_addr_table((uint32_t)m, (uint32_t)t, addr);
+        for (int l = 0; l < lanes; l++) {
+            a2_inputs(raw, raw_len, (uint32_t)l, (uint32_t)m, (uint32_t)t,
                       b0 + (size_t)l * 256, b1 + (size_t)l * 256);
         }
-        g_sched = 1;
-        g_host_sched = 1;
-        diag_case(cm, ct, cl, raw, raw_len, addr, b0, b1);
+        g_dump_mem = 1;
+        {
+            char *mod = build_module(lanes, m, t);
+            int compile_ms = 0, old2 = g_dump_mem;
+            PJRT_LoadedExecutable *ex;
+            PJRT_Buffer *args[3] = {NULL, NULL, NULL};
+            PJRT_Buffer *res;
+            double ms = 0;
+
+            g_dump_mem = old2;
+            ex = compile(mod, &compile_ms);
+            upload_into(&args[0], b0, dblk, 2);
+            upload_into(&args[1], b1, dblk, 2);
+            upload_into(&args[2], addr, daddr, 1);
+            res = execute(ex, args, 3, &ms);
+            read_back(res, outmem, (size_t)lanes * m * 1024);
+            printf("# matrix m=%d t=%d lanes=%d sched=%d compile %d ms run "
+                   "%.2f ms\n", m, t, lanes, g_sched, compile_ms, ms);
+            for (int l = 0; l < lanes; l++) {
+                printf("M %d", l);
+                for (int k = 0; k < m; k++) {
+                    const int32_t *got = outmem + ((size_t)l * m + k) * 256;
+                    uint64_t w0 = (uint32_t)got[0] |
+                                  ((uint64_t)(uint32_t)got[1] << 32);
+
+                    printf(" %016llx", (unsigned long long)w0);
+                }
+                printf("\n");
+            }
+            for (int i = 0; i < 3; i++) {
+                buffer_destroy(args[i]);
+            }
+            buffer_destroy(res);
+            {
+                PJRT_LoadedExecutable_Destroy_Args ed = {0};
+
+                ed.struct_size = sizeof ed;
+                ed.executable = ex;
+                api->PJRT_LoadedExecutable_Destroy(&ed);
+            }
+        }
+        g_dump_mem = old;
         free(b0);
         free(b1);
         free(addr);
+        free(outmem);
         {
             PJRT_Client_Destroy_Args cd = {0};
 
@@ -2437,7 +2480,7 @@ int main(int argc, char **argv)
             }
             runner_free(&r);
             free(tags);
-            free(mod);
+            g_b.len = 0;   /* mod points into the global buffer */
             {
                 PJRT_Client_Destroy_Args cd = {0};
 
