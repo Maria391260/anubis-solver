@@ -238,7 +238,7 @@ static int cv(int a, const char *from, const char *to)
     int r = newval(0, 0);
 
     bprintf(&g_b, "    %%v%d = \"stablehlo.convert\"(%%v%d) : "
-                  "(tensor<%d%s>) -> tensor<%d%s>\n",
+                  "(tensor<%dx%s>) -> tensor<%dx%s>\n",
             r, a, g_lanes, from, g_lanes, to);
     if (v_known[a]) {
         v_known[r] = 1;
