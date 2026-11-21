@@ -1246,9 +1246,9 @@ static char *build_module(int lanes, int m, int t)
         int g1, g2, g3, slice, sslice, is, p0p, refA0, refA1, refA, start1,
             startpos, prev, prevb, pseudop, ltp, dip, clamp, paddrv,
             pseudo, rel, t1, rel2, absv, over, refidx, prevblk, refblk, currblk,
-            withxor, tblock, ublock, vblock, newblk, memx, i2, p2, wrap, i1v;
+            withxor, ublock, vblock, newblk, memx, i2, p2, wrap, i1v;
         int tlo[256], plo[256], rlo[256], clo[256];
-        u64v rprev[128], rref[128], rcurr[128], rout[128], tpair[128];
+        u64v rprev[128], rref[128], rcurr[128], rout[128];
 
         g1 = cmp_cc("GE", i, c32((uint32_t)seg));
         g2 = cmp_cc("GE", i, c32((uint32_t)(2 * seg)));
@@ -1291,14 +1291,12 @@ static char *build_module(int lanes, int m, int t)
         currblk = gather_block(mem, bin(OP_ADD, base, i));
 
         withxor = cmp_cc("GT", p, zero);
-        tblock = bxor(prevblk, refblk);
-        {
+
+        if (g_sched) {
+            int tblock = bxor(prevblk, refblk);
             int predb = bcast_pred(withxor);
 
             ublock = bsel(predb, bxor(tblock, currblk), tblock);
-        }
-
-        if (g_sched) {
             memx = scatter_block(mem, bin(OP_ADD, base, i), ublock);
             goto sched_done;
         }
@@ -1310,16 +1308,12 @@ static char *build_module(int lanes, int m, int t)
             rref[k] = pair(rlo[2 * k], rlo[2 * k + 1]);
             rcurr[k] = pair(clo[2 * k], clo[2 * k + 1]);
         }
-        unpack_block(tblock, tlo);
-        for (int k = 0; k < 128; k++) {
-            tpair[k] = pair(tlo[2 * k], tlo[2 * k + 1]);
-        }
         fill_hlo(rprev, rref, rcurr, withxor, rout);
         for (int k = 0; k < 256; k++) {
             tlo[k] = (k & 1) ? rout[k / 2].hi : rout[k / 2].lo;
         }
         vblock = pack_block(tlo);
-        newblk = bxor(ublock, vblock);
+        newblk = vblock;
 
         memx = scatter_block(mem, bin(OP_ADD, base, i), newblk);
 
@@ -1331,7 +1325,6 @@ sched_done:
 
         bprintf(&g_b, "      stablehlo.return %%v%d, %%v%d, %%v%d : %s, %s, "
                       "%s\n", memx, i2, p2, SH_MEM, SH_VEC, SH_VEC);
-        (void)tpair;
     }
     bprintf(&g_b, "    }) : (%s, %s, %s) -> (%s, %s, %s)\n", SH_MEM, SH_VEC,
             SH_VEC, SH_MEM, SH_VEC, SH_VEC);
