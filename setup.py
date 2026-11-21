@@ -34,7 +34,7 @@ TREE = ("Makefile", "src", "include", "third_party")
 
 
 class BinaryDistribution(Distribution):
-    def has_ext_modules(self):  # noqa: D102 - setuptools hook
+    def has_ext_modules(self):  # setuptools hook
         return True
 
 
