@@ -150,6 +150,7 @@ results that came out negative.
 |---|---|---|
 | SHA-256 in wasm, 4 nonces wide | **1.8-2.1x** Anubis's own module (3.0-3.9 vs 1.7-1.9 M hashes/s) | `cd wasm && make && node bench-sha256.mjs` |
 | HashX compiled from the challenge | **7-8x** Anubis's module (2.9-3.2 vs 0.37-0.44 M hashes/s) | `cd wasm && node verify-jit.mjs` |
+| HashX on a TPU | **75.3 MHash/s** on one TPU device, 7.8x one CPU thread | [`src/google/tpu/hashx_pjrt.c`](src/google/tpu/hashx_pjrt.c), [SPEED.md](SPEED.md#hashx-on-a-tpu-colab-pjrt) |
 | Argon2id, whole hash | **1.02-1.05x** Anubis's module (65-75 vs 68-76 ms/hash) | `cd wasm && make verify-module` |
 | Argon2id fill core | parity with Anubis (~1.5-1.9 µs/block) | `cd wasm && node bench-a2i.mjs` |
 | Browser, native library | **10x** the in-page wasm at difficulty 20 | `python3 firefox-extension/test-native.py` |
@@ -586,13 +587,19 @@ libanubis_solver 2.0.2
 | `levelzero` | Intel Xe (Arc, Iris Xe); same four | vendored `ze_api.h` | `libze_loader.so.1` |
 | `vulkan` | any Vulkan GPU (AMD, Intel, NVIDIA, lavapipe) | `vulkan.h` | `libvulkan.so.1` |
 | `opencl` | any OpenCL ICD (Intel NEO, AMD, NVIDIA, Mesa) | `CL/cl.h` | `libOpenCL.so.1` |
-| `tpu` | Google TPU; the `sha256` tier | nothing | `libtpu.so` (`ANUBIS_TPU_LIB`) |
+| `tpu` | Google TPU; the `sha256` tier (HashX is measured by the standalone client) | nothing | `libtpu.so` (`ANUBIS_TPU_LIB`) |
 
 Dispatch order is `cuda → levelzero → vulkan → opencl → tpu → cpu`, each gated
 by a work threshold so the CPU keeps solving low difficulties. The inventory is
 part of the C API: `anubis_backends_compiled()`, `anubis_backends_available()`
 and `anubis_backend_name()`, plus `"backends_compiled"` in `/v1/version`,
 `GET /v1/backends` in the API service and the `anubis_backends` MCP tool.
+
+The TPU `hashx` tier is not in the dispatch yet: `src/google/tpu/hashx_pjrt.c`
+compiles a challenge's HashX program to StableHLO and measured **75.3 MHash/s**
+on one Colab TPU device (2,097,152 hashes in 27.8 ms, 14.6 s compile), 7.8x one
+CPU thread and ~65% of the two-T4 PTX interpreter - see
+[SPEED.md](SPEED.md#hashx-on-a-tpu-colab-pjrt).
 
 The TPU is also directly callable: `anubis_tpu_available()`,
 `anubis_tpu_info()` and `anubis_tpu_solve()` are exported ABI (see
