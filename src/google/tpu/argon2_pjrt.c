@@ -66,6 +66,7 @@ static int g_lanes;
 static int g_m, g_t;
 static int g_dump_mem;   /* --dump-all: return the whole matrix (debug) */
 static int g_filltest;   /* --filltest: one block fill, no loop (debug) */
+static int g_filltest1;  /* --filltest1: one BLAKE2 round, for a cheap check */
 static char SH_VEC[64], SH_BLK[64], SH_IDX[64], SH_MEM[64], SH_PRED[64],
     SH_PREDB[64];
 
@@ -1134,9 +1135,12 @@ static char *build_module(int lanes, int m, int t)
             "-> %s {\n",
             a0, SH_BLK, a1, SH_BLK, a2v, half, g_dump_mem ? SH_MEM : SH_BLK);
 
+    if (g_filltest1) {
+        g_filltest = 1;
+    }
     if (g_filltest) {
         int lo[256], hi[256];
-        u64v va[128], vb[128], vc[128], out[128];
+        u64v va[128], vb[128], vc[128], out[128], rcur[128];
         int pred;
 
         unpack_block(a0, lo);
@@ -1148,7 +1152,32 @@ static char *build_module(int lanes, int m, int t)
         memset(vc, 0, sizeof vc);
         for (int k = 0; k < 128; k++) vc[k] = pair(c32(0), c32(0));
         pred = andp(cmp_cc("GT", c32(0), c32(0)), cmp_cc("GT", c32(0), c32(0)));
-        fill_hlo(va, vb, vc, pred, out);
+        if (g_filltest1) {
+            /* one BLAKE2 round only, cheap enough for a CPU XLA check:
+             * 1 = column round 0, 2 = row round 0 (strided word selection) */
+            u64v r0[16], v0[16];
+            int idx[16];
+
+            for (int k = 0; k < 128; k++) out[k] = pair(c32(0), c32(0));
+            for (int k = 0; k < 128; k++) rcur[k] = xor64(va[k], vb[k]);
+            for (int k = 0; k < 16; k++) idx[k] = k;
+            if (g_filltest1 == 2) {
+                for (int j = 0; j < 8; j++) {
+                    idx[2 * j] = 16 * j;
+                    idx[2 * j + 1] = 16 * j + 1;
+                }
+            }
+            for (int k = 0; k < 16; k++) {
+                r0[k] = rcur[idx[k]];
+                v0[k] = r0[k];
+            }
+            round16(v0);
+            for (int k = 0; k < 16; k++) {
+                out[idx[k]] = xor64(r0[k], v0[k]);
+            }
+        } else {
+            fill_hlo(va, vb, vc, pred, out);
+        }
         for (int k = 0; k < 256; k++) {
             lo[k] = (k & 1) ? out[k / 2].hi : out[k / 2].lo;
         }
@@ -1955,6 +1984,10 @@ int main(int argc, char **argv)
             serialize_path = argv[++i];
         } else if (strcmp(argv[i], "--dump-all") == 0) {
             g_dump_mem = 1;
+        } else if (strcmp(argv[i], "--filltest2") == 0) {
+            g_filltest1 = 2;
+        } else if (strcmp(argv[i], "--filltest1") == 0) {
+            g_filltest1 = 1;
         } else if (strcmp(argv[i], "--filltest") == 0) {
             g_filltest = 1;
         } else if (strcmp(argv[i], "--force") == 0) {
@@ -1971,7 +2004,9 @@ int main(int argc, char **argv)
                     "          [--serialize FILE] [--force] "
                     "[--init-timeout S]\n"
                     "       %s --hosttest | --unit | --emit | --dump DIR | "
-                    "--selftest\n",
+                    "--selftest\n"
+                    "       debug: --dump-all | --filltest | --filltest1 | "
+                    "--filltest2\n",
                     argv[0], argv[0]);
             return 2;
         }
