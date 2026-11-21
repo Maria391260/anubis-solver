@@ -1589,6 +1589,39 @@ static void serialize_executable(PJRT_LoadedExecutable *ex, const char *path)
     api->PJRT_Executable_Destroy(&ed);
 }
 
+/* Load a serialized executable: the graph depends only on (m, t, lanes), so
+ * one compile can serve a whole session of runs. */
+static PJRT_LoadedExecutable *load_executable(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    long sz;
+    char *data;
+    PJRT_Executable_DeserializeAndLoad_Args da = {0};
+
+    if (f == NULL) {
+        fprintf(stderr, "load: %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) <= 0 ||
+        fseek(f, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "load: %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    data = malloc((size_t)sz);
+    if (data == NULL || fread(data, 1, (size_t)sz, f) != (size_t)sz) {
+        fprintf(stderr, "load: %s: short read\n", path);
+        exit(1);
+    }
+    fclose(f);
+    da.struct_size = sizeof da;
+    da.client = client;
+    da.serialized_executable = data;
+    da.serialized_executable_size = (size_t)sz;
+    die_error(api->PJRT_Executable_DeserializeAndLoad(&da), "deserialize");
+    free(data);
+    return da.loaded_executable;
+}
+
 /* ==================================================================== */
 /* host side: inputs, tags, checks                                      */
 /* ==================================================================== */
@@ -2050,6 +2083,7 @@ int main(int argc, char **argv)
     const char *data = DEFAULT_DATA;
     const char *dump_dir = NULL;
     const char *serialize_path = NULL;
+    const char *load_path = NULL;
     int m = 19456, t = 2, lanes = 32, difficulty = 15;
     int json = 0, mode = 0, force = 0, init_timeout = 120;
     long long bench_hashes = 0;
@@ -2082,6 +2116,8 @@ int main(int argc, char **argv)
             dump_dir = argv[++i];
         } else if (strcmp(argv[i], "--selftest") == 0) {
             mode = 5;
+        } else if (strcmp(argv[i], "--load") == 0 && i + 1 < argc) {
+            load_path = argv[++i];
         } else if (strcmp(argv[i], "--serialize") == 0 && i + 1 < argc) {
             serialize_path = argv[++i];
         } else if (strcmp(argv[i], "--dump-all") == 0) {
@@ -2435,7 +2471,10 @@ int main(int argc, char **argv)
     {
         char *mod = build_module(lanes, m, t);
         int compile_ms = 0;
-        PJRT_LoadedExecutable *ex = compile(mod, &compile_ms);
+        PJRT_LoadedExecutable *ex;
+
+        ex = load_path != NULL ? load_executable(load_path)
+                               : compile(mod, &compile_ms);
         uint8_t *tags = malloc((size_t)lanes * 32);
         runner r;
         double t0;
