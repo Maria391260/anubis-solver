@@ -2207,9 +2207,13 @@ int main(int argc, char **argv)
             a2_inputs(raw, raw_len, (uint32_t)l, (uint32_t)m, (uint32_t)t,
                       b0 + (size_t)l * 256, b1 + (size_t)l * 256);
         }
-        if (g_filltest) {
+        if (g_filltest || g_filltest1) {
             /* one fill (or a truncated one): print the 128 output words */
-            char *mod = build_module(1, m, t);
+            char *mod;
+
+            g_filltest = 1;
+            g_dump_mem = 0;
+            mod = build_module(1, m, t);
             int compile_ms = 0;
             PJRT_LoadedExecutable *ex;
             PJRT_Buffer *args[3] = {NULL, NULL, NULL};
