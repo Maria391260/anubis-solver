@@ -1,1 +1,7 @@
-src/google/tpu/argon2_pjrt
+argon2_pjrt
+hashx_pjrt
+tensor_pjrt
+sha256_pjrt
+pjrt_probe
+*.o
+tpu_backend_selftest
