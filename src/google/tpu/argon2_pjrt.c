@@ -1934,13 +1934,14 @@ static void runner_free(runner *r)
 
 /* run one window of `lanes` nonces starting at base; returns blocks in r->out */
 static int runner_run(runner *r, const uint8_t *raw, size_t raw_len,
-                      uint32_t base, double *ms)
+                      uint32_t base, double *dev_ms, double *in_ms)
 {
     int64_t dblk[2] = {r->lanes, 256};
     int64_t daddr[1] = {(int64_t)(r->m / 2)};
     PJRT_Buffer *args[3] = {NULL, NULL, NULL};
     PJRT_Buffer *res;
     int rc = 0;
+    double t_in = pjrt_now_s();
 
     for (int l = 0; l < r->lanes; l++) {
         static int32_t tb0[256], tb1[256];
@@ -1952,10 +1953,13 @@ static int runner_run(runner *r, const uint8_t *raw, size_t raw_len,
         memcpy(r->b0 + (size_t)l * 256, tb0, 1024);
         memcpy(r->b1 + (size_t)l * 256, tb1, 1024);
     }
+    if (in_ms != NULL) {
+        *in_ms = (pjrt_now_s() - t_in) * 1000.0;
+    }
     upload_into(&args[0], r->b0, dblk, 2);
     upload_into(&args[1], r->b1, dblk, 2);
     upload_into(&args[2], r->addr, daddr, 1);
-    res = execute(r->ex, args, 3, ms);
+    res = execute(r->ex, args, 3, dev_ms);
     read_back(res, r->out, (size_t)r->lanes * 1024);
     for (int i = 0; i < 3; i++) {
         buffer_destroy(args[i]);
@@ -2080,6 +2084,7 @@ int main(int argc, char **argv)
     int m = 19456, t = 2, lanes = 32, difficulty = 15;
     int json = 0, mode = 0, force = 0, init_timeout = 120;
     long long bench_hashes = 0;
+    double stress_s = 0;
     uint8_t raw[4096];
     size_t raw_len;
 
@@ -2096,6 +2101,8 @@ int main(int argc, char **argv)
             lanes = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--difficulty") == 0 && i + 1 < argc) {
             difficulty = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--stress") == 0 && i + 1 < argc) {
+            stress_s = atof(argv[++i]);
         } else if (strcmp(argv[i], "--bench-hashes") == 0 && i + 1 < argc) {
             bench_hashes = atoll(argv[++i]);
         } else if (strcmp(argv[i], "--hosttest") == 0) {
@@ -2470,7 +2477,6 @@ int main(int argc, char **argv)
                                : compile(mod, &compile_ms);
         uint8_t *tags = malloc((size_t)lanes * 32);
         runner r;
-        double t0;
         long long done = 0, hits = 0;
         uint32_t base = 0, found_nonce = 0;
         int found = 0;
@@ -2495,86 +2501,152 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        /* one untimed window warms the executable */
-        if (runner_run(&r, raw, raw_len, 0, NULL) != 0) {
+        /* one untimed window warms the executable (and the device) */
+        if (runner_run(&r, raw, raw_len, 0, NULL, NULL) != 0) {
             return 1;
         }
-        t0 = pjrt_now_s();
-        while (1) {
-            double ms = 0;
+        {
+            enum { MAXWIN = 8192 };
+            static double wdev[MAXWIN];
+            double wall0 = pjrt_now_s();
+            double dev_sum = 0, in_sum = 0, tag_sum = 0;
+            int nw = 0;
 
-            if (runner_run(&r, raw, raw_len, base, &ms) != 0) {
-                return 1;
-            }
-            for (int l = 0; l < lanes; l++) {
-                lane_tag(r.out, lanes, l, tags + 32 * l);
-                if (bits_ok(tags + 32 * l, difficulty)) {
-                    hits++;
-                    if (!found) {
-                        found = 1;
-                        found_nonce = base + (uint32_t)l;
+            while (nw < MAXWIN) {
+                double dev_ms = 0, in_ms = 0, tag_ms = 0;
+                double tw;
+
+                if (runner_run(&r, raw, raw_len, base, &dev_ms, &in_ms) != 0) {
+                    return 1;
+                }
+                tw = pjrt_now_s();
+                for (int l = 0; l < lanes; l++) {
+                    lane_tag(r.out, lanes, l, tags + 32 * l);
+                    if (bits_ok(tags + 32 * l, difficulty)) {
+                        hits++;
+                        if (!found) {
+                            found = 1;
+                            found_nonce = base + (uint32_t)l;
+                        }
                     }
                 }
-            }
-            done += lanes;
-            base += (uint32_t)lanes;
-            if (bench_hashes > 0) {
-                if (done >= bench_hashes) {
+                tag_ms = (pjrt_now_s() - tw) * 1000.0;
+                wdev[nw] = dev_ms;
+                dev_sum += dev_ms;
+                in_sum += in_ms;
+                tag_sum += tag_ms;
+                nw++;
+                done += lanes;
+                base += (uint32_t)lanes;
+                if (base == 0) {
                     break;
                 }
-            } else if (found) {
-                break;
-            }
-            if (base == 0) {
-                break;
-            }
-        }
-        {
-            double ms = (pjrt_now_s() - t0) * 1000.0;
-            char hex[65] = "";
-            int verified = 0;
-
-            if (found) {
-                uint8_t ref[32];
-                uint8_t salt[8];
-
-                make_salt(salt, found_nonce);
-                if (a2_ref((uint32_t)m, (uint32_t)t, raw, raw_len, salt, 8,
-                           ref, NULL) == 0) {
-                    verified = bits_ok(ref, difficulty) &&
-                               memcmp(ref, tags + 32 * (found_nonce - (base - (uint32_t)lanes)), 32) == 0;
-                    pjrt_to_hex(ref, 32, hex);
-                }
-            }
-            if (json) {
-                printf("{\"hashes\":%lld,\"ms\":%.3f,\"h_s\":%.3f,"
-                       "\"lanes\":%d,\"m\":%d,\"t\":%d,\"difficulty\":%d,"
-                       "\"compile_ms\":%d,\"nonce\":%u,\"tag\":\"%s\","
-                       "\"verified\":%s,\"hits\":%lld}\n",
-                       done, ms, (double)done / (ms / 1000.0), lanes, m, t,
-                       difficulty, compile_ms, found ? found_nonce : 0, hex,
-                       verified ? "true" : "false", hits);
-            } else {
-                printf("lanes=%d m=%d t=%d difficulty=%d hashes=%lld %.1f ms "
-                       "= %.2f H/s compile=%d ms\n", lanes, m, t, difficulty,
-                       done, ms, (double)done / (ms / 1000.0), compile_ms);
-                if (found) {
-                    printf("nonce=%u tag=%s %s\n", found_nonce, hex,
-                           verified ? "verified" : "VERIFICATION FAILED");
+                if (stress_s > 0) {
+                    if (pjrt_now_s() - wall0 >= stress_s) {
+                        break;
+                    }
                 } else if (bench_hashes > 0) {
-                    printf("(benchmark only, hits=%lld)\n", hits);
+                    if (done >= bench_hashes) {
+                        break;
+                    }
+                } else if (found) {
+                    break;
                 }
             }
-            runner_free(&r);
-            free(tags);
-            g_b.len = 0;   /* mod points into the global buffer */
             {
-                PJRT_Client_Destroy_Args cd = {0};
+                double wall = (pjrt_now_s() - wall0) * 1000.0;
+                double h_s = (double)done / (wall / 1000.0);
+                double steady = 0;
+                double p50 = 0, p95 = 0, pmax = 0, pmin = 0;
+                char hex[65] = "";
+                int verified = 0;
 
-                cd.struct_size = sizeof cd;
-                api->PJRT_Client_Destroy(&cd);
+                if (found) {
+                    uint8_t ref[32];
+                    uint8_t salt[8];
+
+                    make_salt(salt, found_nonce);
+                    if (a2_ref((uint32_t)m, (uint32_t)t, raw, raw_len, salt, 8,
+                               ref, NULL) == 0) {
+                        verified = bits_ok(ref, difficulty) &&
+                                   memcmp(ref, tags + 32 * (found_nonce -
+                                          (base - (uint32_t)lanes)), 32) == 0;
+                        pjrt_to_hex(ref, 32, hex);
+                    }
+                }
+                if (nw > 0) {
+                    double *sc = malloc((size_t)nw * sizeof *sc);
+
+                    if (sc != NULL) {
+                        memcpy(sc, wdev, (size_t)nw * sizeof *sc);
+                        for (int a = 0; a < nw; a++) {
+                            for (int b = a + 1; b < nw; b++) {
+                                if (sc[b] < sc[a]) {
+                                    double t = sc[a];
+
+                                    sc[a] = sc[b];
+                                    sc[b] = t;
+                                }
+                            }
+                        }
+                        pmin = sc[0];
+                        p50 = sc[nw / 2];
+                        p95 = sc[(int)(nw * 0.95) < nw ? (int)(nw * 0.95) : nw - 1];
+                        pmax = sc[nw - 1];
+                        free(sc);
+                    }
+                    if (nw > 1) {
+                        double ds = 0;
+
+                        for (int k = 1; k < nw; k++) {
+                            ds += wdev[k];
+                        }
+                        steady = (double)(done - lanes) / (ds / 1000.0);
+                    } else {
+                        steady = h_s;
+                    }
+                }
+                if (json) {
+                    printf("{\"hashes\":%lld,\"windows\":%d,\"ms\":%.3f,"
+                           "\"h_s\":%.3f,\"steady_h_s\":%.3f,"
+                           "\"dev_ms\":%.3f,\"win_min_ms\":%.3f,"
+                           "\"win_p50_ms\":%.3f,\"win_p95_ms\":%.3f,"
+                           "\"win_max_ms\":%.3f,\"host_in_ms\":%.3f,"
+                           "\"host_tag_ms\":%.3f,\"lanes\":%d,\"m\":%d,"
+                           "\"t\":%d,\"difficulty\":%d,\"compile_ms\":%d,"
+                           "\"nonce\":%u,\"tag\":\"%s\",\"verified\":%s,"
+                           "\"hits\":%lld}\n",
+                           done, nw, wall, h_s, steady, dev_sum, pmin, p50,
+                           p95, pmax, in_sum, tag_sum, lanes, m, t,
+                           difficulty, compile_ms, found ? found_nonce : 0,
+                           hex, verified ? "true" : "false", hits);
+                } else {
+                    printf("lanes=%d m=%d t=%d difficulty=%d nonces=%lld "
+                           "windows=%d wall=%.1f ms = %.2f H/s\n", lanes, m, t,
+                           difficulty, done, nw, wall, h_s);
+                    printf("  steady (all but the first window): %.2f H/s\n",
+                           steady);
+                    printf("  device execute: %.1f ms total, per window "
+                           "min=%.1f p50=%.1f p95=%.1f max=%.1f ms\n",
+                           dev_sum, pmin, p50, p95, pmax);
+                    printf("  host: inputs %.1f ms, tags %.1f ms (total, all "
+                           "windows)\n", in_sum, tag_sum);
+                    if (found) {
+                        printf("nonce=%u tag=%s %s\n", found_nonce, hex,
+                               verified ? "verified" : "VERIFICATION FAILED");
+                    }
+                }
+                runner_free(&r);
+                free(tags);
+                g_b.len = 0;   /* mod points into the global buffer */
+                {
+                    PJRT_Client_Destroy_Args cd = {0};
+
+                    cd.struct_size = sizeof cd;
+                    api->PJRT_Client_Destroy(&cd);
+                }
+                return found && !verified ? 1 : 0;
             }
-            return found && !verified ? 1 : 0;
         }
     }
 }

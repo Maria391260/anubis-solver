@@ -44,3 +44,9 @@ echo "== graph vs host reference"
 echo "== full size (m=19456, t=2), 32 lanes, 128 nonces, difficulty 8"
 "$OUT" --lib "$LIBTPU_PATH" --lanes 32 --difficulty 8 --bench-hashes 128 \
        --serialize /tmp/argon2_19456x2x32.pjrt --json
+
+# Steady state: the executable is loaded from the file above, so no compile,
+# and the first window is discarded as warm-up. This is the "hot" number.
+echo "== stress, 20 s, 32 lanes, loaded executable"
+"$OUT" --lib "$LIBTPU_PATH" --load /tmp/argon2_19456x2x32.pjrt --lanes 32 \
+       --difficulty 32 --stress 20 --json
