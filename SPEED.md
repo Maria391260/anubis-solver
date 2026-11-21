@@ -676,6 +676,66 @@ Raw data: [`results/tensor-v-tpu-2026-11-21.json`](results/tensor-v-tpu-2026-11-
 Reproduce: `cc -O2 -I. -o tensor_pjrt tensor_pjrt.c -ldl` then
 `./tensor_pjrt --lib /path/libtpu.so --tensor-v --difficulty 8,12,16 --rounds 5 --json`.
 
+## TPU: Argon2id, the chain is the wall
+
+The `argon2id` tier is m=19456 KiB, t=2, p=1: 38,912 one-kilobyte block
+computations per nonce, each one depending on the block before it. Unlike
+`sha256` (independent messages) and `tensor` (a GEMM), there is no parallelism
+*inside* a nonce, so
+[`src/google/tpu/argon2_pjrt.c`](src/google/tpu/argon2_pjrt.c) parallelises the
+only thing it can - nonces. The whole matrix is one int32 tensor
+(`lanes * m * 256`, u64 as lo/hi pairs), a `stablehlo.while` walks the 38,912
+steps, and every lane advances one block per iteration; `index_alpha` is i32
+pairs with `mulhi32`, no divides and no unsigned compares, and pass 0's
+data-independent address words are uploaded once because they depend only on
+`(m, t)`.
+
+Correctness came first, because a wrong fill also "runs fast". The device's
+fill was compared with the host reference at one column round, one row round,
+2 rounds, 4 rounds and the full 8+8 rounds - bit-identical at every truncation
+- and the selftest passes at m=8/t=1 and m=64/t=2 (4 lanes). One real bug was
+found this way and it was in the graph, not the device: the loop XORed `q` back
+into a result that already contained it, so the first fill was right and every
+later block was `rounds(t)` alone.
+
+| | Argon2id, m=19456, t=2 |
+|---|---:|
+| 1 CPU thread, this machine | 35.3 H/s (28.3 ms/hash) |
+| 2x Xeon E5-2680 v4, 28 threads | 411 H/s |
+| **TPU v5e-1, 32 lanes** | **9.38 H/s** |
+
+Measured with the executable deserialized (`--load`), so no compile is in the
+loop, and with the first window discarded: 192 nonces in 6 windows, 20.5 s wall,
+9.376 H/s, steady state 9.379 H/s. The per-window device time is 3411.6-3411.8
+ms across all six windows - flat to 0.006%, which is what a latency-bound chain
+looks like. That is 106.6 ms per nonce chain, or 87.7 us per block fill for all
+32 lanes at once. Host cost is 4.1 ms of input blocks and 0.5 ms of tags per
+window, 0.13% of the wall, and the 20.7 MB serialized executable compiles in
+11.9 s once per `(m, t, lanes)`.
+
+Why the 819 GB/s does not help: a block fill touches the previous block, the
+reference block, the block being replaced and the write - ~4 KiB, so a window
+of 32 nonces moves 4.86 GiB in 3.41 s, **1.42 GiB/s, or 0.19% of HBM**. To
+saturate the HBM at this chain length you would need ~17,000 lanes, which is
+330 GiB of matrix - 21x the chip's memory. The body is also only ~20k i32 ops
+per fill; 87.7 us is ~140k cycles at 1.6 GHz, about 7 cycles per vector op,
+i.e. the dependency chain, not issue rate or bandwidth.
+
+So `argon2id` stays on the CPU. The honest summary is that the TPU is 3.8x
+slower than **one** CPU core here and ~44x slower than the 28-thread Xeon,
+and that this is the tier where the device's advantages (bandwidth, MXUs) are
+structurally irrelevant. The obvious follow-up is a lane sweep: 32 lanes cost
+637 MB of the 16 GB HBM and the per-window time was already sub-linear at 1 vs
+4 lanes (166 vs 112 ms at m=64/t=2), so 128-256 lanes may still be free in time
+- 128 lanes would be ~37 H/s, 256 lanes ~75 H/s, both below the CPU tier.
+
+Raw data: [`results/argon2id-tpu-2026-11-21.json`](results/argon2id-tpu-2026-11-21.json).
+Reproduce: `cc -O2 -I. -o argon2_pjrt argon2_pjrt.c -ldl` in
+`src/google/tpu`, then
+`./argon2_pjrt --lib $LIBTPU --run-matrix --selftest` for correctness and
+`./argon2_pjrt --lib $LIBTPU --lanes 32 --difficulty 32 --stress 20 --json`
+for the rate (add `--serialize F` once, `--load F` afterwards).
+
 ## TPU: the `sha256` tier, 343 MHash/s
 
 The same PJRT client (`src/google/tpu/sha256_pjrt.c`) also runs the `sha256`

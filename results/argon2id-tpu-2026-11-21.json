@@ -1,0 +1,39 @@
+{
+  "what": "Argon2id (m=19456 KiB, t=2, p=1, 32-byte tag) with the memory fill on one TPU v5e-1 chip, through the PJRT C API",
+  "how": "src/google/tpu/argon2_pjrt.c; lanes are independent nonces, one stablehlo.while over the 38912 block computations",
+  "device": "Colab TPU v5e-1 (single chip), libtpu 0.0.53.1, PJRT API 0.118",
+  "correctness": {
+    "fill_vs_host_reference": "bit-exact: 1 column round, 1 row round, 2 rounds, 4 rounds, 8+8 rounds all matched word for word",
+    "selftest": {"m": 8, "t": 1, "lanes": 1, "tags_ok": "1/1", "compile_ms": 13388},
+    "selftest_m64": {"m": 64, "t": 2, "lanes": 4, "tags_ok": "4/4", "compile_ms": 11912}
+  },
+  "benchmark": {
+    "m": 19456, "t": 2, "lanes": 32, "difficulty": 8,
+    "nonces": 128, "windows": 4, "wall_ms": 13651.401,
+    "h_s": 9.376, "steady_h_s": 9.380,
+    "dev_ms": 13646.711,
+    "window_ms": {"min": 3411.610, "p50": 3411.683, "p95": 3411.788, "max": 3411.788},
+    "host_in_ms": 2.619, "host_tag_ms": 0.331,
+    "compile_ms": 11945, "serialized_bytes": 20705385
+  },
+  "stress": {
+    "seconds": 20, "lanes": 32, "difficulty": 32,
+    "nonces": 192, "windows": 6, "wall_ms": 20477.383,
+    "h_s": 9.376, "steady_h_s": 9.379,
+    "window_ms": {"min": 3411.561, "p50": 3411.760, "p95": 3411.807, "max": 3411.807},
+    "host_in_ms": 4.114, "host_tag_ms": 0.518,
+    "note": "executable loaded from the serialized file, no compile in the loop"
+  },
+  "derived": {
+    "ms_per_nonce_chain": 106.6,
+    "us_per_block_fill_all_lanes": 87.68,
+    "traffic_per_window_gib": 4.86,
+    "bandwidth_gib_s": 1.42,
+    "fraction_of_819_gb_s_hbm": 0.0019
+  },
+  "cpu_reference": {
+    "engine": "anubis_verify_argon2id, single thread",
+    "ms_per_hash": 28.3,
+    "h_s": 35.3
+  }
+}

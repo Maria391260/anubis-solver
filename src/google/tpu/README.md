@@ -190,6 +190,17 @@ that device.
 ./argon2_pjrt --lib $LIBTPU --lanes 32 --difficulty 32 --bench-hashes 64 --json
 ```
 
+Measured on one v5e-1 chip at m=19456, t=2, 32 lanes: **9.38 H/s** (192 nonces
+in 6 windows, 20.5 s, steady state 9.379, per-window device time 3411.6-3411.8
+ms). That is 3.8x slower than one CPU core running the reference engine, and
+the point of the number is that the 819 GB/s HBM is not reachable: a window
+moves 4.86 GiB in 3.41 s, 1.42 GiB/s or 0.19% of the HBM, because the next
+block cannot start until the previous one is written. The compile is 11.9 s
+once per `(m, t, lanes)` and serializes to 20.7 MB; the host side is 4.1 ms of
+input blocks and 0.5 ms of tags per window. `--stress SECONDS` reports the
+steady-state rate with the first window discarded, and `--load FILE` reuses a
+serialized executable so no compile is in the measurement.
+
 `--dump DIR` writes the module plus its inputs and the expected tag, so the
 same StableHLO can be compiled and run on a CPU XLA client (jaxlib's MLIR
 bindings parse it; `jaxlib.xla_client.make_cpu_client()` executes it) before
