@@ -63,6 +63,7 @@ typedef struct {
 
 static buf_t g_b;
 static int g_lanes;
+static int g_device_index;  /* which addressable device to use (multi-chip slices) */
 static int g_m, g_t;
 static int g_dump_mem;   /* --dump-all: return the whole matrix (debug) */
 static int g_filltest;   /* --filltest: one block fill, no loop (debug) */
@@ -1412,7 +1413,15 @@ static void pjrt_open(const char *path)
         fprintf(stderr, "no devices\n");
         exit(1);
     }
-    device = da.addressable_devices[0];
+    if (g_device_index < 0 ||
+        (size_t)g_device_index >= da.num_addressable_devices) {
+        fprintf(stderr, "device index %d out of range: %zu addressable device(s)\n",
+                g_device_index, da.num_addressable_devices);
+        exit(1);
+    }
+    device = da.addressable_devices[g_device_index];
+    fprintf(stderr, "devices: %zu addressable, using %d\n",
+            da.num_addressable_devices, g_device_index);
 }
 
 static const unsigned char compile_options[] = {0x1a, 0x04, 0x20, 0x01, 0x28,
@@ -2099,6 +2108,8 @@ int main(int argc, char **argv)
             t = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--lanes") == 0 && i + 1 < argc) {
             lanes = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--device-index") == 0 && i + 1 < argc) {
+            g_device_index = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--difficulty") == 0 && i + 1 < argc) {
             difficulty = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--stress") == 0 && i + 1 < argc) {
@@ -2142,7 +2153,8 @@ int main(int argc, char **argv)
             json = 1;
         } else {
             fprintf(stderr,
-                    "usage: %s --lib libtpu.so [--m KIB] [--t N] [--lanes B]\n"
+                    "usage: %s --lib libtpu.so [--m KIB] [--t N] [--lanes B] "
+                    "[--device-index K]\n"
                     "          [--data HEX] [--difficulty BITS] "
                     "[--bench-hashes N] [--json]\n"
                     "          [--serialize FILE] [--force] "

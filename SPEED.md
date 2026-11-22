@@ -778,6 +778,18 @@ release, in order to skip an 11.9 s compile that `--serialize`/`--load` already
 skips. Not worth it, and it cannot move a chain that costs ~7 cycles per vector
 op because of dependency latency rather than issue rate.
 
+### Adding chips is free, lanes are not
+
+A slice with eight addressable devices (v3-8, v5e-8) needs no sharding for this
+tier: lanes are independent nonces, so one process per device is eight
+independent problems. `--device-index K` selects the device and
+[`src/google/tpu/colab_argon2_multidev.sh`](src/google/tpu/colab_argon2_multidev.sh)
+starts one process per chip, sums the per-device steady rate and prints the
+per-chip chain time. One chip measures 9.376-9.381 H/s with flat windows, so
+eight chips should read ~75 H/s - still below the 28-thread Xeon's 411 H/s, and
+the only way this tier wins is many lanes per chip, which is exactly the axis
+the chain punishes. That sweep is the open question, not this one.
+
 ## TPU: the `sha256` tier, 343 MHash/s
 
 The same PJRT client (`src/google/tpu/sha256_pjrt.c`) also runs the `sha256`
