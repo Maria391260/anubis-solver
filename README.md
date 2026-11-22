@@ -156,6 +156,7 @@ results that came out negative.
 |---|---|---|
 | SHA-256 in wasm, 4 nonces wide | **1.8-2.1x** Anubis's own module (3.0-3.9 vs 1.7-1.9 M hashes/s) | `cd wasm && make && node bench-sha256.mjs` |
 | HashX compiled from the challenge | **7-8x** Anubis's module (2.9-3.2 vs 0.37-0.44 M hashes/s) | `cd wasm && node verify-jit.mjs` |
+| SHA-256 on a TPU | **700.2 MHash/s** at 16.7M lanes, 84x one CPU core | [`src/google/tpu/sha256_pjrt.c`](src/google/tpu/sha256_pjrt.c), [SPEED.md](SPEED.md#tpu-the-sha256-tier-700-mhashs) |
 | HashX on a TPU | **284.6 MHash/s** on one TPU device, 29x one CPU thread | [`src/google/tpu/hashx_pjrt.c`](src/google/tpu/hashx_pjrt.c), [SPEED.md](SPEED.md#hashx-on-a-tpu-colab-pjrt) |
 | Argon2id on a TPU | **9.4 H/s** at 32 lanes, **3.8x slower** than one CPU core - the dependency chain wins | [`src/google/tpu/argon2_pjrt.c`](src/google/tpu/argon2_pjrt.c), [SPEED.md](SPEED.md#tpu-argon2id-the-chain-is-the-wall) |
 | Argon2id, whole hash | **1.02-1.05x** Anubis's module (65-75 vs 68-76 ms/hash) | `cd wasm && make verify-module` |

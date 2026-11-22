@@ -10,7 +10,7 @@ client for libtpu.
 | `pjrt_c_api.h` | vendored from `openxla/xla` (API 0.118); TPU images ship the plugin but not the header |
 | `pjrt_probe.c` | first contact: `dlopen`, `GetPjrtApi`, plugin init, client, devices, compile a dot |
 | `tensor_pjrt.c` | the real thing: derive A/B, upload as S8, execute, copy back, digest, benchmark |
-| `sha256_pjrt.c` | the `sha256` tier: batched nonces, 343 MHash/s at 262,144 lanes |
+| `sha256_pjrt.c` | the `sha256` tier: batched nonces, 700 MHash/s at 16.7M lanes |
 | `argon2_pjrt.c` | the `argon2id` tier: the 19 MiB Argon2id fill as StableHLO, lanes are independent nonces |
 | `colab_argon2.sh` | build + host check + fill selftest + throughput, from one Colab cell |
 | `pjrt_common.h` | host SHA-256, hex and clock, shared by the clients |
@@ -51,7 +51,7 @@ VPU is not reachable, and Intel's VPU is a different device entirely
 | `tensor` (`tensor_pjrt.c`) | `stablehlo.dot_general` (S8 x S8 -> S32) | MXU |
 | `sha256` (`sha256_pjrt.c`) | elementwise `tensor<Nxi32>` (add / xor / and / shift / compare / convert), no dot | vector unit |
 
-So the 343 MHash/s `sha256` figure is a vector-unit measurement, and the `tensor`
+So the 700 MHash/s `sha256` figure is a vector-unit measurement, and the `tensor`
 figure is an MXU one. Neither names the unit: PJRT exposes the TPU as a whole
 and XLA schedules the ops.
 
@@ -72,8 +72,10 @@ to be paid instead:
   per-lane `select` on the branch condition - branch-free, and exact.
 
 Implemented in [`hashx_pjrt.c`](hashx_pjrt.c), compiled once per challenge and
-measured on one Colab TPU device: **75.3 MHash/s** (2,097,152 hashes in 27.8 ms,
-compile 14.6 s), 7.8x one CPU thread and ~65% of the two-T4 PTX interpreter.
+measured on one Colab TPU device: **284.6 MHash/s** at an 8.4M-lane window
+(compile ~20 s), 29x one CPU thread and 2.5x the two-T4 PTX interpreter. The
+window is the knob: 32,768 lanes gives 74.1 MH/s, 262,144 gives 198.3,
+1,048,576 gives 252.3.
 The serialized executable is a `xla.TpuExecutableProto` with a
 `jellyfish.TpuCompilationEnvironment`. See
 [`SPEED.md`](../../../SPEED.md#hashx-on-a-tpu-colab-pjrt).
@@ -132,9 +134,11 @@ that is what makes an int8 tier measurable here at all.
 
 `sha256_pjrt` is the tier this hardware is actually good at: independent
 one-block messages, no chaining. Window size dominates everything (see
-[`SPEED.md`](../../../SPEED.md#tpu-the-sha256-tier-343-mhashs)); at 262,144
-lanes it measures 343 MHash/s, ~43x the browser's wasm kernel. Three bugs cost
-real Colab round trips and are worth recording because each was invisible in a
+[`SPEED.md`](../../../SPEED.md#tpu-the-sha256-tier-700-mhashs)); it measures
+700 MHash/s at a 16.7M-lane window, ~84x one AVX2 core of the browser's wasm
+kernel. Until this sweep the client refused windows above 262,144 lanes, which
+is where the older 343 MHash/s figure came from - our assertion, not the chip.
+Three bugs cost real Colab round trips and are worth recording because each was invisible in a
 different way:
 
 1. **Nonce byte position inside a big-endian word.** The block words are
