@@ -754,7 +754,11 @@ backend"), and the code emitters `xla_llvm_isa_emitter{,_force,_bundles}`;
 the `xla_jf_*` ones are rejected there. That is the closest thing to a boost
 button in this library, and it is untested here because it needs a device:
 [`src/google/tpu/colab_argon2_flags.sh`](src/google/tpu/colab_argon2_flags.sh)
-runs the same serialized executable under each flag and prints steady H/s.
+runs the same serialized executable under each flag and prints steady H/s,
+and [`src/google/tpu/colab_tpu_flags_all.sh`](src/google/tpu/colab_tpu_flags_all.sh)
+does the same for all five tiers at once - sha256, hashx, argon2id, tensor and
+tensor-v - with argon2id recompiled per flag set so a codegen flag is not
+silently ignored by `--load`.
 
 There is no clock, voltage or power-limit flag: 17 of the 2,797 names match
 clock/freq/throttle/power at all, and they point the other way -
