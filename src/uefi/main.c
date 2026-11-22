@@ -72,7 +72,7 @@ static int handle_frame(const char *req, int len, char *resp, int cap, void *ctx
     }
 }
 
-EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
+EFI_STATUS anubis_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     anubis_cpu_t now;
     EFI_STATUS cached;
 

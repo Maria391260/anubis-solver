@@ -17,10 +17,10 @@ CFLAGS    += -I$(EFIINC) -I$(EFIINC)/$(ARCH) -Ishim/include -I. \
              -DGNU_EFI_USE_MS_ABI -fno-stack-protector -fpic -fshort-wchar \
              -mno-red-zone -O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11
 LDFLAGS   += -nostdlib -znocombreloc -T $(LIBDIR)/elf_$(ARCH)_efi.lds \
-             -shared -Bsymbolic -L$(LIBDIR) $(LIBDIR)/crt0-efi-$(ARCH).o
-LIBS      += -lefi -lgnuefi
+             -shared -Bsymbolic -L$(LIBDIR) -e _start
+LIBS      +=
 
-OBJS      := crt.o guids.o cpu.o caps.o json.o sha256.o timer.o mp.o net.o solve.o main.o
+OBJS      := entry.o crt.o guids.o cpu.o caps.o json.o sha256.o timer.o mp.o net.o solve.o main.o
 
 all: anubis.efi
 
@@ -33,7 +33,7 @@ anubis.efi: anubis.so
 	        --target=efi-app-$(ARCH) $< $@
 
 anubis.so: $(OBJS)
-	ld $(LDFLAGS) $(OBJS) $(LIBS) -o $@
+	ld $(LDFLAGS) $(OBJS) -o $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
