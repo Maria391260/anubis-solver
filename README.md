@@ -3,6 +3,20 @@
 [![PyPI](https://img.shields.io/pypi/v/libanubis-solver.svg)](https://pypi.org/project/libanubis-solver/)
 [![Python versions](https://img.shields.io/pypi/pyversions/libanubis-solver.svg)](https://pypi.org/project/libanubis-solver/)
 
+> **Wanted: a live `soteria` sample.** Upstream Anubis documents a `soteria`
+> challenge — a SIMD wasm one — but registers no implementation for it, so there is
+> nothing in that tree to port and nothing to measure
+> ([`betterAnusbis/PARITY.md`](betterAnusbis/PARITY.md)). **If you find a site that
+> actually issues one, open an issue with the URL** and it can be reverse engineered
+> from the wire format and supported like the other seven tiers.
+>
+> Useful, in this order: the URL; the challenge JSON — the `{"challenge": …,
+> "rules": …}` block, or what `POST /api/make-challenge` answers; the Anubis version,
+> or the hash of the served JS; and whether you are happy for the host to be named in
+> the issue. **Please do not paste cookies, auth headers, or anything from a
+> logged-in session** — the challenge is public and is the only part needed, and one
+> request is enough.
+
 `pip install libanubis-solver` (the PyPI name `anubis-solver` is an unrelated
 project; the import name is `anubis_solver` either way).
 
@@ -504,6 +518,7 @@ Makefile at install time.
 | `sha256` (WASM) | SHA-256(raw challenge + uint32 nonce) | leading zero bits | ✅ |
 | `argon2id` (WASM) | Argon2id(password=challenge, salt=u64 nonce) | leading zero bits | ✅ |
 | `hashx` (WASM) | HashX program derived from the challenge | leading zero bits | ✅ |
+| `soteria` | a SIMD wasm challenge, documented upstream with **no implementation registered** | unknown until a sample exists | ❌ needs a live sample — [see the top of this file](#anubis-solver) |
 
 Byte-exact details:
 
