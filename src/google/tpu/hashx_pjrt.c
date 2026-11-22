@@ -1174,7 +1174,7 @@ int main(int argc, char **argv)
         u64v w[4];
         int flag;
 
-        if (lanes < 1 || lanes > 262144) {
+        if (lanes < 1 || lanes > 1048576) {
             fprintf(stderr, "--window out of range\n");
             return 2;
         }
@@ -1190,7 +1190,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "need --lib or LIBTPU\n");
         return 2;
     }
-    if (lanes < 1 || lanes > 262144) {
+    if (lanes < 1 || lanes > 1048576) {
         fprintf(stderr, "--window out of range\n");
         return 2;
     }

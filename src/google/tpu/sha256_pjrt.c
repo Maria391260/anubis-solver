@@ -30,11 +30,14 @@
  * Run:    ./sha256_pjrt --lib libtpu.so --challenge HEX --difficulty 20
  */
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <glob.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "pjrt_c_api.h"
 #include "pjrt_common.h"
@@ -507,6 +510,7 @@ int main(int argc, char **argv) {
     const char *lib = getenv("LIBTPU");
     const char *challenge = DEFAULT_CHALLENGE;
     int difficulty = 20, lanes = 32768, json = 0;
+    int force = 0, init_timeout = 20;
     long long bench_hashes = 0;
     uint8_t raw[4096];
     size_t raw_len;
@@ -527,12 +531,17 @@ int main(int argc, char **argv) {
             lanes = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--bench-hashes") == 0 && i + 1 < argc) {
             bench_hashes = atoll(argv[++i]);
+        } else if (strcmp(argv[i], "--force") == 0) {
+            force = 1;
+        } else if (strcmp(argv[i], "--init-timeout") == 0 && i + 1 < argc) {
+            init_timeout = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--json") == 0) {
             json = 1;
         } else {
             fprintf(stderr, "usage: %s --lib libtpu.so [--challenge HEX] "
                             "[--difficulty BITS] [--window LANES] "
-                            "[--bench-hashes N] [--json]\n", argv[0]);
+                            "[--bench-hashes N] [--json] [--force] "
+                            "[--init-timeout S]\n", argv[0]);
             return 2;
         }
     }
@@ -540,9 +549,32 @@ int main(int argc, char **argv) {
         fprintf(stderr, "need --lib or LIBTPU\n");
         return 2;
     }
-    if (lanes < 1 || lanes > 262144) {
+    if (lanes < 1 || lanes > 1048576) {
         fprintf(stderr, "--window out of range\n");
         return 2;
+    }
+    /* Preflight: libtpu's plugin init blocks on a host with no TPU instead of
+     * returning an error, so check for a VFIO group or an accel node and fail
+     * fast, then keep a hard alarm around the initialization anyway. --force
+     * skips the check. */
+    if (!force) {
+        glob_t g;
+        int have = access("/dev/accel", F_OK) == 0;
+
+        if (!have && glob("/dev/vfio/[0-9]*", 0, NULL, &g) == 0) {
+            have = g.gl_pathc > 0;
+            globfree(&g);
+        }
+        if (!have) {
+            fprintf(stderr,
+                    "no TPU device node (numeric /dev/vfio/<group> or "
+                    "/dev/accel) - this host has no TPU; use --force to try "
+                    "PJRT_Plugin_Initialize anyway\n");
+            return 3;
+        }
+    }
+    if (init_timeout > 0) {
+        alarm((unsigned)init_timeout);
     }
     raw_len = pjrt_hex_decode(challenge, raw, sizeof raw);
     if (raw_len == 0 || raw_len + 4 > 55) {
@@ -553,6 +585,9 @@ int main(int argc, char **argv) {
     build_block(raw, raw_len, words);
 
     pjrt_open(lib);
+    if (init_timeout > 0) {
+        alarm(0);
+    }
     if (difficulty < 1 || difficulty > 32) {
         fprintf(stderr, "--difficulty must be 1..32 for the device-side test\n");
         return 2;
