@@ -20,7 +20,7 @@ LDFLAGS   += -nostdlib -znocombreloc -T $(LIBDIR)/elf_$(ARCH)_efi.lds \
              -shared -Bsymbolic -L$(LIBDIR) $(LIBDIR)/crt0-efi-$(ARCH).o
 LIBS      += -lefi -lgnuefi
 
-OBJS      := crt.o cpu.o caps.o json.o sha256.o timer.o net.o solve.o main.o
+OBJS      := crt.o cpu.o caps.o json.o sha256.o timer.o mp.o net.o solve.o main.o
 
 all: anubis.efi
 

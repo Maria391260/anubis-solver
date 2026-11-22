@@ -3,9 +3,15 @@
 #include <string.h>
 
 #include "json.h"
+#include "mp.h"
 #include "sha256.h"
-#include "timer.h"
 #include "solve.h"
+#include "timer.h"
+
+#define CHUNK 8192u
+
+static const uint32_t H0[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+                               0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
 
 static int hexval(int c) {
     if (c >= '0' && c <= '9') {
@@ -35,6 +41,24 @@ static int hex_decode(const char *hex, uint8_t *out, int max) {
     return n;
 }
 
+static int leading_zero_bits(const uint8_t d[32], int bits) {
+    int i, n = 0;
+
+    for (i = 0; i < 32 && n < bits; i++) {
+        if (d[i] == 0) {
+            n += 8;
+            continue;
+        }
+        for (int b = 7; b >= 0 && n < bits; b--) {
+            if (d[i] & (1u << b)) {
+                return n >= bits;
+            }
+            n++;
+        }
+    }
+    return n >= bits;
+}
+
 int solve_parse(const char *json, solve_req_t *r) {
     memset(r, 0, sizeof *r);
     if (json_str(json, "algo", r->algo, sizeof r->algo) != 0) {
@@ -55,43 +79,106 @@ int solve_parse(const char *json, solve_req_t *r) {
     return 0;
 }
 
-static int leading_zero_bits(const uint8_t d[32], int bits) {
-    int i, n = 0;
-
-    for (i = 0; i < 32 && n < bits; i++) {
-        if (d[i] == 0) {
-            n += 8;
-            continue;
-        }
-        for (int b = 7; b >= 0 && n < bits; b--) {
-            if (d[i] & (1u << b)) {
-                return n >= bits;
-            }
-            n++;
-        }
-    }
-    return n >= bits;
-}
-
 int solve_caps_json(const char *model, int kernel, unsigned long long solved,
                     char *out, size_t n) {
     return snprintf(out, n,
                     "{\"ok\":true,\"caps\":{\"model\":\"%s\",\"kernel\":\"%s\","
-                    "\"solved\":%llu}}",
-                    model, anubis_kernel_name(kernel), solved);
+                    "\"cpus\":%d,\"solved\":%llu}}",
+                    model, anubis_kernel_name(kernel), mp_count(), solved);
+}
+
+/* ---- the scan ---------------------------------------------------------- */
+
+typedef struct {
+    const solve_req_t *r;
+    uint8_t block[64];
+    int raw_len;
+    int use_le;
+    volatile long next_chunk;
+    volatile int found;
+    unsigned long long nonce;
+    uint8_t digest[32];
+} scan_job;
+
+static int scan_once(scan_job *j, unsigned long long nonce, uint8_t digest[32]) {
+    uint32_t h[8];
+    int i;
+
+    if (j->use_le) {
+        j->block[j->raw_len + 0] = (uint8_t)nonce;
+        j->block[j->raw_len + 1] = (uint8_t)(nonce >> 8);
+        j->block[j->raw_len + 2] = (uint8_t)(nonce >> 16);
+        j->block[j->raw_len + 3] = (uint8_t)(nonce >> 24);
+    } else {
+        j->block[j->raw_len + 0] = (uint8_t)(nonce >> 24);
+        j->block[j->raw_len + 1] = (uint8_t)(nonce >> 16);
+        j->block[j->raw_len + 2] = (uint8_t)(nonce >> 8);
+        j->block[j->raw_len + 3] = (uint8_t)nonce;
+    }
+    for (i = 0; i < 8; i++) {
+        h[i] = H0[i];
+    }
+    anubis_sha256_block(h, j->block);
+    for (i = 0; i < 8; i++) {
+        digest[i * 4 + 0] = (uint8_t)(h[i] >> 24);
+        digest[i * 4 + 1] = (uint8_t)(h[i] >> 16);
+        digest[i * 4 + 2] = (uint8_t)(h[i] >> 8);
+        digest[i * 4 + 3] = (uint8_t)h[i];
+    }
+    return leading_zero_bits(digest, j->r->difficulty);
+}
+
+/* Runs on the BSP and on every AP. Chunks are claimed with one locked add, so
+ * no two workers scan the same nonce and no per-CPU argument is needed. */
+static void scan_worker(void *arg) {
+    scan_job *j = arg;
+    unsigned long long end = j->r->start + j->r->count;
+
+    for (;;) {
+        long c;
+        unsigned long long base, hi, n;
+        uint8_t d[32];
+
+        if (j->found) {
+            return;
+        }
+        c = mp_atomic_add(&j->next_chunk, 1);
+        base = j->r->start + (unsigned long long)c * CHUNK;
+        if (base >= end) {
+            return;
+        }
+        hi = base + CHUNK;
+        if (hi > end) {
+            hi = end;
+        }
+        for (n = base; n < hi; n++) {
+            if (scan_once(j, n, d)) {
+                if (mp_atomic_cas(&j->found, 0, 1)) {
+                    j->nonce = n;
+                    memcpy(j->digest, d, 32);
+                }
+                return;
+            }
+        }
+    }
+}
+
+static int hex32(const uint8_t d[32], char out[65]) {
+    int i;
+
+    for (i = 0; i < 32; i++) {
+        out[i * 2] = "0123456789abcdef"[d[i] >> 4];
+        out[i * 2 + 1] = "0123456789abcdef"[d[i] & 15];
+    }
+    out[64] = '\0';
+    return 0;
 }
 
 int solve_run(const solve_req_t *r, const anubis_cpu_t *cpu, char *out, size_t n) {
-    static const uint32_t h0[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u,
-                                   0xa54ff53au, 0x510e527fu, 0x9b05688cu,
-                                   0x1f83d9abu, 0x5be0cd19u};
+    static scan_job job;
     uint8_t raw[64];
-    uint8_t block[64];
-    uint8_t digest[32];
-    uint32_t h[8];
-    int raw_len, i, use_le;
-    unsigned long long nonce, attempts = 0;
     uint64_t t0, t1, cycles;
+    int raw_len, i;
 
     if (strcmp(r->algo, "sha256") != 0) {
         return snprintf(out, n,
@@ -103,63 +190,44 @@ int solve_run(const solve_req_t *r, const anubis_cpu_t *cpu, char *out, size_t n
     if (raw_len <= 0 || raw_len + 4 > 55) {
         return snprintf(out, n, "{\"ok\":false,\"error\":\"bad challenge\"}");
     }
-    use_le = raw[raw_len - 1] >= 0x80;
 
-    memset(block, 0, sizeof block);
-    memcpy(block, raw, (size_t)raw_len);
-    block[raw_len + 4] = 0x80;                    /* padding byte */
-    block[62] = (uint8_t)((raw_len + 4) >> 5);    /* length in bits, high */
-    block[63] = (uint8_t)((raw_len + 4) << 3);    /* and low */
+    memset(&job, 0, sizeof job);
+    job.r = r;
+    job.raw_len = raw_len;
+    job.use_le = raw[raw_len - 1] >= 0x80;
+    memcpy(job.block, raw, (size_t)raw_len);
+    job.block[raw_len + 4] = 0x80;
+    job.block[62] = (uint8_t)((raw_len + 4) >> 5);
+    job.block[63] = (uint8_t)((raw_len + 4) << 3);
 
     t0 = timer_now();
-    for (nonce = r->start; nonce < r->start + r->count; nonce++) {
-        if (use_le) {
-            block[raw_len + 0] = (uint8_t)nonce;
-            block[raw_len + 1] = (uint8_t)(nonce >> 8);
-            block[raw_len + 2] = (uint8_t)(nonce >> 16);
-            block[raw_len + 3] = (uint8_t)(nonce >> 24);
-        } else {
-            block[raw_len + 0] = (uint8_t)(nonce >> 24);
-            block[raw_len + 1] = (uint8_t)(nonce >> 16);
-            block[raw_len + 2] = (uint8_t)(nonce >> 8);
-            block[raw_len + 3] = (uint8_t)nonce;
-        }
-        for (i = 0; i < 8; i++) {
-            h[i] = h0[i];
-        }
-        anubis_sha256_block(h, block);
-        for (i = 0; i < 8; i++) {
-            digest[i * 4 + 0] = (uint8_t)(h[i] >> 24);
-            digest[i * 4 + 1] = (uint8_t)(h[i] >> 16);
-            digest[i * 4 + 2] = (uint8_t)(h[i] >> 8);
-            digest[i * 4 + 3] = (uint8_t)h[i];
-        }
-        attempts++;
-        if (leading_zero_bits(digest, r->difficulty)) {
-            char hex[65];
-            t1 = timer_now();
-            cycles = t1 - t0;
-            for (i = 0; i < 32; i++) {
-                hex[i * 2] = "0123456789abcdef"[digest[i] >> 4];
-                hex[i * 2 + 1] = "0123456789abcdef"[digest[i] & 15];
-            }
-            hex[64] = '\0';
-            return snprintf(out, n,
-                            "{\"ok\":true,\"hit\":true,\"algo\":\"sha256\","
-                            "\"kernel\":\"%s\",\"nonce\":%llu,\"attempts\":%llu,"
-                            "\"us\":%llu,\"cycles\":%llu,\"digest\":\"%s\"}",
-                            anubis_kernel_name(anubis_cpu_pick(cpu)), nonce,
-                            attempts, (unsigned long long)timer_us(cycles),
-                            (unsigned long long)cycles, hex);
-        }
+    if (mp_count() > 1) {
+        mp_run(scan_worker, &job);
+    } else {
+        scan_worker(&job);
     }
     t1 = timer_now();
     cycles = t1 - t0;
+
+    if (job.found) {
+        char hex[65];
+        hex32(job.digest, hex);
+        return snprintf(out, n,
+                        "{\"ok\":true,\"hit\":true,\"algo\":\"sha256\","
+                        "\"kernel\":\"%s\",\"nonce\":%llu,\"attempts\":%llu,"
+                        "\"us\":%llu,\"cycles\":%llu,\"threads\":%d,"
+                        "\"digest\":\"%s\"}",
+                        anubis_kernel_name(anubis_cpu_pick(cpu)), job.nonce,
+                        job.nonce - r->start + 1,
+                        (unsigned long long)timer_us(cycles),
+                        (unsigned long long)cycles, mp_count(), hex);
+    }
+    (void)i;
     return snprintf(out, n,
                     "{\"ok\":true,\"hit\":false,\"algo\":\"sha256\","
                     "\"kernel\":\"%s\",\"attempts\":%llu,\"us\":%llu,"
-                    "\"cycles\":%llu}",
-                    anubis_kernel_name(anubis_cpu_pick(cpu)), attempts,
+                    "\"cycles\":%llu,\"threads\":%d}",
+                    anubis_kernel_name(anubis_cpu_pick(cpu)), r->count,
                     (unsigned long long)timer_us(cycles),
-                    (unsigned long long)cycles);
+                    (unsigned long long)cycles, mp_count());
 }

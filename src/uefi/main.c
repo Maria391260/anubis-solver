@@ -17,6 +17,7 @@
 #include "json.h"
 #include "net.h"
 #include "shim.h"
+#include "mp.h"
 #include "timer.h"
 #include "solve.h"
 
@@ -82,6 +83,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     RT = st->RuntimeServices;
     shim_init(st);
     timer_init();
+    mp_init();
     g_image = image;
 
     anubis_console_write("\nanubis-uefi: boot\n");
