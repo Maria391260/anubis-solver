@@ -156,7 +156,7 @@ results that came out negative.
 |---|---|---|
 | SHA-256 in wasm, 4 nonces wide | **1.8-2.1x** Anubis's own module (3.0-3.9 vs 1.7-1.9 M hashes/s) | `cd wasm && make && node bench-sha256.mjs` |
 | HashX compiled from the challenge | **7-8x** Anubis's module (2.9-3.2 vs 0.37-0.44 M hashes/s) | `cd wasm && node verify-jit.mjs` |
-| HashX on a TPU | **75.3 MHash/s** on one TPU device, 7.8x one CPU thread | [`src/google/tpu/hashx_pjrt.c`](src/google/tpu/hashx_pjrt.c), [SPEED.md](SPEED.md#hashx-on-a-tpu-colab-pjrt) |
+| HashX on a TPU | **284.6 MHash/s** on one TPU device, 29x one CPU thread | [`src/google/tpu/hashx_pjrt.c`](src/google/tpu/hashx_pjrt.c), [SPEED.md](SPEED.md#hashx-on-a-tpu-colab-pjrt) |
 | Argon2id on a TPU | **9.4 H/s** at 32 lanes, **3.8x slower** than one CPU core - the dependency chain wins | [`src/google/tpu/argon2_pjrt.c`](src/google/tpu/argon2_pjrt.c), [SPEED.md](SPEED.md#tpu-argon2id-the-chain-is-the-wall) |
 | Argon2id, whole hash | **1.02-1.05x** Anubis's module (65-75 vs 68-76 ms/hash) | `cd wasm && make verify-module` |
 | Argon2id fill core | parity with Anubis (~1.5-1.9 µs/block) | `cd wasm && node bench-a2i.mjs` |
@@ -611,7 +611,7 @@ and `anubis_backend_name()`, plus `"backends_compiled"` in `/v1/version`,
 `GET /v1/backends` in the API service and the `anubis_backends` MCP tool.
 
 The TPU `hashx` tier is not in the dispatch yet: `src/google/tpu/hashx_pjrt.c`
-compiles a challenge's HashX program to StableHLO and measured **75.3 MHash/s**
+compiles a challenge's HashX program to StableHLO and measured **284.6 MHash/s**
 on one Colab TPU device (2,097,152 hashes in 27.8 ms, 14.6 s compile), 7.8x one
 CPU thread and ~65% of the two-T4 PTX interpreter - see
 [SPEED.md](SPEED.md#hashx-on-a-tpu-colab-pjrt).

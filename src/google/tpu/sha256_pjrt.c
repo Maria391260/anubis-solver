@@ -510,7 +510,7 @@ int main(int argc, char **argv) {
     const char *lib = getenv("LIBTPU");
     const char *challenge = DEFAULT_CHALLENGE;
     int difficulty = 20, lanes = 32768, json = 0;
-    int force = 0, init_timeout = 20;
+    int force = 0, init_timeout = 120;
     long long bench_hashes = 0;
     uint8_t raw[4096];
     size_t raw_len;
@@ -549,7 +549,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "need --lib or LIBTPU\n");
         return 2;
     }
-    if (lanes < 1 || lanes > 1048576) {
+    if (lanes < 1 || lanes > 16777216) {
         fprintf(stderr, "--window out of range\n");
         return 2;
     }

@@ -537,16 +537,17 @@ nonces per window:
 |---|---:|
 | 1 CPU thread | 9.7 MH/s |
 | 4 CPU threads | ~35 MH/s |
-| **TPU (this run)** | **75.3 MH/s** |
+| **TPU, 8.4M-lane window** | **284.6 MH/s** |
 | 2x T4, PTX interpreter | 115.4 MH/s |
 
-2,097,152 hashes in 27.8 ms; the module compiled in 14.6 s. That is 7.8x one
-CPU thread, 2.2x a four-thread CPU, and ~65% of the two-T4 PTX interpreter on
-a single device.
+33,554,432 hashes per measurement; the module compiles in 18-20 s and the
+window is the knob: 32,768 lanes gives 74.1 MH/s, 262,144 gives 198.3, 1,048,576
+gives 252.3 and 8,388,608 gives 284.6 MH/s. That is 29x one CPU thread and 2.5x
+the two-T4 PTX interpreter, on a single device and a single chip.
 
 The 64-bit registers are emulated in i32 pairs and each of the 16 program blocks
 runs its body twice for the branch, so HashX lands at ~22% of the TPU `sha256`
-tier's 343 MHash/s. The serialized executable (`--serialize`) is a
+tier's 700 MHash/s. The serialized executable (`--serialize`) is a
 `xla.TpuExecutableProto` carrying a `jellyfish.TpuCompilationEnvironment`.
 Raw data: [`results/hashx-tpu-colab-2026-11-21.json`](results/hashx-tpu-colab-2026-11-21.json).
 
@@ -801,7 +802,7 @@ eight chips should read ~75 H/s - still below the 28-thread Xeon's 411 H/s, and
 the only way this tier wins is many lanes per chip, which is exactly the axis
 the chain punishes. That sweep is the open question, not this one.
 
-## TPU: the `sha256` tier, 343 MHash/s
+## TPU: the `sha256` tier, 700 MHash/s
 
 The same PJRT client (`src/google/tpu/sha256_pjrt.c`) also runs the `sha256`
 tier, and this is the one it is genuinely good at. A `sha256` challenge is many
@@ -816,15 +817,25 @@ launch plus a copy:
 
 | window (lanes/execute) | rate | per window |
 |---:|---:|---:|
-| 8,192 | 38.0 MHash/s | 0.216 ms |
-| 32,768 | 111.9 MHash/s | 0.293 ms |
-| 131,072 | 251.3 MHash/s | 0.522 ms |
-| 262,144 | **342.8 MHash/s** | 0.765 ms |
+| 8,192 | 18.0 MHash/s | 0.455 ms |
+| 262,144 | 375.9 MHash/s | 0.70 ms |
+| 524,288 | 476.9 MHash/s | 1.10 ms |
+| 1,048,576 | 560.5 MHash/s | 1.87 ms |
+| 2,097,152 | 633.1 MHash/s | 3.31 ms |
+| 4,194,304 | 668.5 MHash/s | 6.27 ms |
+| 16,777,216 | **700.2 MHash/s** | 23.96 ms |
+
+The 343 MHash/s this section used to report was not the device: the client
+refused `--window` above 262,144 lanes, and the curve was still climbing when
+that assertion tripped. Raising our own cap to 16.7M lanes doubles the rate,
+and the per-window time stays honest - 16.7M lanes is 16.7M hashes per execute
+in 24 ms. A verified run at 4.19M lanes and difficulty 24 found nonce 29258703
+(`000000cc4fb432e4...`), so the wider window is not a faster wrong answer.
 
 Every row was verified: the program prints the winning nonce's digest and the
 CPU recomputes it, and the same nonce (`740876`, digest `00000328…`) came out at
 every window size because the scan order is deterministic. The knee is not
-reached yet - the rate nearly doubled again between 131k and 262k - so 343 M/s
+reached at 262k - the rate kept climbing to 16.7M, where it flattens at 700 M/s
 is a floor for this configuration, not a ceiling.
 
 For scale: the browser's four-wide wasm kernel is ~8 MHash/s and the engine's
@@ -832,7 +843,7 @@ AVX2 path ~8.3 MHash/s per core, so a single v5e chip is **~41-43x** either of
 them. Compile is ~1.5 s once per challenge, the same trade the page makes when it
 compiles a HashX program.
 
-**What that means for the tier.** At 343 MHash/s, difficulty 24 (16.7M expected
+**What that means for the tier.** At 700 MHash/s, difficulty 24 (16.7M expected
 hashes) is ~0.05 s on one chip, and difficulty 32 is ~12.5 s. `sha256` is
 therefore a speed bump, not a wall, against anyone with TPU time - and unlike
 the memory-hard tiers, the work is embarrassingly parallel on exactly the
