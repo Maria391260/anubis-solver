@@ -16,10 +16,8 @@ INSTALLDIR = $(PREFIX)/lib/gnuefi/apps
 CFLAGS    += -I$(EFIINC) -I$(EFIINC)/$(ARCH) -Ishim/include -I. \
              -DGNU_EFI_USE_MS_ABI -fno-stack-protector -fpic -fshort-wchar \
              -mno-red-zone -O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11
-# No crt0-efi-*: we are the entry point. gnu-efi's startup code needs its own
-# relocation/init dance, and on modern toolchains it faults before main().
 LDFLAGS   += -nostdlib -znocombreloc -T $(LIBDIR)/elf_$(ARCH)_efi.lds \
-             -shared -Bsymbolic -L$(LIBDIR) -e efi_main
+             -shared -Bsymbolic -L$(LIBDIR) $(LIBDIR)/crt0-efi-$(ARCH).o
 LIBS      += -lefi -lgnuefi
 
 OBJS      := crt.o cpu.o caps.o json.o sha256.o timer.o net.o solve.o main.o
@@ -27,8 +25,11 @@ OBJS      := crt.o cpu.o caps.o json.o sha256.o timer.o net.o solve.o main.o
 all: anubis.efi
 
 anubis.efi: anubis.so
-	objcopy -j .text -j .sdata -j .data -j .dynamic -j .dynsym -j .rel \
-	        -j .rela -j .reloc --target=efi-app-$(ARCH) $< $@
+	# .rodata must be listed: gnu-efi's sample list omits it, which produces
+	# an image whose string literals are missing. Keeping the list explicit
+	# (rather than dumping every section) is what the OVMF loader accepts.
+	objcopy -j .text -j .rodata -j .sdata -j .data -j .dynamic -j .dynsym \
+	        -j .rel -j .rela -j .reloc --target=efi-app-$(ARCH) $< $@
 
 anubis.so: $(OBJS)
 	ld $(LDFLAGS) $(OBJS) $(LIBS) -o $@
