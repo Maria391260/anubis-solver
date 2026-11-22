@@ -1100,7 +1100,7 @@ int main(int argc, char **argv)
 {
     const char *lib = getenv("LIBTPU");
     const char *data = DEFAULT_DATA;
-    int difficulty = 15, lanes = 16384, json = 0, selftest = 0, emit = 0;
+    int difficulty = 15, lanes = 1048576, json = 0, selftest = 0, emit = 0;
     const char *serialize_path = NULL;
     int force = 0, init_timeout = 120;
     long long bench_hashes = 0;
