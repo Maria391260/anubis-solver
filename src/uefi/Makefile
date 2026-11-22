@@ -17,12 +17,10 @@ CFLAGS    += -I$(EFIINC) -I$(EFIINC)/$(ARCH) -Ishim/include -I. \
              -DGNU_EFI_USE_MS_ABI -fno-stack-protector -fpic -fshort-wchar \
              -mno-red-zone -O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11
 LDFLAGS   += -nostdlib -znocombreloc -T $(LIBDIR)/elf_$(ARCH)_efi.lds \
-             -shared -Bsymbolic -L$(LIBDIR) -e _start
-# No gnu-efi runtime at all: our entry.S is the entry point and every
-# firmware service is called through the system table pointers.
-LIBS      +=
+             -shared -Bsymbolic -L$(LIBDIR) $(LIBDIR)/crt0-efi-$(ARCH).o
+LIBS      += -lefi -lgnuefi
 
-OBJS      := entry.o crt.o guids.o cpu.o caps.o json.o sha256.o timer.o mp.o net.o solve.o main.o
+OBJS      := crt.o guids.o cpu.o caps.o json.o sha256.o timer.o mp.o net.o solve.o main.o
 
 all: anubis.efi
 
@@ -31,10 +29,11 @@ anubis.efi: anubis.so
 	# an image whose string literals are missing. Keeping the list explicit
 	# (rather than dumping every section) is what the OVMF loader accepts.
 	objcopy -j .text -j .rodata -j .sdata -j .data -j .dynamic -j .dynsym \
-	        -j .rel -j .rela -j .reloc --target=efi-app-$(ARCH) $< $@
+	        -j .rel -j .rela -j .reloc -j .plt -j .got -j .got.plt \
+	        --target=efi-app-$(ARCH) $< $@
 
 anubis.so: $(OBJS)
-	ld $(LDFLAGS) $(OBJS) -o $@
+	ld $(LDFLAGS) $(OBJS) $(LIBS) -o $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

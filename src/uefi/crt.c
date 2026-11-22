@@ -17,11 +17,6 @@
 
 #include "shim.h"
 
-/* gnu-efi declares these; we define them, because libefi is not linked. */
-EFI_SYSTEM_TABLE *ST;
-EFI_BOOT_SERVICES *BS;
-EFI_RUNTIME_SERVICES *RT;
-
 static EFI_SYSTEM_TABLE *g_st;
 static EFI_SERIAL_IO_PROTOCOL *g_ser;
 extern EFI_GUID gAnubisSerialIoGuid;
@@ -132,26 +127,6 @@ void *realloc(void *p, size_t n) {
 }
 
 /* ---- string ----------------------------------------------------------- */
-
-void *memcpy(void *dst, const void *src, size_t n) {
-    uint8_t *d = dst;
-    const uint8_t *s = src;
-
-    while (n-- > 0) {
-        *d++ = *s++;
-    }
-    return dst;
-}
-
-void *memset(void *dst, int c, size_t n) {
-    uint8_t *d = dst;
-
-    while (n-- > 0) {
-        *d++ = (uint8_t)c;
-    }
-    return dst;
-}
-
 
 void *memmove(void *dst, const void *src, size_t n) {
     uint8_t *d = dst;

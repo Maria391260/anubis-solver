@@ -8,3 +8,8 @@ EFI_GUID gAnubisSimpleFsGuid = {
     0x964E5B22, 0x6459, 0x11d2, {0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}};
 EFI_GUID gAnubisSerialIoGuid = {
     0xBB25CF6F, 0xF1D4, 0x11D2, {0x9A, 0x0C, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0xFD}};
+
+/* OVMF refuses a PE whose relocation directory is empty (it cannot tell the
+ * image is position independent), so keep one real absolute reference in .data
+ * to force a relocation entry into .rela and therefore into .reloc. */
+void *const gAnubisSelfRef = (void *)&gAnubisLoadedImageGuid;
