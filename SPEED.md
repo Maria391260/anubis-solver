@@ -764,13 +764,31 @@ backend"), and the code emitters `xla_llvm_isa_emitter{,_force,_bundles}`;
 `xla_jf_naive_bundle_packer` only changes compile time. The channel is
 `LIBTPU_INIT_ARGS` (a string in the image); `XLA_FLAGS` does not reach these -
 the `xla_jf_*` ones are rejected there. That is the closest thing to a boost
-button in this library, and it is untested here because it needs a device:
+button in this library. It was measured on a Colab v5e1 at a 4,194,304-lane
+window, three interleaved rounds per set, same binary, only `LIBTPU_INIT_ARGS`
+changing:
+
+| flag set | median | min-max | vs baseline |
+|---|---:|---:|---:|
+| baseline | 662.8 MHash/s | 640.0-664.4 | - |
+| `xla_jf_critical_path_scheduler=true` | 665.7 | 620.7-670.4 | +0.4% |
+| `xla_jf_vliw_scheduler=true` | 669.8 | 649.9-670.5 | +1.1% |
+| `xla_llvm_isa_emitter=true --xla_llvm_isa_emitter_force=true` | 657.9 | 622.4-668.4 | -0.7% |
+| `xla_optimization_level=EFFORT_O1/O2/O3` | 663.1 / 631.4 / 654.4 | one run each | within noise |
+
+Run-to-run spread on this VM is ~3-4% and the baseline drifted 630-669 across
+sessions, so every one of those is noise. There is nothing for a scheduler flag
+to win here: the module is elementwise vector ops and the pipeline already runs
+at 98.7% of its asymptote (1.41 ns per lane). Separately,
+`xla_optimization_level` takes the enum `EFFORT_O0..O3`, not an integer - `=3`
+is rejected with a list of the legal values, which is how that row was found.
+
+The scripts remain for other workloads:
 [`src/google/tpu/colab_argon2_flags.sh`](src/google/tpu/colab_argon2_flags.sh)
-runs the same serialized executable under each flag and prints steady H/s,
-and [`src/google/tpu/colab_tpu_flags_all.sh`](src/google/tpu/colab_tpu_flags_all.sh)
-does the same for all five tiers at once - sha256, hashx, argon2id, tensor and
-tensor-v - with argon2id recompiled per flag set so a codegen flag is not
-silently ignored by `--load`.
+runs the serialized Argon2id executable under each flag, and
+[`src/google/tpu/colab_tpu_flags_all.sh`](src/google/tpu/colab_tpu_flags_all.sh)
+does all five tiers at once, with argon2id recompiled per set so a codegen flag
+is not silently ignored by `--load`.
 
 There is no clock, voltage or power-limit flag: 17 of the 2,797 names match
 clock/freq/throttle/power at all, and they point the other way -
