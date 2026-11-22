@@ -17,15 +17,21 @@
 
 #include "shim.h"
 
+/* gnu-efi declares these; we define them, because libefi is not linked. */
+EFI_SYSTEM_TABLE *ST;
+EFI_BOOT_SERVICES *BS;
+EFI_RUNTIME_SERVICES *RT;
+
 static EFI_SYSTEM_TABLE *g_st;
 static EFI_SERIAL_IO_PROTOCOL *g_ser;
+extern EFI_GUID gAnubisSerialIoGuid;
 
 void shim_init(EFI_SYSTEM_TABLE *st) {
     g_st = st;
     g_ser = NULL;
     /* Headless boot has no ConOut worth trusting, so log to COM1 as well.
      * QEMU with -serial file: captures this without a graphics console. */
-    if (BS->LocateProtocol(&gEfiSerialIoProtocolGuid, NULL, (void **)&g_ser) ==
+    if (BS->LocateProtocol(&gAnubisSerialIoGuid, NULL, (void **)&g_ser) ==
             EFI_SUCCESS && g_ser != NULL) {
         g_ser->SetAttributes(g_ser, 115200, 0, 0, 0, 8, 1);
     }
@@ -127,8 +133,25 @@ void *realloc(void *p, size_t n) {
 
 /* ---- string ----------------------------------------------------------- */
 
-/* memcpy/memset come from gnu-efi's libefi, which provides them for its own
- * runtime; defining them here would collide at link time. */
+void *memcpy(void *dst, const void *src, size_t n) {
+    uint8_t *d = dst;
+    const uint8_t *s = src;
+
+    while (n-- > 0) {
+        *d++ = *s++;
+    }
+    return dst;
+}
+
+void *memset(void *dst, int c, size_t n) {
+    uint8_t *d = dst;
+
+    while (n-- > 0) {
+        *d++ = (uint8_t)c;
+    }
+    return dst;
+}
+
 
 void *memmove(void *dst, const void *src, size_t n) {
     uint8_t *d = dst;

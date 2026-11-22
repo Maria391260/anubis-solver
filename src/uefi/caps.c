@@ -4,6 +4,9 @@
 #include <efilib.h>
 
 #include "caps.h"
+
+extern EFI_GUID gAnubisLoadedImageGuid;
+extern EFI_GUID gAnubisSimpleFsGuid;
 #include "json.h"
 
 #define CAPS_NAME L"\\anubis-caps.json"
@@ -14,11 +17,11 @@ static EFI_STATUS open_root(EFI_HANDLE image, EFI_FILE **root) {
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL;
     EFI_STATUS st;
 
-    st = BS->HandleProtocol(image, &gEfiLoadedImageProtocolGuid, (void **)&li);
+    st = BS->HandleProtocol(image, &gAnubisLoadedImageGuid, (void **)&li);
     if (EFI_ERROR(st)) {
         return st;
     }
-    st = BS->HandleProtocol(li->DeviceHandle, &gEfiSimpleFileSystemProtocolGuid,
+    st = BS->HandleProtocol(li->DeviceHandle, &gAnubisSimpleFsGuid,
                             (void **)&fs);
     if (EFI_ERROR(st)) {
         return st;

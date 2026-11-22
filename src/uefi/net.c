@@ -1,5 +1,6 @@
 #include <efi.h>
 #include <efilib.h>
+#include <string.h>
 #include <efitcp.h>
 
 #include "net.h"
@@ -42,8 +43,8 @@ static int tcp_send(EFI_TCP4 *s, const void *buf, UINT32 len) {
     EFI_TCP4_FRAGMENT_DATA frag;
     EFI_STATUS st;
 
-    ZeroMem(&tok, sizeof tok);
-    ZeroMem(&tx, sizeof tx);
+    memset(&tok, 0, sizeof tok);
+    memset(&tx, 0, sizeof tx);
     frag.FragmentLength = len;
     frag.FragmentBuffer = (void *)buf;
     tx.Push = TRUE;
@@ -69,8 +70,8 @@ static int tcp_recv(EFI_TCP4 *s, void *buf, UINT32 cap, UINT32 *got) {
     EFI_TCP4_FRAGMENT_DATA frag;
     EFI_STATUS st;
 
-    ZeroMem(&tok, sizeof tok);
-    ZeroMem(&rx, sizeof rx);
+    memset(&tok, 0, sizeof tok);
+    memset(&rx, 0, sizeof rx);
     frag.FragmentLength = cap;
     frag.FragmentBuffer = buf;
     rx.DataLength = cap;
@@ -176,7 +177,7 @@ EFI_STATUS net_serve(UINT16 port, net_handler handler, void *ctx) {
         return EFI_UNSUPPORTED;
     }
 
-    ZeroMem(&opt, sizeof opt);
+    memset(&opt, 0, sizeof opt);
     opt.ReceiveBufferSize = 0x40000;
     opt.SendBufferSize = 0x40000;
     opt.MaxSynBackLog = 4;
@@ -187,7 +188,7 @@ EFI_STATUS net_serve(UINT16 port, net_handler handler, void *ctx) {
     opt.KeepAliveProbes = 0;
     opt.EnableNagle = TRUE;
 
-    ZeroMem(&cfg, sizeof cfg);
+    memset(&cfg, 0, sizeof cfg);
     cfg.TypeOfService = 0;
     cfg.TimeToLive = 64;
     cfg.AccessPoint.UseDefaultAddress = TRUE;
@@ -207,7 +208,7 @@ EFI_STATUS net_serve(UINT16 port, net_handler handler, void *ctx) {
         EFI_TCP4 *conn = NULL;
         EFI_TCP4_CLOSE_TOKEN ct;
 
-        ZeroMem(&lt, sizeof lt);
+        memset(&lt, 0, sizeof lt);
         st = BS->CreateEvent(0, 0, NULL, NULL, &lt.CompletionToken.Event);
         if (EFI_ERROR(st)) {
             return st;
@@ -232,7 +233,7 @@ EFI_STATUS net_serve(UINT16 port, net_handler handler, void *ctx) {
         anubis_console_write("net: connection closed\n");
 
         if (conn != listener) {
-            ZeroMem(&ct, sizeof ct);
+            memset(&ct, 0, sizeof ct);
             BS->CreateEvent(0, 0, NULL, NULL, &ct.CompletionToken.Event);
             conn->Close(conn, &ct);
             wait_token(&ct.CompletionToken);
