@@ -101,10 +101,13 @@ make test-impersonate         # local TLS server: GREASE present/absent per prof
   The one tier where acceleration is the point rather than a bonus.
 - **`tensor-v`, the sampled proof** — same GEMM, but the client commits to the
   output with a Merkle root and opens only the 96 blocks the server picks after
-  seeing the root. The server checks those elements instead of recomputing the
-  product, so its cost is a few milliseconds at difficulty 16 against the
-  client's several hundred (measured: 3.6 ms vs 538 ms in wasm, ~1:150). See
-  [betterAnusbis/SECURITY-REVIEW.md](betterAnusbis/SECURITY-REVIEW.md).
+  seeing the root, from a server secret. The server checks those elements instead
+  of recomputing the product, so its cost stops being `O(N^3)`: a few milliseconds
+  at difficulty 16 against the client's several hundred (measured: 3.6 ms vs
+  538 ms in wasm, ~1:150), and a client that skipped a fraction `f` of the matrix
+  still passes only `f^96` of the time. See
+  [the section below](#tensor-and-tensor-v-the-two-tiers-that-are-ours) and
+  [betterAnusbis/SECURITY-REVIEW.md](betterAnusbis/SECURITY-REVIEW.md#tensor-v-sampled-verification).
 - **CPU kernels**: hand-written AVX2, SHA-NI, AVX-512 and AArch64 NEON/SHA-2
   assembly, with runtime dispatch down to a portable C fallback.
 - **GPU backends** (all opt-in except SHA-256): CUDA, oneAPI Level Zero,
@@ -164,6 +167,7 @@ results that came out negative.
 | Browser, native library | **10x** the in-page wasm at difficulty 20 | `python3 firefox-extension/test-native.py` |
 | Gate server footprint | **~21x less RAM** (2.1 vs 44-46 MB), ~1.9x less CPU per request | `python3 tools/bench-server-resources.py` |
 | Client memory | wasm kernel 0.13 MiB vs Anubis's 1.06 MiB | `node tools/bench-client-resources.mjs` |
+| `tensor-v` server audit | **3.6 ms** at difficulty 16, against 538 ms of client wasm commit (~1:150) | `python3 tools/bench_tensor_v.py` |
 | The wall, end to end | six server x client combinations | `node tools/bench-endtoend.mjs` |
 
 ## Quick start
@@ -513,6 +517,127 @@ Byte-exact details:
   same, so client and server agree on the program.
 
 Unknown algorithms raise `UnsupportedAlgorithm`.
+
+### `tensor` and `tensor-v`: the two tiers that are ours
+
+Upstream Anubis ships five algorithms and every one of them scales with integer and
+bit throughput — the axis a CPU with good ILP beats a GPU on. Neither of our tiers
+changes that for the machine that has to *solve* the challenge. Both change who
+pays. `tensor` is one integer GEMM whose digest is the proof: the single primitive
+where a GPU is faster instead of slower. `tensor-v` is the same GEMM with the
+server's cost taken out.
+
+Neither is part of Anubis and no release of it issues them. A gate offers them only
+if it is `betterAnusbis/` started with `--algorithm tensor` or `--algorithm
+tensor-v`.
+
+#### `tensor`, spec v1
+
+1. `N = 64 * clamp(difficulty, 2, 16)` — difficulty 2/4/8/12/16 gives 128/256/512/768/1024.
+2. `seed = SHA256(hex_decode(randomData))`, the decoded challenge bytes.
+3. `stream = concat(SHA256(seed || u32le(counter)))` over `counter = 0, 1, 2, ...`.
+4. `A`, row-major `N*N` uint8: `A[i] = stream[i] & 0x7f` (0..127).
+5. `B`, row-major `N*N` int8: `B[i] = int8(stream[N*N + i])` (`>= 0x80` becomes -128..-1).
+6. `C`, row-major `N*N` int32: `C[i][j] = sum_k A[i][k] * B[k][j]`, exact.
+7. `digest = SHA256(C)`, with `C` serialized as `N*N` little-endian int32.
+8. `response = hex(digest)`, `nonce = 0` — deterministic, there is no nonce search.
+
+There is no floating point anywhere, and that is the whole reason the tier can be
+verified. Float addition reassociates, so a float GEMM would give a different digest
+per tiling or per backend and no server could check it; int32 accumulation in a
+fixed order is bit-identical in wasm, JavaScript, CUDA and the C verifier. Every
+partial sum is bounded by `127 * 128 * N <= 130 M < 2^27`, every individual product
+fits in int16 (`127 * 128 = 16256`), and WebNN — which only takes float32 — still
+gets exact results because the sums stay below `2^24`, where float32 represents
+every integer. At `N = 1024` the matrices are 1 MiB each and `C` is 4 MiB.
+
+The kernel is [`wasm/tensor_pow.c`](wasm/tensor_pow.c), 622 lines, statically
+allocated and 64-byte aligned so the SIMD rows are aligned too.
+
+#### `tensor-v`: the sampled proof
+
+The client's work stays. The server's `O(N^3)` goes away.
+
+The client reads the second matrix as `BT` — the stream's second matrix, so
+`C[i][j]` is one contiguous row dot one contiguous row — builds a Merkle tree over
+`C` in 32-element leaves, and sends the root. The gate then picks 96 block indices
+and one element position inside each, and the client opens exactly those blocks.
+
+Two requests:
+
+1. `GET .../pass-challenge?id&response=<root>&nonce=0`. The gate derives the 96
+   indices from a sampler key (an HMAC of `cfg.secret`, domain-separated from the
+   cookie key) and `SHA256("ANUBIS-TENSOR-VS" || key || randomData || root)`, and
+   returns them as JSON. It does not spend the challenge.
+2. `POST .../api/audit-tensor` with `{id, root, audit, redir}`. The gate re-derives
+   the same sample, requires the witness to describe exactly that sample
+   (`anubis_tensor_v_check_sample`), checks the Merkle proofs, and recomputes only
+   those 96 elements. It spends the challenge here, so a replay is refused.
+
+The server's cost is `O(k*N)` stream hashes plus one dot product per sample — not
+`O(N^3)` — and about 3 ms of it is SHA-256 for the 96 rows and their inclusion
+proofs. Measured here with the 16-thread C client, 96 samples
+([`results/tensor-v-2026-11-19.json`](results/tensor-v-2026-11-19.json)):
+
+| difficulty | N | client commit + open | server audit | ratio |
+|---:|---:|---:|---:|---:|
+| 2 | 128 | 3.0 ms | 2.2 ms | 1.4x |
+| 4 | 256 | 8.2 ms | 2.2 ms | 3.7x |
+| 8 | 512 | 32.1 ms | 2.4 ms | 13.5x |
+| 12 | 768 | 64.2 ms | 3.0 ms | 21.4x |
+
+Difficulty 16 is 69 ms of client tree against 3.6 ms of audit, and in the wasm
+kernel the same commit is 82 ms at difficulty 8 rising to **538 ms** at difficulty
+16 — about **1:150** at the top, which is the number that matters, because the
+browser is where the client runs. On a 4-thread Xeon at 2.20 GHz the ratio is 23x
+at difficulty 8 and 46x at 12
+([`results/tensor-v-kaggle-2026-11-20.json`](results/tensor-v-kaggle-2026-11-20.json)).
+The witness blob is 41 KB at `N = 128` and 59.5 KB at `N = 768`.
+
+Why the sample is sound:
+
+- **It is chosen after the commitment, from a server secret.** The client must know
+  the sampled elements before it sends the root; the index list is only revealed
+  afterwards. A client that computed a fraction `f` of `C` passes with probability
+  `f^96`, so computing 90% of the matrix and skipping the rest is accepted 4e-5 of
+  the time — 1 in 25,000.
+- **The witness is bound to the sample.** `anubis_tensor_v_check_sample` runs before
+  any verification, so a valid witness for a cheaper set of blocks is rejected.
+  Without it the server would verify whatever the client picked.
+- **The root is bound to the challenge.** Each leaf hashes
+  `SHA256("ANUBIS-TENSOR-VL" || SHA256("ANUBIS-TENSOR-VC" || randomData) || u32le(block) || block bytes)`,
+  and the root is an input to the sample derivation, so a root from another
+  challenge does not transfer.
+- **On the TPU the GEMM is nearly free** and the commit stays on the host: at
+  difficulty 16 the 2.15 GMAC product runs in **0.19 ms**, 11.5 GMAC/s, 0.82 ms
+  end to end with the copy-back
+  ([`results/tensor-v-tpu-2026-11-21.json`](results/tensor-v-tpu-2026-11-21.json),
+  [SPEED.md](SPEED.md#tpu-tensor-v-the-gemm-is-free)).
+
+What it does not remove, stated plainly:
+
+- **Online grinding of the sample oracle.** Step 1 is cheap and stateless, so a
+  client can ask for samples for many candidate roots and compute the revealed
+  blocks (about 3 M multiply-adds each) to retry. Acceptance per root is still
+  `f^96`; put a per-IP limit on step 1 if that matters.
+- **Outsourcing.** As with every proof of work: the GEMM can be rented.
+- **The server still hashes** `2*N/32` stream blocks per sample.
+
+`tensor` remains the one-request tier for clients that expect a single digest, and
+costs the server the full product: 20-130 ms against 2-4 ms. The sampled protocol
+is the one to use when the gate is the bottleneck.
+
+```bash
+python3 tests/test_tensor_v.py         # root, sample, witness, tamper
+python3 tests/test_tensor_v_gate.py    # the two-request commit/audit protocol, replay refused
+python3 tools/bench_tensor_v.py        # client GEMM + tree against the sampled server check
+node wasm/verify-tensor-v.mjs          # the wasm root and witness, pinned against the C core
+node betterAnusbis/tests_js_tensor_v.mjs   # WebNN hand-off, transpose retry, pure-JS path
+```
+
+The full protocol, the threat model and the two residual weaknesses are in
+[betterAnusbis/SECURITY-REVIEW.md](betterAnusbis/SECURITY-REVIEW.md#tensor-v-sampled-verification);
+the browser side is in [betterAnusbis/README.md](betterAnusbis/README.md).
 
 ### Protocol eras handled
 
