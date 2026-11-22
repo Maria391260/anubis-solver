@@ -613,8 +613,8 @@ and `anubis_backend_name()`, plus `"backends_compiled"` in `/v1/version`,
 
 The TPU `hashx` tier is not in the dispatch yet: `src/google/tpu/hashx_pjrt.c`
 compiles a challenge's HashX program to StableHLO and measured **284.6 MHash/s**
-on one Colab TPU device (2,097,152 hashes in 27.8 ms, 14.6 s compile), 7.8x one
-CPU thread and ~65% of the two-T4 PTX interpreter - see
+on one Colab TPU device at an 8.4M-lane window, 29x one CPU thread and 2.5x the
+two-T4 PTX interpreter - see
 [SPEED.md](SPEED.md#hashx-on-a-tpu-colab-pjrt).
 
 `argon2id` was ported to the same device for the number, and it loses:

@@ -546,7 +546,7 @@ gives 252.3 and 8,388,608 gives 284.6 MH/s. That is 29x one CPU thread and 2.5x
 the two-T4 PTX interpreter, on a single device and a single chip.
 
 The 64-bit registers are emulated in i32 pairs and each of the 16 program blocks
-runs its body twice for the branch, so HashX lands at ~22% of the TPU `sha256`
+runs its body twice for the branch, so HashX lands at ~41% of the TPU `sha256`
 tier's 700 MHash/s. The serialized executable (`--serialize`) is a
 `xla.TpuExecutableProto` carrying a `jellyfish.TpuCompilationEnvironment`.
 Raw data: [`results/hashx-tpu-colab-2026-11-21.json`](results/hashx-tpu-colab-2026-11-21.json).
@@ -839,7 +839,7 @@ reached at 262k - the rate kept climbing to 16.7M, where it flattens at 700 M/s
 is a floor for this configuration, not a ceiling.
 
 For scale: the browser's four-wide wasm kernel is ~8 MHash/s and the engine's
-AVX2 path ~8.3 MHash/s per core, so a single v5e chip is **~41-43x** either of
+AVX2 path ~8.3 MHash/s per core, so a single v5e chip is **~84x** either of
 them. Compile is ~1.5 s once per challenge, the same trade the page makes when it
 compiles a HashX program.
 
