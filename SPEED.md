@@ -672,6 +672,17 @@ removes is the GEMM: execute is flat at ~0.2 ms and the copy-back dominates even
 at N=1024. Hashing the tree on the device is the step that would make `tensor-v`
 a single-device tier.
 
+The copy-back is the term to attack. libtpu on v5e keeps a premapped host
+region (`libtpu::RequiresPremappedBuffers()` is true from v4 up) and a
+destination outside it is bounced through that region: one DMA plus one host
+memcpy. `--dmamap` registers our own 2 MiB-aligned buffer with
+`PJRT_Client_DmaMap` - a first-class PJRT C call, so no C++ objects - and the
+JSON carries `"dma_mapped"` so the two runs are distinguishable. 0.63 ms for
+4 MiB is 6.6 GB/s, about half of what one Gen4 x16 descriptor should manage,
+which is what a staging copy looks like. Same family, zero code:
+`TPU_PREMAPPED_BUFFER_SIZE`, `TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES`
+and `--tfrt_tpu_pjrt_client_host_transfer_prefer_zero_copy_over_premap`.
+
 Raw data: [`results/tensor-v-tpu-2026-11-21.json`](results/tensor-v-tpu-2026-11-21.json).
 Reproduce: `cc -O2 -I. -o tensor_pjrt tensor_pjrt.c -ldl` then
 `./tensor_pjrt --lib /path/libtpu.so --tensor-v --difficulty 8,12,16 --rounds 5 --json`.

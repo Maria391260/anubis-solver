@@ -365,6 +365,54 @@ static PJRT_Api *api;
 static PJRT_Client *client;
 static PJRT_Device *device;
 
+/* -1 = not tried, 0 = plugin refused, 1 = mapped. libtpu on v5e keeps a
+ * premapped region (RequiresPremappedBuffers is true for v5e) and bounces any
+ * other host destination through it: one DMA plus one host memcpy. DmaMap
+ * registers our own buffer so ToHostBuffer can write it directly. */
+static int g_dmamap;
+static int g_dma_state = -1;
+
+static void *alloc_host(size_t bytes) {
+    void *p = NULL;
+    int64_t dma_off = (int64_t)offsetof(PJRT_Api, PJRT_Client_DmaMap);
+
+    if (!g_dmamap) {
+        return malloc(bytes);
+    }
+    if (api->PJRT_Client_DmaMap == NULL ||
+        (int64_t)api->struct_size < dma_off + (int64_t)sizeof(void *)) {
+        fprintf(stderr, "dmamap: plugin does not expose PJRT_Client_DmaMap\n");
+        g_dma_state = 0;
+        return malloc(bytes);
+    }
+    if (posix_memalign(&p, 2u << 20, bytes) != 0 || p == NULL) {
+        return malloc(bytes);
+    }
+    PJRT_Client_DmaMap_Args da = {0};
+    da.struct_size = sizeof da;
+    da.client = client;
+    da.data = p;
+    da.size = bytes;
+    PJRT_Error *e = api->PJRT_Client_DmaMap(&da);
+    if (e != NULL) {
+        PJRT_Error_Message_Args ma = {0};
+        ma.struct_size = sizeof ma;
+        ma.error = e;
+        api->PJRT_Error_Message(&ma);
+        fprintf(stderr, "dmamap: DmaMap refused: %.*s\n", (int)ma.message_size,
+                ma.message);
+        PJRT_Error_Destroy_Args ed = {0};
+        ed.struct_size = sizeof ed;
+        ed.error = e;
+        api->PJRT_Error_Destroy(&ed);
+        free(p);
+        g_dma_state = 0;
+        return malloc(bytes);
+    }
+    g_dma_state = 1;
+    return p;
+}
+
 static void die_error(PJRT_Error *e, const char *what) {
     if (e == NULL) {
         return;
@@ -602,7 +650,7 @@ static int bench_one(int difficulty, int n_override, const char *challenge,
     size_t cells = (size_t)n * (size_t)n;
     uint8_t *a = malloc(cells);
     int8_t *b = malloc(cells);
-    int32_t *c = malloc(cells * sizeof *c);
+    int32_t *c = alloc_host(cells * sizeof *c);
     int32_t *ref = NULL;
     char gpu_hex[65], cpu_hex[65];
     double compile_ms = 0, upload_ms = 0, exec_ms = 0, read_ms = 0;
@@ -669,11 +717,14 @@ static int bench_one(int difficulty, int n_override, const char *challenge,
                    "\"upload_ms\":%.2f,\"execute_ms\":%.4f,\"e2e_ms\":%.4f,"
                    "\"io_ms\":%.4f,"
                    "\"gmacs_execute\":%.2f,\"gmacs_e2e\":%.2f,\"digest_ok\":%s,"
+                   "\"dma_mapped\":%s,"
                    "\"digest\":\"%s\",\"tier\":\"%s\"}\n",
                    difficulty, n, macs, compile_ms, upload_ms, exec_ms, t_e2e,
                    t_e2e - exec_ms,
                    macs / (exec_ms / 1000.0) / 1e9,
-                   macs / (t_e2e / 1000.0) / 1e9, ok ? "true" : "false", gpu_hex,
+                   macs / (t_e2e / 1000.0) / 1e9, ok ? "true" : "false",
+                   g_dma_state == 1 ? "true" : (g_dma_state == 0 ? "false" : "null"),
+                   gpu_hex,
                    tv ? "tensor-v" : "tensor");
         } else {
             printf("d=%2d N=%4d %8.1f MMAC  execute %9.4f ms (%7.1f GMAC/s)  "
@@ -736,13 +787,15 @@ int main(int argc, char **argv) {
             tv = 1;
         } else if (strcmp(argv[i], "--cpu-root") == 0) {
             cpu_root = 1;
+        } else if (strcmp(argv[i], "--dmamap") == 0) {
+            g_dmamap = 1;
         } else if (strcmp(argv[i], "--json") == 0) {
             json = 1;
         } else {
             fprintf(stderr,
                     "usage: %s --lib /path/libtpu.so [--difficulty 4,8,12,16] "
                     "[--n N] [--rounds 5] [--challenge HEX] [--no-verify] [--json]\n"
-                    "       [--tensor-v] [--cpu-root]\n",
+                    "       [--tensor-v] [--cpu-root] [--dmamap]\n",
                     argv[0]);
             return 2;
         }
@@ -759,7 +812,7 @@ int main(int argc, char **argv) {
             size_t cells = (size_t)n * (size_t)n;
             uint8_t *a = malloc(cells);
             int8_t *b = malloc(cells);
-            int32_t *c = malloc(cells * sizeof *c);
+            int32_t *c = alloc_host(cells * sizeof *c);
             char root[65];
             if (a == NULL || b == NULL || c == NULL) {
                 return 1;
