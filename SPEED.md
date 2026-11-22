@@ -736,6 +736,44 @@ Reproduce: `cc -O2 -I. -o argon2_pjrt argon2_pjrt.c -ldl` in
 `./argon2_pjrt --lib $LIBTPU --lanes 32 --difficulty 32 --stress 20 --json`
 for the rate (add `--serialize F` once, `--load F` afterwards).
 
+### No boost button, but there is a flag table
+
+Before believing that a hidden switch could rescue this tier, the library was
+read instead of guessed at. `libtpu.so` (451,904,656 bytes) carries 751,967
+defined symbols, but only 83 dynamic exports - `GetPjrtApi`,
+`GetLibtpuSdkApi`, `TpuTopology_*`, `TpuProfiler_*`, `TpuEmbeddingEngine_*`,
+`TpuStatus_*`, the TF kernels. Nothing resembling "execute faster".
+
+What it does carry is a flag table: 2,797 `FLAGS_*` variables, of which 1,079
+are `xla_tpu_*` and 142 are `xla_jf_*`. The ones that could matter for one long
+dependent chain are `xla_jf_critical_path_scheduler`, `xla_jf_vliw_scheduler`,
+`xla_optimization_level` ("Numerical optimization level for the XLA compiler
+backend"), and the code emitters `xla_llvm_isa_emitter{,_force,_bundles}`;
+`xla_jf_naive_bundle_packer` only changes compile time. The channel is
+`LIBTPU_INIT_ARGS` (a string in the image); `XLA_FLAGS` does not reach these -
+the `xla_jf_*` ones are rejected there. That is the closest thing to a boost
+button in this library, and it is untested here because it needs a device:
+[`src/google/tpu/colab_argon2_flags.sh`](src/google/tpu/colab_argon2_flags.sh)
+runs the same serialized executable under each flag and prints steady H/s.
+
+There is no clock, voltage or power-limit flag: 17 of the 2,797 names match
+clock/freq/throttle/power at all, and they point the other way -
+`tpu_throttle_when_idle`, `tpu_throttle_idle_timer_duration`,
+`tpu_throttle_when_continuation_queue_empty`. The power manager limits itself
+for thermal and droop reasons and only reports it as counters
+(`PWRMGR_*_THROTTLE_CORE_DEBUG_STATS_CLOCKS_SKIPPED`,
+`THERMAL_THROTTLE_CLOCKS_SKIPPED`, `LDIDT_BRAKE_EVENTS`); nothing in the image
+lets software raise that limit.
+
+The "no XLA" door exists too, just not in `.dynsym`:
+`tpu::EncodeProgram<pufferfish::isa::EncoderPfBarnaCoreSequencer, ...>` turns an
+ISA program proto into a `TpuTypedHostDmaBuffer<unsigned char, 32>`, and
+`deepsea::executor::DeepseaExecutor::LoadProgram` / `RunProgram` execute it. Using
+those means calling internal C++ by base+offset and redoing it for every libtpu
+release, in order to skip an 11.9 s compile that `--serialize`/`--load` already
+skips. Not worth it, and it cannot move a chain that costs ~7 cycles per vector
+op because of dependency latency rather than issue rate.
+
 ## TPU: the `sha256` tier, 343 MHash/s
 
 The same PJRT client (`src/google/tpu/sha256_pjrt.c`) also runs the `sha256`
