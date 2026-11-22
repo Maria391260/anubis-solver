@@ -4,6 +4,7 @@
 
 #include "json.h"
 #include "sha256.h"
+#include "timer.h"
 #include "solve.h"
 
 static int hexval(int c) {
@@ -90,6 +91,7 @@ int solve_run(const solve_req_t *r, const anubis_cpu_t *cpu, char *out, size_t n
     uint32_t h[8];
     int raw_len, i, use_le;
     unsigned long long nonce, attempts = 0;
+    uint64_t t0, t1, cycles;
 
     if (strcmp(r->algo, "sha256") != 0) {
         return snprintf(out, n,
@@ -109,6 +111,7 @@ int solve_run(const solve_req_t *r, const anubis_cpu_t *cpu, char *out, size_t n
     block[62] = (uint8_t)((raw_len + 4) >> 5);    /* length in bits, high */
     block[63] = (uint8_t)((raw_len + 4) << 3);    /* and low */
 
+    t0 = timer_now();
     for (nonce = r->start; nonce < r->start + r->count; nonce++) {
         if (use_le) {
             block[raw_len + 0] = (uint8_t)nonce;
@@ -134,6 +137,8 @@ int solve_run(const solve_req_t *r, const anubis_cpu_t *cpu, char *out, size_t n
         attempts++;
         if (leading_zero_bits(digest, r->difficulty)) {
             char hex[65];
+            t1 = timer_now();
+            cycles = t1 - t0;
             for (i = 0; i < 32; i++) {
                 hex[i * 2] = "0123456789abcdef"[digest[i] >> 4];
                 hex[i * 2 + 1] = "0123456789abcdef"[digest[i] & 15];
@@ -142,13 +147,19 @@ int solve_run(const solve_req_t *r, const anubis_cpu_t *cpu, char *out, size_t n
             return snprintf(out, n,
                             "{\"ok\":true,\"hit\":true,\"algo\":\"sha256\","
                             "\"kernel\":\"%s\",\"nonce\":%llu,\"attempts\":%llu,"
-                            "\"digest\":\"%s\"}",
+                            "\"us\":%llu,\"cycles\":%llu,\"digest\":\"%s\"}",
                             anubis_kernel_name(anubis_cpu_pick(cpu)), nonce,
-                            attempts, hex);
+                            attempts, (unsigned long long)timer_us(cycles),
+                            (unsigned long long)cycles, hex);
         }
     }
+    t1 = timer_now();
+    cycles = t1 - t0;
     return snprintf(out, n,
                     "{\"ok\":true,\"hit\":false,\"algo\":\"sha256\","
-                    "\"kernel\":\"%s\",\"attempts\":%llu}",
-                    anubis_kernel_name(anubis_cpu_pick(cpu)), attempts);
+                    "\"kernel\":\"%s\",\"attempts\":%llu,\"us\":%llu,"
+                    "\"cycles\":%llu}",
+                    anubis_kernel_name(anubis_cpu_pick(cpu)), attempts,
+                    (unsigned long long)timer_us(cycles),
+                    (unsigned long long)cycles);
 }

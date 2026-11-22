@@ -17,6 +17,7 @@
 #include "json.h"
 #include "net.h"
 #include "shim.h"
+#include "timer.h"
 #include "solve.h"
 
 #define ANUBIS_PORT 8642
@@ -80,6 +81,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     BS = st->BootServices;
     RT = st->RuntimeServices;
     shim_init(st);
+    timer_init();
     g_image = image;
 
     anubis_console_write("\nanubis-uefi: boot\n");
